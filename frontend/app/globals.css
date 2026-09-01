@@ -1,0 +1,132 @@
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --text: #1a2027;
+  --muted: #64707d;
+  --border: #e3e7eb;
+  --healthy: #1a7f37;
+  --healthy-bg: #dcffe4;
+  --faulty: #b42318;
+  --faulty-bg: #ffe2dd;
+  --disconnected: #6e56cf;
+  --disconnected-bg: #ece6ff;
+  --unknown: #57606a;
+  --unknown-bg: #eaeef2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+}
+
+main {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 4rem;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin: 0 0 0.25rem;
+}
+
+.subtitle {
+  color: var(--muted);
+  margin: 0 0 1.5rem;
+  font-size: 0.9rem;
+}
+
+.plants-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.plants-table th,
+.plants-table td {
+  text-align: left;
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+
+.plants-table th {
+  background: #fafbfc;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.plants-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.plants-table th.num {
+  text-align: right;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.badge.healthy {
+  color: var(--healthy);
+  background: var(--healthy-bg);
+}
+
+.badge.faulty {
+  color: var(--faulty);
+  background: var(--faulty-bg);
+}
+
+.badge.disconnected {
+  color: var(--disconnected);
+  background: var(--disconnected-bg);
+}
+
+.badge.unknown {
+  color: var(--unknown);
+  background: var(--unknown-bg);
+}
+
+.state-note {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  color: var(--muted);
+}
+
+.state-note.error {
+  color: var(--faulty);
+  border-color: var(--faulty);
+}
+
+.meta-line {
+  margin-top: 0.9rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
