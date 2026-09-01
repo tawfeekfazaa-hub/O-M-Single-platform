@@ -44,7 +44,9 @@ export default function PlantsPage() {
   }, []);
 
   useEffect(() => {
-    void load();
+    // Initial fetch is deferred to a microtask: state updates happen in the
+    // async fetch callback, never synchronously inside the effect body.
+    queueMicrotask(() => void load());
     const timer = setInterval(() => void load(), REFRESH_INTERVAL_MS);
     return () => {
       clearInterval(timer);
