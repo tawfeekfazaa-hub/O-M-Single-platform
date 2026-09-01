@@ -23,6 +23,7 @@ frontend/.next/
 frontend/out/
 frontend/next-env.d.ts
 npm-debug.log*
+*.tsbuildinfo
 
 # IDE / OS
 .idea/
