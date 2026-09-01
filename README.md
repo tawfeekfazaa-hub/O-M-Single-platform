@@ -16,13 +16,30 @@ Read `CLAUDE.md`, `docs/PRD.md` and `docs/API-NOTES.md` before touching code.
 
 ## Backend quickstart
 
+Linux/macOS:
+
 ```bash
 cd backend
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 pytest                      # runs fully offline against the mock adapter
-uvicorn app.main:app --reload
+SCHEDULER_ENABLED=true uvicorn app.main:app --reload --reload-dir app
 ```
+
+Windows (PowerShell):
+
+```powershell
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt -r requirements-dev.txt
+pytest
+$env:SCHEDULER_ENABLED = "true"
+python -m uvicorn app.main:app --reload --reload-dir app
+```
+
+Always pass `--reload-dir app` with `--reload`: without it the watcher also
+watches `.venv/` and restarts the server on every package change.
 
 With no `.env`, the API runs in **mock mode** with an in-memory store and
 (if `SCHEDULER_ENABLED=true`) ingests data from the FusionSolar mock
@@ -42,6 +59,10 @@ cd frontend
 npm install
 npm run dev    # http://localhost:3000/plants — expects backend on :8000
 ```
+
+Run only ONE `npm run dev` at a time — a second instance falls back to
+another port and fights over the shared `.next/` build folder (EPERM on
+`.next/trace` on Windows).
 
 ## Configuration
 
