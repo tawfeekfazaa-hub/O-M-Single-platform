@@ -33,6 +33,9 @@ export default function PlantsPage() {
     abortRef.current = controller;
     try {
       const data = await fetchPlants(controller.signal);
+      // An aborted request must never update state, even when the fetch
+      // itself already resolved before the abort landed.
+      if (controller.signal.aborted) return;
       setPlants(data);
       setError(null);
       setUpdatedAt(new Date());
@@ -44,9 +47,17 @@ export default function PlantsPage() {
   }, []);
 
   useEffect(() => {
-    void load();
+    // Initial fetch is deferred to a microtask: state updates happen in the
+    // async fetch callback, never synchronously inside the effect body.
+    // The cancelled flag keeps the queued task from starting a request
+    // after the effect has already been cleaned up.
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) void load();
+    });
     const timer = setInterval(() => void load(), REFRESH_INTERVAL_MS);
     return () => {
+      cancelled = true;
       clearInterval(timer);
       abortRef.current?.abort();
     };

@@ -69,6 +69,37 @@ another port and fights over the shared `.next/` build folder (EPERM on
 All configuration via environment variables — see `.env.example`
 (names only; real values live in your untracked `.env`).
 
+## Security & development rules
+
+- **Credentials never leave `.env`.** Real Huawei/FusionSolar credentials
+  must never appear in GitHub (code, commits, branches), CI configuration
+  or logs, AI prompts, tests or fixtures, screenshots, or issue/PR
+  comments. `.env` is gitignored; `.env.example` carries names only.
+- **No public exposure.** The local API (`:8000`), the Next.js dev server
+  (`:3000`), and PostgreSQL (`127.0.0.1:5432` only) are development
+  services: never bind them to a public interface or forward them to the
+  internet.
+- **Real-mode ingestion is prohibited for now.** `FUSIONSOLAR_MODE=real`
+  stays off until follow-up PRs add vendor contract validation and
+  raw/quarantine storage. Development and CI run exclusively against the
+  mock adapter.
+- **`backend/scripts/check_fusionsolar.py` is NOT approved for live use
+  before PR-1.** It exists for future credential validation only; a green
+  mock run (or green tests) is no evidence that a real Huawei connection
+  works. Do not run it against real credentials, and do not print, log,
+  or commit real plant data anywhere.
+- CI enforces: ruff + pytest, `pip-audit` on the fully resolved production
+  tree and on the complete installed environment (blocking on any finding),
+  `npm audit` blocking on high/critical for production and for all
+  dependencies, ESLint, `tsc --noEmit`, production build, a `/plants`
+  smoke test against the built app, and a full-git-history TruffleHog scan
+  (checksum-pinned binary, no floating container tag).
+- **Known limitation**: the Python dependency tree is NOT hash-locked yet —
+  `requirements.txt` pins direct dependencies only, so builds are not fully
+  reproducible. Required follow-up before any deployment: generate hashed
+  lockfiles (e.g. `pip-compile --generate-hashes`) and install with
+  `--require-hashes`.
+
 ## Hard rules
 
 See `CLAUDE.md`. Highlights: no hardcoded credentials, all vendor calls go

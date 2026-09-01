@@ -1,13 +1,18 @@
 services:
   timescaledb:
-    image: timescale/timescaledb:latest-pg16
+    # Pinned release (TimescaleDB 2.29.2 on PostgreSQL 16) + manifest-list
+    # digest, both verified against the official Docker Hub repository
+    # hub.docker.com/r/timescale/timescaledb on 2026-09-01. Never use
+    # floating tags like latest-pg16.
+    image: timescale/timescaledb:2.29.2-pg16@sha256:289d55704b1b3ee8263cd3805c6930f9cd54506835a8f19f9b85dad17d5c5a8a
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-aq_om}
       POSTGRES_USER: ${POSTGRES_USER:-aq_om}
       # Set in your untracked .env; never commit real values.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     ports:
-      - "5432:5432"
+      # Loopback only — the database must never listen on a public interface.
+      - "127.0.0.1:5432:5432"
     volumes:
       - ./pgdata:/var/lib/postgresql/data
     healthcheck:

@@ -2,18 +2,37 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+# Least privilege: read-only token for every job.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Official release binary, pinned by version AND sha256 (verified against
+  # trufflehog_3.97.1_checksums.txt from the GitHub release). No container
+  # image is pulled, so no floating `latest` tag can be involved.
+  TRUFFLEHOG_VERSION: 3.97.1
+  TRUFFLEHOG_SHA256: f863ea3a8d786f7d097870496c977944cce7372a2fe1e56707d965016e543ece
 
 jobs:
   backend:
-    name: Backend — lint & tests
-    runs-on: ubuntu-latest
+    name: Backend — lint, audit & tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
           cache: pip
@@ -21,28 +40,91 @@ jobs:
             backend/requirements.txt
             backend/requirements-dev.txt
       - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt
+        run: |
+          # pip/setuptools are part of the audited environment below —
+          # the runner-provided versions may carry known advisories.
+          python -m pip install --upgrade pip setuptools
+          pip install -r requirements.txt -r requirements-dev.txt
       - name: Lint (ruff)
         run: |
           ruff check app tests scripts
           ruff format --check app tests scripts
+      # Fully resolves requirements.txt (including transitive dependencies)
+      # in an isolated environment and fails on ANY known vulnerability.
+      - name: Audit resolved production dependency tree (pip-audit, blocking)
+        run: pip-audit -r requirements.txt --strict
+      # Audits every distribution installed in the CI environment
+      # (production + development + their transitive dependencies).
+      - name: Audit complete installed environment (pip-audit, blocking)
+        run: pip-audit --strict
       - name: Tests (pytest, offline mock mode)
         run: pytest -q
 
   frontend:
-    name: Frontend — build
-    runs-on: ubuntu-latest
+    name: Frontend — audit, lint, typecheck, build & smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Install dependencies
+      - name: Install dependencies (clean)
         run: npm ci
+      - name: Audit production dependencies (blocking on high/critical)
+        run: npm audit --omit=dev --audit-level=high
+      - name: Audit all dependencies (blocking on high/critical)
+        run: npm audit --audit-level=high
+      - name: Lint (ESLint)
+        run: npm run lint
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
       - name: Build
         run: npm run build
+      # Boots the production build on loopback and verifies the plants
+      # dashboard route serves HTTP 200. Static mock-data route: no backend
+      # and no vendor connectivity involved.
+      - name: Smoke test — GET /plants must return 200
+        run: |
+          # The next binary is launched directly (no npm wrapper) so the
+          # trapped PID is the server itself and cleanup is guaranteed.
+          node_modules/.bin/next start --hostname 127.0.0.1 --port 3300 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          code=000
+          for attempt in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3300/plants || true)
+            if [ "$code" = "200" ]; then
+              echo "GET /plants -> HTTP 200 (attempt $attempt)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Smoke test FAILED: GET /plants -> HTTP $code after 30 attempts"
+          exit 1
+
+  secrets:
+    name: Secret scan (TruffleHog, full git history)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Download and verify TruffleHog ${{ env.TRUFFLEHOG_VERSION }}
+        run: |
+          curl -sSL -o trufflehog.tar.gz \
+            "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz"
+          echo "${TRUFFLEHOG_SHA256}  trufflehog.tar.gz" | sha256sum --check
+          tar xzf trufflehog.tar.gz trufflehog
+          ./trufflehog --version
+      - name: Scan full git history
+        run: ./trufflehog git "file://$(pwd)" --no-update --fail --results=verified,unknown
