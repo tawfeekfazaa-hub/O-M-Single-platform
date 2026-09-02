@@ -5,6 +5,7 @@ All offline via httpx.MockTransport; no other endpoint is ever tried."""
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -104,9 +105,20 @@ class StationListServer:
         return httpx.Response(200, json={"success": True, "failCode": 0, "data": data})
 
 
-def make_client(server: StationListServer, max_pages: int = 50) -> RealFusionSolarClient:
+def make_client(
+    server: StationListServer,
+    max_pages: int = 50,
+    *,
+    station_list_max_calls: int = 1000,
+    clock: Callable[[], float] | None = None,
+) -> RealFusionSolarClient:
+    # A generous default budget keeps the contract tests about the contract;
+    # a caller exercising budget behaviour passes its own budget and clock.
     policy = FusionSolarRatePolicy(
-        login_max_calls=100, station_list_max_calls=1000, station_list_window_seconds=86_400.0
+        login_max_calls=100,
+        station_list_max_calls=station_list_max_calls,
+        station_list_window_seconds=86_400.0,
+        **({"clock": clock} if clock is not None else {}),
     )
     return RealFusionSolarClient(
         base_url=BASE_URL,

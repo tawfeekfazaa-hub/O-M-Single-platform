@@ -509,6 +509,66 @@ async def test_a_growing_inventory_waits_for_the_earlier_bursts_to_expire(
     await client.close()
 
 
+async def test_a_capacity_hint_is_honoured_instead_of_a_full_window(
+    repository: InMemoryRepository,
+):
+    # The pre-flight check measures when EVERY page of the next attempt can
+    # run, so widening it to a full window only adds staleness. Here a
+    # 2-page fleet refreshed at hour 0 advertises 3 pages at hour 12: the
+    # hour-0 calls expire at hour 24, leaving exactly the three slots the
+    # retry needs. The old full-window rule pushed it to hour 36.
+    hour = 3600.0
+    clock = FakeClock()
+    server = StationListServer([[station_row(i) for i in range(100)], [station_row(100)]])
+    server.serve_kpi = True
+    client = make_station_list_client(server, station_list_max_calls=4, clock=clock)
+    scheduler = IngestionScheduler(
+        FusionSolarAdapter(client, allow_synthetic_fields=True),
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=24 * hour,
+        clock=clock,
+    )
+    assert (await scheduler.run_cycle()).inventory_refreshed
+
+    clock.now = 12 * hour
+    server.pages = [
+        [station_row(i) for i in range(100)],
+        [station_row(i) for i in range(100, 200)],
+        [station_row(200)],
+    ]
+    result = await scheduler.run_cycle()
+    assert result.inventory_rate_limited  # deferred, not half-run
+    assert scheduler._inventory_not_before == 24 * hour  # not 36
+
+    clock.now = 24 * hour
+    assert (await scheduler.run_cycle()).inventory_refreshed
+    await client.close()
+
+
+async def test_a_plain_rate_limit_still_waits_a_full_window(repository: InMemoryRepository):
+    # A hint that only frees ONE slot must still be widened: retrying on it
+    # would spend that slot and fail on the same page forever.
+    hour = 3600.0
+    clock = FakeClock()
+
+    class RateLimitedAdapter(FusionSolarAdapter):
+        async def list_plants(self) -> list[PlantInfo]:
+            raise AdapterRateLimitError("budget exhausted", retry_after_seconds=hour)
+
+    scheduler = IngestionScheduler(
+        RateLimitedAdapter(
+            MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+        ),
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=24 * hour,
+        clock=clock,
+    )
+    await scheduler.run_cycle()
+    assert scheduler._inventory_not_before == 24 * hour
+
+
 async def test_a_failed_refresh_defers_until_the_calls_it_spent_expire(
     repository: InMemoryRepository,
 ):

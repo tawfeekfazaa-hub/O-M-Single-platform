@@ -311,13 +311,19 @@ class IngestionScheduler:
                     # budget: a rate-limited refresh defers itself and must
                     # never abort KPI polling for this cycle.
                     self._stale_rate_limited = True
-                    # The limiter's hint frees ONE slot, which is not enough
-                    # for a paginated refresh: retrying then would spend the
-                    # same partial burst again and fail on the same page,
-                    # forever. Wait a full window so every call of the failed
-                    # burst has expired before the next attempt.
+                    # A plain limiter hint frees ONE slot, which is not
+                    # enough for a paginated refresh: retrying then would
+                    # spend the same partial burst again and fail on the
+                    # same page, forever. Wait a full window so every call
+                    # of the failed burst has expired first. The exception
+                    # is a hint the adapter measured for the WHOLE next
+                    # attempt (its pre-flight capacity check): widening
+                    # that one only adds staleness the budget did not ask
+                    # for.
                     deferral = exc.retry_after_seconds or self._inventory_refresh
-                    if self._station_list_window:
+                    if self._station_list_window and not getattr(
+                        exc, "retry_after_covers_whole_attempt", False
+                    ):
                         deferral = max(deferral, self._station_list_window)
                     self._inventory_not_before = self._clock() + self._failed_deferral(deferral)
                     logger.warning(

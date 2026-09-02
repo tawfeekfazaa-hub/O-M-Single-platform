@@ -80,11 +80,27 @@ class AdapterRateLimitError(AdapterError):
 
     ``retry_after_seconds`` is a hint for the scheduler's backoff; it is a
     lower bound, not a guarantee.
+
+    ``retry_after_covers_whole_attempt`` says what that delay actually
+    buys. A plain rate-limit hint frees ONE slot, which is not enough for a
+    multi-call operation: retrying then would spend the freed slot, fail
+    again at the same point and never make progress, so the scheduler
+    widens such a delay to a full window. When the adapter has instead
+    measured when the ENTIRE next attempt can run — a pre-flight capacity
+    check that knows how many calls it needs — the delay is already
+    sufficient and widening it only adds staleness.
     """
 
-    def __init__(self, message: str, retry_after_seconds: float | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        retry_after_seconds: float | None = None,
+        *,
+        retry_after_covers_whole_attempt: bool = False,
+    ) -> None:
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
+        self.retry_after_covers_whole_attempt = retry_after_covers_whole_attempt
 
 
 class VendorAdapter(ABC):

@@ -462,6 +462,10 @@ class RealFusionSolarClient:
                             "station list needs more pages than the station-list "
                             "budget has free; deferring the whole refresh",
                             retry_after_seconds=wait,
+                            # Measured for EVERY page the next attempt needs,
+                            # not for one freed slot: the scheduler can act on
+                            # it as-is instead of waiting out a whole window.
+                            retry_after_covers_whole_attempt=True,
                         )
                 elif echoed_page_count != page_count:
                     # The FIRST page's metadata is authoritative: values that

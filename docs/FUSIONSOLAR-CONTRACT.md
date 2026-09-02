@@ -126,7 +126,11 @@ mask authentication/version errors).
   other end: page 1 is the first moment the burst size is known, so the
   client checks the remaining pages against the free budget THERE and
   defers the whole refresh rather than spending calls on an inventory it
-  cannot finish. A refresh that fails part-way has still spent its calls,
+  cannot finish. That deferral uses the limiter's own answer as-is: a
+  plain rate-limit hint frees ONE slot and is widened to a full window
+  (retrying on it would fail on the same page forever), but a hint
+  measured for every page of the next attempt is already sufficient, and
+  widening it would only add staleness. A refresh that fails part-way has still spent its calls,
   so its slots are recorded like a successful burst's and the deferral
   covers them — otherwise the retry walks into a budget that cannot carry
   it, wastes another call and extends the staleness it was meant to end.
