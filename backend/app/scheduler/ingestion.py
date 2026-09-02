@@ -65,6 +65,10 @@ class CycleResult:
     # KPI polling still runs and the refresh is deferred, never hammered.
     inventory_error: str | None = None
     plants_upserted: int = 0
+    # Stations whose capacity was present but unreadable. Their stored
+    # capacity is KEPT (a failed validation never replaces good data), so
+    # this is the only trace that the vendor sent something unusable.
+    inventory_invalid_capacity: int = 0
     requested_plants: int = 0
     readings_returned: int = 0
     readings_written: int = 0
@@ -87,6 +91,7 @@ class CycleResult:
             or self.readings_duplicate > 0
             or self.readings_unexpected > 0
             or self.invalid_values > 0
+            or self.inventory_invalid_capacity > 0
         )
 
     @property
@@ -199,6 +204,7 @@ class IngestionScheduler:
         diag = getattr(self._adapter, "last_inventory_diagnostics", None)
         if diag is not None:
             result.inventory_pages = diag.pages_retrieved
+            result.inventory_invalid_capacity = getattr(diag, "invalid_capacity", 0)
             result.calls_consumed += diag.calls_consumed
             # Budget SLOTS, not transport attempts. One logical page request
             # reserves exactly one station-list slot; the retry after a
@@ -353,6 +359,13 @@ class IngestionScheduler:
                     # and aborting the cycle would stop KPI monitoring too.
                     # Defer the refresh instead and keep polling.
                     self._stale_error = str(exc)
+                    if getattr(exc, "blocks_authentication", False):
+                        # Except when the failure was the session itself: a
+                        # re-login after failCode 305 can time out or answer
+                        # 5xx just as it can be throttled. Polling on would
+                        # log in again into the same outage.
+                        self._record_failed_burst()
+                        raise
                     self._inventory_not_before = self._clock() + self._failed_deferral(
                         max(self._inventory_refresh, self._inventory_min_spacing)
                     )
@@ -427,13 +440,14 @@ class IngestionScheduler:
             # Counts only — no identifiers or values in this log line.
             logger.warning(
                 "ingestion cycle incomplete: requested=%d returned=%d missing=%d "
-                "duplicate=%d unexpected=%d invalid=%d",
+                "duplicate=%d unexpected=%d invalid=%d invalid_capacity=%d",
                 result.requested_plants,
                 result.readings_returned,
                 result.readings_missing,
                 result.readings_duplicate,
                 result.readings_unexpected,
                 result.invalid_values,
+                result.inventory_invalid_capacity,
             )
         self.stats.last_result = result
         return result

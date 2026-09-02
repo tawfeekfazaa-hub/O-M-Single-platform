@@ -54,6 +54,9 @@ class InventoryDiagnostics:
     variant: str = ""
     duplicates_removed: int = 0
     calls_consumed: int = 0
+    # Stations whose capacity was present but unreadable. Counted, never
+    # written: an unreadable value must not replace a good stored one.
+    invalid_capacity: int = 0
     # A failed retrieval still SPENT its calls. The scheduler needs that to
     # know when the budget can carry the next attempt; without it a refresh
     # that died on page 3 is retried while its own three calls are still
@@ -185,12 +188,12 @@ class FusionSolarAdapter(VendorAdapter):
             )
             raise
         plants: list[PlantInfo] = []
-        throwaway = KpiDiagnostics()  # numeric validation counter for capacity
+        capacity_check = KpiDiagnostics()  # numeric validation counter for capacity
         for station in result.stations:
             code = station.get("stationCode")
             if not code:
                 continue  # client already rejects these; belt and braces
-            capacity_mw = _finite_float(station.get("capacity"), throwaway)
+            capacity_mw = _finite_float(station.get("capacity"), capacity_check)
             plants.append(
                 PlantInfo(
                     vendor=self.vendor,
@@ -202,6 +205,7 @@ class FusionSolarAdapter(VendorAdapter):
                 )
             )
         self.last_inventory_diagnostics = InventoryDiagnostics(
+            invalid_capacity=capacity_check.invalid_values,
             stations=len(plants),
             pages_retrieved=result.pages_retrieved,
             variant=result.variant,

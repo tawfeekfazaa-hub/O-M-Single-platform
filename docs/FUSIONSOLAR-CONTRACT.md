@@ -237,13 +237,20 @@ mask authentication/version errors).
   outside the adapter error taxonomy and can never yield a delay that
   stalls the scheduler. *Whether your tenant sends Retry-After:*
   `unverified`.
-- A rate limit on **login** blocks everything, not just the call that hit
-  it: every other request needs that session. A station-list call answered
-  with failCode 305 re-logins, and that login can come back 429 — treating
-  it as a station-list throttle would defer the inventory and carry on to
-  KPI polling, which finds no token and logs in AGAIN, inside the delay the
-  vendor just asked for. The error carries this, and the whole cycle backs
-  off on the vendor's own hint instead.
+- ANY failure while establishing the session blocks everything, not just
+  the call that hit it: every other request needs that session. A
+  station-list call answered with failCode 305 re-logins, and that login
+  can come back 429, time out, or answer 5xx — treating it as a
+  station-list failure would defer the inventory and carry on to KPI
+  polling, which finds no token and logs in AGAIN, inside the delay the
+  vendor asked for or into the same outage. The error carries this
+  regardless of its kind, and the whole cycle backs off instead.
+- A capacity that is present but unreadable is COUNTED, never written. The
+  adapter reports `None` both for an absent capacity and for one that
+  failed validation, so an upsert that wrote it would silently replace a
+  good stored value: a missing capacity means "not reported", not "the
+  plant lost its capacity". The count marks the cycle incomplete, which is
+  the only trace the vendor sent something unusable.
 - Timeouts, connection failures, 500/502/503/504 → transient error →
   scheduler backoff with jitter (no blind retries). Jitter (0.75x–1.25x)
   applies to the BACKOFF only: a vendor `Retry-After` and the configured

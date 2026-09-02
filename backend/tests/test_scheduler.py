@@ -513,6 +513,75 @@ async def test_a_growing_inventory_waits_for_the_earlier_bursts_to_expire(
     await client.close()
 
 
+async def test_a_transient_relogin_failure_aborts_the_cycle_too(
+    repository: InMemoryRepository,
+):
+    # The session can fail to establish for reasons other than a throttle: a
+    # re-login after failCode 305 can time out or answer 5xx. Deferring only
+    # the refresh and polling on would log in again into the same outage,
+    # spending another scarce login slot each cycle.
+    class Server:
+        def __init__(self) -> None:
+            self.paths: list[str] = []
+            self.logins = 0
+            self.expire_once = True
+
+        def handler(self, request: httpx.Request) -> httpx.Response:
+            path = request.url.path.removeprefix("/thirdData")
+            self.paths.append(path)
+            if path == "/login":
+                self.logins += 1
+                if self.logins >= 2:
+                    return httpx.Response(503, json={})  # vendor outage
+                return httpx.Response(
+                    200, json={"success": True, "failCode": 0}, headers={XSRF_HEADER: "tok"}
+                )
+            if path == "/getStationList":
+                if self.expire_once:
+                    self.expire_once = False
+                    return httpx.Response(200, json={"success": False, "failCode": 305})
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "failCode": 0,
+                        "data": {
+                            "list": [station_row(1)],
+                            "pageNo": 1,
+                            "pageSize": 100,
+                            "pageCount": 1,
+                            "total": 1,
+                        },
+                    },
+                )
+            raise AssertionError("KPI polling must not run after a failed session")
+
+    server = Server()
+    client = RealFusionSolarClient(
+        base_url="https://fake.fusionsolar.example/thirdData",
+        username="nb-user",
+        system_code="nb-system-code",
+        policy=FusionSolarRatePolicy(
+            login_max_calls=10, station_list_max_calls=4, station_list_window_seconds=86_400.0
+        ),
+        transport=httpx.MockTransport(server.handler),
+    )
+    await repository.upsert_plants(
+        [PlantInfo(vendor="fusionsolar", vendor_plant_id="NE=1", name="x")]
+    )
+    scheduler = IngestionScheduler(
+        FusionSolarAdapter(client, allow_synthetic_fields=True),
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=86_400.0,
+    )
+
+    result = await scheduler.run_cycle()
+    assert server.logins == 2  # the failed one, and no third
+    assert result.transient and result.error is not None
+    await client.close()
+
+
 async def test_a_throttled_relogin_aborts_the_cycle_instead_of_polling_on(
     repository: InMemoryRepository,
 ):

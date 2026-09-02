@@ -326,3 +326,38 @@ async def test_rows_are_validated_against_their_own_batch():
     diag = adapter.last_kpi_diagnostics
     assert diag.unexpected == 1  # the misrouted row was rejected and counted
     assert diag.duplicates == 0  # the correct row was never treated as a dup
+
+
+async def test_an_unreadable_capacity_is_counted_and_not_written():
+    # It used to go into a throwaway diagnostics object: the refresh looked
+    # clean while the station's capacity silently became None.
+    class Client:
+        async def login(self) -> None: ...
+
+        def is_logged_in(self) -> bool:
+            return True
+
+        def set_kpi_plant_count(self, plant_count: int) -> None: ...
+
+        def call_counts(self) -> ClientCallCounts:
+            return ClientCallCounts()
+
+        async def list_stations(self) -> StationListResult:
+            return StationListResult(
+                stations=[
+                    {"stationCode": "NE=1", "stationName": "A", "capacity": 2.5},
+                    {"stationCode": "NE=2", "stationName": "B", "capacity": float("inf")},
+                ],
+                variant="paginated",
+                pages_retrieved=1,
+            )
+
+        async def get_station_real_kpi(self, station_codes: list[str]) -> KpiBatchResult:
+            raise AssertionError("not used")
+
+        async def close(self) -> None: ...
+
+    adapter = FusionSolarAdapter(Client())
+    plants = await adapter.list_plants()
+    assert [p.capacity_kwp for p in plants] == [2500.0, None]
+    assert adapter.last_inventory_diagnostics.invalid_capacity == 1

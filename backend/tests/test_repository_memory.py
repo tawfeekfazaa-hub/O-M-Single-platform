@@ -76,3 +76,26 @@ async def test_per_plant_isolation(repository: InMemoryRepository):
     assert (await repository.latest_kpi(p2.id)).active_power_kw == 20.0
     only_p1 = await repository.kpi_history(p1.id, T0 - timedelta(days=1), T0 + timedelta(days=1))
     assert all(p.plant_id == p1.id for p in only_p1)
+
+
+async def test_an_unreported_capacity_never_erases_a_stored_one():
+    # The adapter reports capacity None both when the vendor omits it and
+    # when the value it sent could not be read. Writing that over a good
+    # stored value is silent metadata loss, so a missing capacity means "no
+    # update" rather than "unknown now".
+    repo = InMemoryRepository()
+    await repo.upsert_plants(
+        [PlantInfo(vendor="fusionsolar", vendor_plant_id="NE=1", name="P", capacity_kwp=2500.0)]
+    )
+    await repo.upsert_plants(
+        [PlantInfo(vendor="fusionsolar", vendor_plant_id="NE=1", name="P", capacity_kwp=None)]
+    )
+    (plant,) = await repo.list_plants()
+    assert plant.capacity_kwp == 2500.0
+
+    # A capacity the vendor DOES report still updates the stored one.
+    await repo.upsert_plants(
+        [PlantInfo(vendor="fusionsolar", vendor_plant_id="NE=1", name="P", capacity_kwp=3100.0)]
+    )
+    (plant,) = await repo.list_plants()
+    assert plant.capacity_kwp == 3100.0

@@ -305,6 +305,18 @@ class RealFusionSolarClient:
 
     async def login(self) -> None:
         """Establish a session. Single-flight: concurrent callers share one login."""
+        try:
+            await self._login()
+        except AdapterError as exc:
+            # Whatever went wrong — throttle, outage, bad credentials — it
+            # went wrong ESTABLISHING the session. Every later call needs
+            # one, so a caller that carries on would just log in again,
+            # spending another scarce login slot on an endpoint that is
+            # already failing.
+            exc.blocks_authentication = True
+            raise
+
+    async def _login(self) -> None:
         async with self._login_lock:
             if self._token is not None:
                 return

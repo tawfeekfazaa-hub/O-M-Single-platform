@@ -58,7 +58,19 @@ class PlantKpiReading:
 
 
 class AdapterError(Exception):
-    """Base class for all vendor adapter failures."""
+    """Base class for all vendor adapter failures.
+
+    ``blocks_authentication`` marks a failure that happened while
+    ESTABLISHING the session, whatever its kind. Every other call needs
+    that session, so a caller that treats such a failure as belonging to
+    the operation it happened to be running would move on to the next one,
+    re-authenticate immediately, and spend another scarce login slot —
+    turning a vendor outage into a client-side login throttle.
+    """
+
+    def __init__(self, message: str, *, blocks_authentication: bool = False) -> None:
+        super().__init__(message)
+        self.blocks_authentication = blocks_authentication
 
 
 class AdapterAuthError(AdapterError):
@@ -90,12 +102,9 @@ class AdapterRateLimitError(AdapterError):
     check that knows how many calls it needs — the delay is already
     sufficient and widening it only adds staleness.
 
-    ``blocks_authentication`` marks a throttle on the endpoint that
-    establishes the session. Every other call needs that session, so no
-    further work is possible until the delay has passed: a caller that
-    treats it as a throttle of the operation it happened to be running
-    would move on to the next one, re-authenticate, and send another
-    request to the very endpoint the vendor just throttled.
+    ``blocks_authentication`` (inherited) additionally means the vendor
+    itself asked for the delay on the login endpoint, so the wait is not
+    just "no session" but "do not call login again yet".
     """
 
     def __init__(
@@ -106,10 +115,9 @@ class AdapterRateLimitError(AdapterError):
         retry_after_covers_whole_attempt: bool = False,
         blocks_authentication: bool = False,
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, blocks_authentication=blocks_authentication)
         self.retry_after_seconds = retry_after_seconds
         self.retry_after_covers_whole_attempt = retry_after_covers_whole_attempt
-        self.blocks_authentication = blocks_authentication
 
 
 class VendorAdapter(ABC):

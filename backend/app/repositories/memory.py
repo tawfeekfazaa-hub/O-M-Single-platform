@@ -42,7 +42,13 @@ class InMemoryRepository(Repository):
             else:
                 plant = self._plants[plant_id]
                 plant.name = info.name
-                plant.capacity_kwp = info.capacity_kwp
+                if info.capacity_kwp is not None:
+                    # Capacity is static metadata that the adapter reports
+                    # as None both when the vendor omits it and when the
+                    # value it sent could not be read. Overwriting a good
+                    # stored value with that is silent data loss, so a
+                    # missing capacity means "no update", not "unknown now".
+                    plant.capacity_kwp = info.capacity_kwp
                 plant.address = info.address
                 plant.updated_at = now
             result.append(self._plants[plant_id])
