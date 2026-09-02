@@ -445,3 +445,44 @@ async def test_a_failed_batch_still_publishes_what_it_spent():
     diag = adapter.last_kpi_diagnostics
     assert diag.requested == 150 and diag.returned == 0  # the FAILED attempt
     assert diag.calls_consumed == 1  # and the call it spent is visible
+
+
+async def test_an_unreadable_data_map_never_becomes_a_reading():
+    # Substituting {} builds a reading with every KPI unset and status
+    # UNKNOWN, which the repository writes over a healthy stored status:
+    # one malformed row silently downgrading a plant.
+    class Client:
+        async def login(self) -> None: ...
+
+        def is_logged_in(self) -> bool:
+            return True
+
+        def set_kpi_plant_count(self, plant_count: int) -> None: ...
+
+        def call_counts(self) -> ClientCallCounts:
+            return ClientCallCounts()
+
+        async def list_stations(self) -> StationListResult:
+            raise AssertionError("not used")
+
+        async def get_station_real_kpi(self, station_codes: list[str]) -> KpiBatchResult:
+            return KpiBatchResult(
+                rows=[
+                    {"stationCode": "NE=1", "dataItemMap": "not-an-object"},
+                    {"stationCode": "NE=2", "dataItemMap": ["not", "an", "object"]},
+                    {"stationCode": "NE=3", "dataItemMap": {"day_power": 4.0}},
+                ],
+                vendor_current_time_ms=VENDOR_MS,
+            )
+
+        async def close(self) -> None: ...
+
+    adapter = FusionSolarAdapter(Client())
+    readings = await adapter.fetch_plant_kpis(["NE=1", "NE=2", "NE=3"])
+    assert [r.vendor_plant_id for r in readings] == ["NE=3"]  # only the readable row
+    diag = adapter.last_kpi_diagnostics
+    assert diag.invalid_values == 2
+    # Counted as unreadable rather than missing: the vendor DID answer for
+    # them, with something unusable. Either way invalid_values makes the
+    # cycle incomplete, and requested=3 vs returned=1 shows the gap.
+    assert (diag.requested, diag.returned, diag.missing) == (3, 1, 0)

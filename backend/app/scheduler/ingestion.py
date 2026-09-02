@@ -319,6 +319,11 @@ class IngestionScheduler:
             # configured refresh cadence still applies.
             return 0.0
 
+    def _login_count(self) -> int:
+        """Logins the client has sent so far; 0 when it does not count."""
+        counts = getattr(getattr(self._adapter, "_client", None), "call_counts", None)
+        return counts().login if callable(counts) else 0
+
     def _copy_kpi_diagnostics(self, result: CycleResult) -> None:
         """Mirror the adapter's KPI counts onto the cycle result."""
         diag = getattr(self._adapter, "last_kpi_diagnostics", None)
@@ -335,6 +340,7 @@ class IngestionScheduler:
     async def run_cycle(self) -> CycleResult:
         """One ingestion pass. Never raises — errors land in the result."""
         result = CycleResult()
+        logins_before = self._login_count()
         try:
             await self._adapter.authenticate()
 
@@ -358,7 +364,9 @@ class IngestionScheduler:
                         # another request on the endpoint the vendor just
                         # throttled. The whole cycle backs off instead, on
                         # the vendor's own delay.
-                        self._record_failed_burst(result)
+                        self._inventory_not_before = self._clock() + self._failed_deferral(
+                            self._inventory_refresh, result
+                        )
                         raise
                     # A plain limiter hint frees ONE slot, which is not
                     # enough for a paginated refresh: retrying then would
@@ -394,7 +402,9 @@ class IngestionScheduler:
                         # re-login after failCode 305 can time out or answer
                         # 5xx just as it can be throttled. Polling on would
                         # log in again into the same outage.
-                        self._record_failed_burst(result)
+                        self._inventory_not_before = self._clock() + self._failed_deferral(
+                            self._inventory_refresh, result
+                        )
                         raise
                     self._inventory_not_before = self._clock() + self._failed_deferral(
                         max(self._inventory_refresh, self._inventory_min_spacing), result
@@ -459,6 +469,11 @@ class IngestionScheduler:
         except AdapterError as exc:
             result.error = str(exc)
             logger.error("ingestion cycle failed: %s", exc)
+
+        # Logins are a separate, scarcer Huawei budget, and both the
+        # authenticate step and any re-login inside an operation spend one.
+        # Counted on every path, since a failed cycle spends them too.
+        result.calls_consumed += max(self._login_count() - logins_before, 0)
 
         self.stats.cycles_total += 1
         if result.error is None:

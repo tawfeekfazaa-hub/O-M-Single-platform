@@ -138,7 +138,11 @@ mask authentication/version errors).
   so its slots are recorded like a successful burst's, counted in the
   cycle's call total, and the deferral RESERVES the pages the vendor
   advertised rather than the ones the failure happened to spend (the retry
-  restarts at page 1 and needs them all) — otherwise the retry walks into a budget that cannot carry
+  restarts at page 1 and needs them all). The advertised count is recorded
+  BEFORE the page guard rejects it — an over-guard inventory cannot succeed
+  until the configuration changes, so it must wait a full window rather
+  than spend page 1 every 6 h — and is kept until page 1 actually answers,
+  since a page-1 timeout would otherwise erase the only estimate there is — otherwise the retry walks into a budget that cannot carry
   it, wastes another call and extends the staleness it was meant to end.
   `pages` here means BUDGET SLOTS, not HTTP attempts: the retry after a
   failCode 305 reuses the slot its rejected attempt already paid for, so it
@@ -251,6 +255,13 @@ mask authentication/version errors).
   issued is rejected too, so the token is DROPPED and the session marked
   unusable — keeping it would send the next call out with a token the
   vendor has already refused and spend a third login to learn that again.
+- A KPI row whose `dataItemMap` is not an object is COUNTED and SKIPPED,
+  never turned into a reading. Substituting an empty map builds a reading
+  with every KPI unset and status UNKNOWN, which the repository then writes
+  over a healthy stored status: one malformed row silently downgrading a
+  plant. A row we cannot read is a row we do not have.
+- Every vendor request a cycle makes is in its call total, LOGINS included
+  (a separate, scarcer budget) and failed attempts included.
 - A capacity that is present but unreadable is COUNTED, never written. The
   adapter reports `None` both for an absent capacity and for one that
   failed validation, so an upsert that wrote it would silently replace a

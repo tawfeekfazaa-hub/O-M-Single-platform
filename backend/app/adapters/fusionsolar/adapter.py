@@ -281,8 +281,13 @@ class FusionSolarAdapter(VendorAdapter):
                     seen.add(code)
                     item = row.get("dataItemMap")
                     if not isinstance(item, dict):
+                        # Substituting {} would build a reading with every
+                        # KPI unset and status UNKNOWN, which the repository
+                        # then writes over a healthy stored status: one
+                        # malformed row silently downgrading a plant. A row
+                        # we cannot read is a row we do not have.
                         diagnostics.invalid_values += 1
-                        item = {}
+                        continue
 
                     if self._allow_synthetic_fields:
                         # SYNTHETIC mock-only field; see mock_client docstring.

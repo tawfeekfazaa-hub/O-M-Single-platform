@@ -552,3 +552,30 @@ async def test_textual_pagination_metadata_is_a_protocol_error(field: str):
     with pytest.raises(AdapterProtocolError):
         await client.list_stations()
     await client.close()
+
+
+async def test_a_page_one_failure_keeps_the_last_known_page_count():
+    # Until page 1 answers, the last known size is the only estimate there
+    # is: resetting it would report one page for an inventory known to need
+    # four, and the caller would under-reserve the retry.
+    pages = [[station(i) for i in range(100)], [station(100)]]
+    server = StationListServer(pages)
+    client = make_client(server)
+    await client.list_stations()
+    assert client.last_advertised_pages == 2
+
+    server.data_override = "not-an-envelope"  # page 1 comes back malformed
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    assert client.last_advertised_pages == 2  # preserved, not reset to 1
+    await client.close()
+
+
+async def test_a_direct_list_reports_one_page_once_confirmed():
+    # The legacy variant IS one complete call — but only once the response
+    # has been classified, not assumed before it arrives.
+    server = StationListServer(pages=None, direct=[station(1)])
+    client = make_client(server)
+    await client.list_stations()
+    assert client.last_advertised_pages == 1
+    await client.close()

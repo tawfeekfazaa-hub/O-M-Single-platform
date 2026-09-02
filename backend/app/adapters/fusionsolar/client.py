@@ -476,6 +476,11 @@ class RealFusionSolarClient:
 
     def _parse_page_count(self, data: dict[str, Any]) -> int:
         count = self._require_int(data, "pageCount")
+        # Remember it BEFORE the guard rejects it: an over-guard inventory
+        # cannot succeed until the configuration changes, and reporting one
+        # page would have the caller retry on the ordinary cadence, spending
+        # page 1 again every time.
+        self.last_advertised_pages = max(self.last_advertised_pages, count)
         if count > self._max_pages:
             # Fail on page 1 (one call) instead of burning the whole budget
             # and dying part-way. The guard is min(configured pages, the
@@ -489,7 +494,9 @@ class RealFusionSolarClient:
 
     async def list_stations(self) -> StationListResult:
         stations: list[dict[str, Any]] = []
-        self.last_advertised_pages = 1  # a direct list is one complete call
+        # NOT reset here: until page 1 answers, the last known size is the
+        # only estimate there is, and a page-1 timeout would otherwise
+        # report one page for an inventory known to need four.
         seen: dict[str, dict[str, Any]] = {}
         duplicates_removed = 0
         variant: str | None = None
@@ -520,6 +527,8 @@ class RealFusionSolarClient:
                 variant = "direct_list"
                 rows = data
                 page_count = 1
+                # Confirmed only now: a direct list IS one complete call.
+                self.last_advertised_pages = 1
             elif isinstance(data, dict):
                 variant = "paginated"
                 rows = data.get("list")
@@ -546,7 +555,6 @@ class RealFusionSolarClient:
                     page_count = echoed_page_count
                     page_size = echoed_page_size
                     total = echoed_total
-                    self.last_advertised_pages = echoed_page_count
                     # Page 1 is the first moment the burst size is known.
                     # Starting a burst the budget cannot finish spends
                     # calls on an inventory that is never retrieved, and

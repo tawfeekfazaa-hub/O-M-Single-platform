@@ -13,7 +13,11 @@ from app.adapters.base import (
     PlantKpiReading,
     VendorAdapter,
 )
-from app.adapters.fusionsolar.adapter import FusionSolarAdapter, KpiDiagnostics
+from app.adapters.fusionsolar.adapter import (
+    FusionSolarAdapter,
+    InventoryDiagnostics,
+    KpiDiagnostics,
+)
 from app.adapters.fusionsolar.client import XSRF_HEADER, RealFusionSolarClient
 from app.adapters.fusionsolar.mock_client import MockFusionSolarClient
 from app.adapters.fusionsolar.policy import FusionSolarRatePolicy
@@ -511,6 +515,65 @@ async def test_a_growing_inventory_waits_for_the_earlier_bursts_to_expire(
     await scheduler._refresh_inventory(CycleResult())
     assert scheduler._inventory_min_spacing == 12 * hour
     await client.close()
+
+
+async def test_an_over_guard_inventory_defers_a_full_window(
+    repository: InMemoryRepository,
+):
+    # An inventory advertising more pages than the effective guard cannot
+    # succeed until the configuration changes. Reporting one page would have
+    # it retried on the 6 h cadence, spending page 1 four times a day.
+    hour = 3600.0
+    clock = FakeClock()
+    server = StationListServer([[station_row(1)]])
+    server.serve_kpi = True
+    server.page_count_override = 50  # far beyond the 4-call guard
+    client = make_station_list_client(server, max_pages=4, station_list_max_calls=4, clock=clock)
+    scheduler = IngestionScheduler(
+        FusionSolarAdapter(client, allow_synthetic_fields=True),
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=24 * hour,
+        clock=clock,
+    )
+    result = await scheduler.run_cycle()
+    assert result.inventory_error is not None
+    assert scheduler._adapter.last_inventory_diagnostics.pages_advertised == 50
+    assert scheduler._inventory_not_before == 24 * hour  # not the 6 h cadence
+    # The login and the station-list call it spent are both in the total.
+    assert result.calls_consumed >= 2
+    await client.close()
+
+
+async def test_a_session_blocked_refresh_is_still_deferred(repository: InMemoryRepository):
+    # Aborting the cycle on a session failure must not leave the refresh due
+    # again as soon as the login delay passes: its calls are still held, and
+    # the retry would spend page 1 before finding that out.
+    hour = 3600.0
+    clock = FakeClock()
+
+    class BlockedAdapter(FusionSolarAdapter):
+        async def list_plants(self) -> list[PlantInfo]:
+            self.last_inventory_diagnostics = InventoryDiagnostics(
+                calls_consumed=2, pages_advertised=4, failed=True
+            )
+            raise AdapterRateLimitError(
+                "login throttled", retry_after_seconds=600.0, blocks_authentication=True
+            )
+
+    scheduler = IngestionScheduler(
+        BlockedAdapter(
+            MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+        ),
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=24 * hour,
+        clock=clock,
+    )
+    result = await scheduler.run_cycle()
+    assert result.rate_limited and result.error is not None  # the cycle aborted
+    clock.now = 600.0  # the login delay elapses
+    assert not scheduler._inventory_due()  # but the refresh is still deferred
 
 
 async def test_a_failed_refresh_reserves_the_pages_the_retry_needs(
