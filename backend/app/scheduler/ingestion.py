@@ -1,10 +1,17 @@
 """Central ingestion scheduler.
 
 The ONLY component allowed to call vendor adapters (CLAUDE.md rule 2).
-One periodic cycle: list plants -> upsert -> fetch KPIs -> store. On
-rate-limit or transient vendor errors it backs off exponentially with
-jitter instead of hammering the API. Clock/sleep/jitter are injectable so
-tests run instantly.
+
+Two independent cadences (docs/FUSIONSOLAR-CONTRACT.md):
+- station INVENTORY refresh — conservative (default 6 h): the vendor's
+  station-list budget is tiny, so it must NOT be called on every cycle;
+- real-time KPI polling — every cycle, reading the plant list from the
+  repository cache and fetching KPIs in sequential batches.
+
+On rate-limit or transient vendor errors the scheduler backs off
+exponentially with jitter instead of hammering the API. Clock/sleep/
+jitter are injectable so tests run instantly. Cycle diagnostics carry
+counts only — never plant identifiers, names, or KPI values.
 """
 
 from __future__ import annotations
@@ -12,10 +19,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from app.adapters.base import AdapterError, AdapterRateLimitError, VendorAdapter
+from app.adapters.base import (
+    AdapterError,
+    AdapterRateLimitError,
+    AdapterTransientError,
+    VendorAdapter,
+)
 from app.repositories.base import Repository
 
 logger = logging.getLogger(__name__)
@@ -23,19 +36,50 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class CycleResult:
+    """Counts-only outcome of one scheduler cycle."""
+
+    inventory_refreshed: bool = False
+    inventory_pages: int = 0
     plants_upserted: int = 0
+    requested_plants: int = 0
+    readings_returned: int = 0
     readings_written: int = 0
-    error: str | None = None
+    readings_missing: int = 0
+    readings_duplicate: int = 0
+    readings_unexpected: int = 0
+    invalid_values: int = 0
+    batches: int = 0
+    calls_consumed: int = 0
     rate_limited: bool = False
     retry_after_seconds: float | None = None
+    transient: bool = False
+    error: str | None = None
+
+    @property
+    def partial(self) -> bool:
+        """True when the vendor answered but the data set was not whole."""
+        return (
+            self.readings_missing > 0
+            or self.readings_duplicate > 0
+            or self.readings_unexpected > 0
+            or self.invalid_values > 0
+        )
+
+    @property
+    def complete_success(self) -> bool:
+        """A cycle counts as fully successful ONLY with no error and no
+        partial/malformed data — a partial response is never reported as
+        a complete ingestion."""
+        return self.error is None and not self.partial
 
 
 @dataclass(slots=True)
 class SchedulerStats:
     cycles_total: int = 0
     cycles_failed: int = 0
+    cycles_partial: int = 0
     consecutive_failures: int = 0
-    last_result: CycleResult | None = None
+    last_result: CycleResult | None = field(default=None)
 
 
 class IngestionScheduler:
@@ -45,37 +89,86 @@ class IngestionScheduler:
         repository: Repository,
         *,
         interval_seconds: float = 300.0,
+        min_interval_seconds: float = 0.0,
+        inventory_refresh_seconds: float = 21_600.0,
         backoff_base_seconds: float = 60.0,
         backoff_max_seconds: float = 1800.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter: Callable[[], float] = random.random,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._adapter = adapter
         self._repository = repository
-        self._interval = interval_seconds
+        # min_interval lets real-mode wiring enforce the KPI window+margin.
+        self._interval = max(interval_seconds, min_interval_seconds)
+        self._inventory_refresh = inventory_refresh_seconds
         self._backoff_base = backoff_base_seconds
         self._backoff_max = backoff_max_seconds
         self._sleep = sleep
         self._jitter = jitter
+        self._clock = clock
+        self._last_inventory_at: float | None = None
         self.stats = SchedulerStats()
         self._stopping = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+
+    @property
+    def interval_seconds(self) -> float:
+        return self._interval
+
+    def _inventory_due(self) -> bool:
+        if self._last_inventory_at is None:
+            return True
+        return (self._clock() - self._last_inventory_at) >= self._inventory_refresh
+
+    async def _refresh_inventory(self, result: CycleResult) -> None:
+        plants = await self._adapter.list_plants()
+        await self._repository.upsert_plants(plants)
+        self._last_inventory_at = self._clock()
+        result.inventory_refreshed = True
+        result.plants_upserted = len(plants)
+        diag = getattr(self._adapter, "last_inventory_diagnostics", None)
+        if diag is not None:
+            result.inventory_pages = diag.pages_retrieved
+            result.calls_consumed += diag.calls_consumed
 
     async def run_cycle(self) -> CycleResult:
         """One ingestion pass. Never raises — errors land in the result."""
         result = CycleResult()
         try:
             await self._adapter.authenticate()
-            plants = await self._adapter.list_plants()
-            await self._repository.upsert_plants(plants)
-            result.plants_upserted = len(plants)
-            readings = await self._adapter.fetch_plant_kpis([p.vendor_plant_id for p in plants])
-            result.readings_written = await self._repository.record_kpis(readings)
+
+            # Inventory on its own conservative cadence — never every cycle.
+            if self._inventory_due():
+                await self._refresh_inventory(result)
+
+            # KPI polling uses the repository inventory, not a vendor call.
+            plants = [
+                p for p in await self._repository.list_plants() if p.vendor == self._adapter.vendor
+            ]
+            codes = [p.vendor_plant_id for p in plants]
+            result.requested_plants = len(codes)
+            if codes:
+                readings = await self._adapter.fetch_plant_kpis(codes)
+                result.readings_returned = len(readings)
+                result.readings_written = await self._repository.record_kpis(readings)
+                diag = getattr(self._adapter, "last_kpi_diagnostics", None)
+                if diag is not None:
+                    result.readings_missing = diag.missing
+                    result.readings_duplicate = diag.duplicates
+                    result.readings_unexpected = diag.unexpected
+                    result.invalid_values = diag.invalid_values
+                    result.batches = diag.batches
+                    result.calls_consumed += diag.calls_consumed
         except AdapterRateLimitError as exc:
             result.rate_limited = True
             result.error = str(exc)
             result.retry_after_seconds = exc.retry_after_seconds
             logger.warning("ingestion rate-limited: %s", exc)
+        except AdapterTransientError as exc:
+            result.transient = True
+            result.error = str(exc)
+            logger.warning("ingestion transient failure: %s", exc)
         except AdapterError as exc:
             result.error = str(exc)
             logger.error("ingestion cycle failed: %s", exc)
@@ -86,6 +179,19 @@ class IngestionScheduler:
         else:
             self.stats.cycles_failed += 1
             self.stats.consecutive_failures += 1
+        if result.error is None and result.partial:
+            self.stats.cycles_partial += 1
+            # Counts only — no identifiers or values in this log line.
+            logger.warning(
+                "ingestion cycle partial: requested=%d returned=%d missing=%d "
+                "duplicate=%d unexpected=%d invalid=%d",
+                result.requested_plants,
+                result.readings_returned,
+                result.readings_missing,
+                result.readings_duplicate,
+                result.readings_unexpected,
+                result.invalid_values,
+            )
         self.stats.last_result = result
         return result
 
@@ -95,7 +201,7 @@ class IngestionScheduler:
             return self._interval
         exponent = min(self.stats.consecutive_failures - 1, 5)
         delay = min(self._backoff_max, self._backoff_base * (2**exponent))
-        # The vendor's retry-after hint is a lower bound on the wait.
+        # The vendor's/budget's retry-after hint is a lower bound on the wait.
         if result.retry_after_seconds is not None:
             delay = max(delay, result.retry_after_seconds)
         # 0.75x..1.25x jitter so multiple deployments don't sync up.
