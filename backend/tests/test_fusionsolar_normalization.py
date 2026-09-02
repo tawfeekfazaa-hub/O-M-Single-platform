@@ -7,6 +7,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
+
 from app.adapters.base import PlantStatus
 from app.adapters.fusionsolar.adapter import (
     FusionSolarAdapter,
@@ -141,10 +143,35 @@ async def test_mock_adapter_maps_synthetic_active_power():
 
 
 async def test_unknown_health_state_maps_to_unknown():
+    # A numeric code outside 1/2/3 is the documented "else unknown" case:
+    # UNKNOWN, and NOT counted as invalid data.
     client = ScriptedClient([kpi_row("NE=1", real_health_state=9)])
     adapter = real_adapter(client)
     (reading,) = await adapter.fetch_plant_kpis(["NE=1"])
     assert reading.status is PlantStatus.UNKNOWN
+    assert adapter.last_kpi_diagnostics.invalid_values == 0
+
+
+async def test_absent_health_state_is_unknown_without_counting():
+    client = ScriptedClient([kpi_row("NE=1", day_power=1.0)])
+    adapter = real_adapter(client)
+    (reading,) = await adapter.fetch_plant_kpis(["NE=1"])
+    assert reading.status is PlantStatus.UNKNOWN
+    assert adapter.last_kpi_diagnostics.complete
+
+
+@pytest.mark.parametrize("bad", ["broken", True, float("nan"), float("inf"), [3]])
+async def test_malformed_health_state_is_counted_as_invalid(bad: Any):
+    # Present but unreadable is malformed data — otherwise the scheduler
+    # would report the response as a complete success and persist the
+    # bogus status.
+    client = ScriptedClient([kpi_row("NE=1", day_power=1.0, real_health_state=bad)])
+    adapter = real_adapter(client)
+    (reading,) = await adapter.fetch_plant_kpis(["NE=1"])
+    assert reading.status is PlantStatus.UNKNOWN
+    diag = adapter.last_kpi_diagnostics
+    assert diag.invalid_values == 1
+    assert not diag.complete
 
 
 async def test_missing_pr_stays_none_without_invalid_count():

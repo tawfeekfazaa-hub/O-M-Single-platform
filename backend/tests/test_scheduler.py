@@ -191,35 +191,62 @@ async def test_min_interval_floor_is_enforced(repository: InMemoryRepository):
     assert scheduler.interval_seconds == 330.0
 
 
+class SilentOnOneStationClient(MockFusionSolarClient):
+    """Lists every station but returns no KPI row for one of them."""
+
+    SILENT = "NE=MOCK003"
+
+    async def get_station_real_kpi(self, station_codes):
+        result = await super().get_station_real_kpi(station_codes)
+        result.rows = [r for r in result.rows if r["stationCode"] != self.SILENT]
+        return result
+
+
 async def test_partial_response_is_never_a_complete_success(
     repository: InMemoryRepository,
 ):
-    # Mock returns rows only for stations it knows; unknown code -> missing.
-    client = MockFusionSolarClient(now=lambda: FIXED_NOON_UTC)
-    adapter = mock_adapter(client)
-    scheduler = make_scheduler(adapter, repository)
-    await scheduler.run_cycle()
+    # The station IS in the current vendor inventory, but the KPI response
+    # omits it — a genuine partial answer, not a stale local row.
+    client = SilentOnOneStationClient(now=lambda: FIXED_NOON_UTC)
+    scheduler = make_scheduler(mock_adapter(client), repository)
 
-    # Inject a plant the vendor will not answer for.
-    from app.adapters.base import PlantInfo
-
-    await repository.upsert_plants(
-        [
-            PlantInfo(
-                vendor="fusionsolar",
-                vendor_plant_id="NE=GHOST",
-                name="Ghost",
-                capacity_kwp=1.0,
-                address=None,
-            )
-        ]
-    )
     result = await scheduler.run_cycle()
     assert result.error is None
+    assert result.requested_plants == 3
     assert result.readings_missing == 1
     assert result.partial
     assert not result.complete_success
     assert scheduler.stats.cycles_partial == 1
+
+
+async def test_stale_plants_are_not_polled_after_the_vendor_drops_them(
+    repository: InMemoryRepository,
+):
+    """A station removed from the account must stop consuming KPI capacity.
+
+    Phase-1 persistence has no delete, so the row survives in the
+    repository; polling it forever would report every cycle partial and
+    waste KPI budget on a station the vendor will never answer for.
+    """
+    client = MockFusionSolarClient(now=lambda: FIXED_NOON_UTC)
+    clock = FakeClock()
+    scheduler = make_scheduler(
+        mock_adapter(client), repository, clock=clock, inventory_refresh_seconds=3600.0
+    )
+    result = await scheduler.run_cycle()
+    assert result.requested_plants == 3 and result.complete_success
+
+    # The vendor drops one station from the account.
+    client._stations = client._stations[:2]
+    clock.now = 3601.0
+    result = await scheduler.run_cycle()
+
+    assert result.inventory_refreshed and result.plants_upserted == 2
+    assert result.requested_plants == 2  # the retired station is not polled
+    assert result.readings_missing == 0
+    assert result.complete_success  # and the cycle is NOT reported partial
+    # The row itself is still stored (no delete in the Phase-1 schema).
+    assert len(await repository.list_plants()) == 3
 
 
 async def test_rate_limit_error_triggers_backoff(repository: InMemoryRepository):
@@ -498,3 +525,28 @@ async def test_min_interval_floor_also_applies_to_failure_backoff(
     for _ in range(4):
         result = await scheduler.run_cycle()
     assert scheduler.next_delay(result) == 960.0
+
+
+async def test_retry_after_is_never_scaled_down_by_jitter(repository: InMemoryRepository):
+    # A vendor Retry-After is a hard lower bound: retrying at 0.75x would
+    # send the next request before the server's requested delay.
+    scheduler = IngestionScheduler(
+        FailingAdapter(AdapterRateLimitError("429", retry_after_seconds=600.0)),
+        repository,
+        interval_seconds=300.0,
+        backoff_base_seconds=60.0,
+        jitter=lambda: 0.0,  # worst case: 0.75x multiplier
+    )
+    result = await scheduler.run_cycle()
+    assert scheduler.next_delay(result) == 600.0
+
+    # Jitter still applies to the backoff itself when it is the larger value.
+    jittered = IngestionScheduler(
+        FailingAdapter(AdapterError("boom")),
+        repository,
+        interval_seconds=300.0,
+        backoff_base_seconds=1000.0,
+        jitter=lambda: 0.0,
+    )
+    result = await jittered.run_cycle()
+    assert jittered.next_delay(result) == 750.0  # 1000 * 0.75

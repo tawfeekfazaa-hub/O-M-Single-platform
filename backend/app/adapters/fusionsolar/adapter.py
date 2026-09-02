@@ -108,9 +108,28 @@ def _as_int(value: Any) -> int | None:
     if value is None or isinstance(value, bool):
         return None
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return number
+
+
+def _health_status(value: Any, diagnostics: KpiDiagnostics) -> PlantStatus:
+    """Map real_health_state, distinguishing ABSENT from UNPARSEABLE.
+
+    An absent field and a documented-but-unmapped code both yield UNKNOWN
+    without counting: the contract itself says "else unknown". A value that
+    is present but cannot be read as an integer (bool, text, NaN) is
+    malformed data and must be counted, or the scheduler would report the
+    response as a complete success and persist the bad status.
+    """
+    if value is None:
+        return PlantStatus.UNKNOWN
+    code = _as_int(value)
+    if code is None:
+        diagnostics.invalid_values += 1
+        return PlantStatus.UNKNOWN
+    return _HEALTH_TO_STATUS.get(code, PlantStatus.UNKNOWN)
 
 
 class FusionSolarAdapter(VendorAdapter):
@@ -220,9 +239,7 @@ class FusionSolarAdapter(VendorAdapter):
                         )
                         if item.get("performance_ratio") is not None
                         else None,
-                        status=_HEALTH_TO_STATUS.get(
-                            _as_int(item.get("real_health_state")), PlantStatus.UNKNOWN
-                        ),
+                        status=_health_status(item.get("real_health_state"), diagnostics),
                         vendor_server_time=vendor_time,
                     )
                 )

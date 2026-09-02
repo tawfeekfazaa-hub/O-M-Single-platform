@@ -101,6 +101,10 @@ mask authentication/version errors).
   drift into the window (a 5-call budget with 2-page refreshes would put
   bursts at 0 h, 9.6 h and 19.2 h, needing six slots in one window). On the
   4/day default: 1 page → 6 h, 2 pages → 12 h, 3–4 pages → 24 h.
+- KPI polling covers the LAST SUCCESSFUL inventory only. Phase-1
+  persistence has no delete, so a station the vendor drops keeps its
+  repository row; polling it would mark every later cycle partial and
+  waste KPI capacity on a station the vendor will never answer for.
 - A refresh rejected by the budget never aborts KPI polling, and defers
   itself by a **full window** rather than the limiter's next-slot hint:
   one freed slot is not enough for a paginated refresh, so retrying earlier
@@ -122,6 +126,10 @@ mask authentication/version errors).
   `total_power`, `day_income`, `total_income`, `real_health_state`
   (`confirmed`). `day_power`/`total_power` are kWh and stay kWh.
 - `real_health_state`: 1 disconnected, 2 faulty, 3 healthy, else unknown.
+  An ABSENT field and a numeric code outside 1/2/3 are both the documented
+  "else unknown" case and are not counted as invalid; a value that is
+  present but unreadable (bool, text, NaN, ∞) IS counted, so a malformed
+  response can never be reported as a complete ingestion.
 - **Station-level active power: NOT in the documented contract.** The
   real adapter stores `None` and never derives it from another field.
   (Device-level active power belongs to the device interfaces — later
@@ -154,7 +162,10 @@ mask authentication/version errors).
   the adapter error taxonomy. *Whether your tenant sends Retry-After:*
   `unverified`.
 - Timeouts, connection failures, 500/502/503/504 → transient error →
-  scheduler backoff with jitter (no blind retries).
+  scheduler backoff with jitter (no blind retries). Jitter (0.75x–1.25x)
+  applies to the BACKOFF only: a vendor `Retry-After` and the configured
+  minimum interval are hard lower bounds applied afterwards, so the next
+  request is never sent before the server's requested delay.
 - Non-JSON bodies, non-object envelopes, contract-violating shapes →
   protocol error.
 - HTTPS only; TLS verification enabled; redirects disabled; explicit

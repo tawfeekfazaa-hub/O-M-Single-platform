@@ -126,6 +126,12 @@ class IngestionScheduler:
         self._jitter = jitter
         self._clock = clock
         self._last_inventory_at: float | None = None
+        # vendor_plant_ids of the last SUCCESSFUL inventory refresh. Plants
+        # the vendor has dropped stay in the repository (no delete in the
+        # Phase-1 schema), so polling the repository blindly would request
+        # KPIs for retired stations forever — every cycle partial, and KPI
+        # capacity wasted on rows the vendor will never answer for.
+        self._current_inventory: set[str] | None = None
         self.stats = SchedulerStats()
         self._stopping = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -150,6 +156,7 @@ class IngestionScheduler:
         self._inventory_not_before = None
         result.inventory_refreshed = True
         result.plants_upserted = len(plants)
+        self._current_inventory = {p.vendor_plant_id for p in plants}
         calls = 1
         diag = getattr(self._adapter, "last_inventory_diagnostics", None)
         if diag is not None:
@@ -214,6 +221,9 @@ class IngestionScheduler:
                 p for p in await self._repository.list_plants() if p.vendor == self._adapter.vendor
             ]
             codes = [p.vendor_plant_id for p in plants]
+            if self._current_inventory is not None:
+                # Restrict to the last inventory the vendor actually served.
+                codes = [c for c in codes if c in self._current_inventory]
             result.requested_plants = len(codes)
             if codes:
                 readings = await self._adapter.fetch_plant_kpis(codes)
@@ -263,17 +273,22 @@ class IngestionScheduler:
         return result
 
     def next_delay(self, result: CycleResult) -> float:
-        """Normal interval on success; exponential backoff + jitter on failure."""
+        """Normal interval on success; exponential backoff + jitter on failure.
+
+        Jitter is applied to the BACKOFF only. A vendor Retry-After (or a
+        budget hint) is a hard lower bound: scaling it by 0.75 would send the
+        next request before the server's requested delay and earn another
+        429. The same holds for the configured minimum interval.
+        """
         if result.error is None:
             return self._interval
         exponent = min(self.stats.consecutive_failures - 1, 5)
         delay = min(self._backoff_max, self._backoff_base * (2**exponent))
-        # The vendor's/budget's retry-after hint is a lower bound on the wait.
-        if result.retry_after_seconds is not None:
-            delay = max(delay, result.retry_after_seconds)
         # 0.75x..1.25x jitter so multiple deployments don't sync up.
         delay *= 0.75 + 0.5 * self._jitter()
-        # The configured minimum interval is a hard floor, jitter included.
+        # Hard lower bounds, applied AFTER jitter so they are never undercut.
+        if result.retry_after_seconds is not None:
+            delay = max(delay, result.retry_after_seconds)
         return max(delay, self._min_interval)
 
     async def run_forever(self) -> None:

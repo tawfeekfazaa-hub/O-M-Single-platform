@@ -238,9 +238,10 @@ def main(argv: list[str] | None = None, settings: Settings | None = None) -> int
             # non-numeric budget) must still produce the documented exit
             # code. Report the offending variable NAMES only — never the
             # values, never a traceback.
-            names = sorted(
-                {str(location[0]).upper() for error in exc.errors() for location in [error["loc"]]}
-            )
+            # A model-level validator (e.g. the SYSTEM_CODE/PASSWORD
+            # conflict) reports an EMPTY loc tuple — indexing it blindly
+            # would raise IndexError inside this very handler.
+            names = sorted({str(error["loc"][0]).upper() for error in exc.errors() if error["loc"]})
             print(
                 "CONFIG ERROR: settings could not be loaded; check "
                 + (", ".join(names) if names else "the FUSIONSOLAR_* variables"),
