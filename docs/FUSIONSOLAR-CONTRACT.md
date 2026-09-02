@@ -94,11 +94,20 @@ mask authentication/version errors).
   `documented version difference`, NOT a universal constant). Our
   client-side budget of **4 calls/day** and the **6-hour inventory
   cadence are SAFETY DEFAULTS**, both configurable.
-- Cadence vs pagination: each page spends one station-list call, so the
-  scheduler stretches the effective spacing between inventory refreshes
-  to `pages × window / budget` — the 6-hour default holds only for a
-  one-page inventory on the 4/day default (2 pages → 12 h). A refresh
-  rejected by the budget defers itself and never aborts KPI polling.
+- Cadence vs pagination: each page spends one station-list call, and the
+  budget is a ROLLING window, so the scheduler derives the spacing between
+  inventory refreshes from the pages the last refresh consumed:
+  `pages × window / budget` while the budget still fits two bursts
+  (`budget >= 2 × pages`), otherwise a **full window**, after which the
+  previous burst has aged out. On the 4/day default: 1 page → 6 h,
+  2 pages → 12 h, 3–4 pages → 24 h. A refresh rejected by the budget
+  defers itself and never aborts KPI polling.
+- **Pages per refresh may never exceed the budget.** A paginated refresh
+  cannot be resumed across windows, so the effective page guard is
+  `min(FUSIONSOLAR_STATION_LIST_MAX_PAGES, FUSIONSOLAR_STATION_LIST_MAX_CALLS)`.
+  A larger inventory fails on page 1 (one call) with an actionable message
+  instead of burning the whole budget and dying part-way; retrieving an
+  N-page inventory requires a station-list budget of at least N.
 
 ## Real-time KPIs — `/thirdData/getStationRealKpi`
 
@@ -137,8 +146,10 @@ mask authentication/version errors).
   per session expiry (≈30 min); *whether Huawei counts rejected requests
   against the endpoint quota:* `unverified`.
 - HTTP `429` → rate-limit error; `Retry-After` parsed safely
-  (delta-seconds or HTTP-date; garbage → endpoint-window hint).
-  *Whether your tenant sends Retry-After:* `unverified`.
+  (delta-seconds or HTTP-date; a timezone-less date is read as GMT per
+  RFC 9110; garbage → endpoint-window hint). Parsing never raises outside
+  the adapter error taxonomy. *Whether your tenant sends Retry-After:*
+  `unverified`.
 - Timeouts, connection failures, 500/502/503/504 → transient error →
   scheduler backoff with jitter (no blind retries).
 - Non-JSON bodies, non-object envelopes, contract-violating shapes →

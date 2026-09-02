@@ -34,7 +34,10 @@ def normalize_fusionsolar_base_url(raw: str) -> str:
     path = parts.path.rstrip("/")
     if path not in ("", THIRD_DATA_PATH):
         raise ValueError(f"FUSIONSOLAR_BASE_URL path must be empty or {THIRD_DATA_PATH}")
-    netloc = parts.hostname if parts.port is None else f"{parts.hostname}:{parts.port}"
+    # urlsplit strips the brackets from an IPv6 literal; without them the
+    # rebuilt authority would be ambiguous (and rejected by the client).
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    netloc = host if parts.port is None else f"{host}:{parts.port}"
     return f"https://{netloc}{THIRD_DATA_PATH}"
 
 

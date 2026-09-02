@@ -361,3 +361,35 @@ async def test_data_neither_list_nor_object_is_protocol_error():
     with pytest.raises(AdapterProtocolError):
         await client.list_stations()
     await client.close()
+
+
+async def test_zero_page_count_with_stations_is_protocol_error():
+    # pageCount=0 + one row + total=1 is internally contradictory: the loop
+    # would exit immediately and the unique count would still match total.
+    server = StationListServer(pages=[[station(1)]])
+    server.page_count_override = 0
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_zero_page_count_is_accepted_only_for_an_empty_fleet():
+    server = StationListServer(pages=[[]])
+    server.page_count_override = 0
+    client = make_client(server)
+    result = await client.list_stations()
+    assert result.stations == [] and result.variant == "paginated"
+    await client.close()
+
+
+async def test_inventory_larger_than_the_guard_fails_on_the_first_page():
+    # Fail fast with an actionable message instead of burning the whole
+    # station-list budget and dying part-way through pagination.
+    server = StationListServer(pages=[[station(i)] for i in range(6)])
+    client = make_client(server, max_pages=4)
+    with pytest.raises(AdapterProtocolError) as excinfo:
+        await client.list_stations()
+    assert "FUSIONSOLAR_STATION_LIST_MAX_CALLS" in str(excinfo.value)
+    assert len(server.requests) == 1  # only page 1 was ever requested
+    await client.close()

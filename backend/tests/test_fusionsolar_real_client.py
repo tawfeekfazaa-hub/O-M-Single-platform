@@ -371,3 +371,67 @@ async def test_kpi_malformed_data_is_protocol_error():
     with pytest.raises(AdapterProtocolError):
         await client.get_station_real_kpi(["NE=1"])
     await client.close()
+
+
+# --------------------------------------------------------------------- #
+# Retry-After parsing robustness                                        #
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Wed, 21 Oct 2015 07:28:00",  # no timezone -> naive datetime
+        "Wed, 21 Oct 2015 07:28:00 GMT",
+        "Thu, 01 Jan 2099 00:00:00 GMT",
+    ],
+)
+async def test_http_date_retry_after_never_raises(header: str):
+    # A timezone-less HTTP-date used to raise TypeError out of the adapter
+    # taxonomy, which could take the scheduler task down.
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = header
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    assert excinfo.value.retry_after_seconds is not None
+    assert excinfo.value.retry_after_seconds >= 0.0
+    await client.close()
+
+
+# --------------------------------------------------------------------- #
+# absolute transport-level call cap                                     #
+# --------------------------------------------------------------------- #
+
+
+async def test_max_total_calls_caps_every_request_including_relogin():
+    # The post-305 retry deliberately bypasses the endpoint budget, so only
+    # a transport-level ceiling can hold an advertised hard cap.
+    fake = FakeFusionSolar()
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username=USERNAME,
+        system_code=SYSTEM_CODE,
+        policy=generous_policy(),
+        transport=httpx.MockTransport(fake.handler),
+        max_total_calls=4,
+    )
+    await client.login()  # 1
+    await client.list_stations()  # 2
+    fake.expire_session_times = 1  # KPI (3) rejected -> re-login (4) -> retry (5)
+    with pytest.raises(AdapterError):
+        await client.get_station_real_kpi(["NE=1"])
+    assert client.call_counts().total() == 4  # the 5th request was never sent
+    await client.close()
+
+
+async def test_call_counts_total_sums_every_endpoint():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    await client.get_station_real_kpi(["NE=1"])
+    counts = client.call_counts()
+    assert counts.total() == sum(counts.as_dict().values()) == 3
+    await client.close()

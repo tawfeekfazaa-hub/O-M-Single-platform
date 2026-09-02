@@ -85,8 +85,22 @@ def _plan_lines(settings: Settings) -> list[str]:
         f"  - POST /getStationList ..... up to {LIVE_MAX_STATION_LIST_PAGES} pages, "
         "hard-capped up front (station-list budget)",
         "  - POST /getStationRealKpi .. 1 batch, first <=100 plants (KPI budget)",
+        "the cap is enforced at the transport level and covers every request,",
+        "including a failCode 305 re-login and its retry.",
         f"profile={settings.fusionsolar_api_profile} mode={settings.fusionsolar_mode}",
     ]
+
+
+# Safety settings that must be positive for the rate limiters to be
+# constructible at all: variable name -> attribute.
+_POSITIVE_SETTINGS = {
+    "FUSIONSOLAR_LOGIN_MAX_CALLS": "fusionsolar_login_max_calls",
+    "FUSIONSOLAR_LOGIN_WINDOW_SECONDS": "fusionsolar_login_window_seconds",
+    "FUSIONSOLAR_STATION_LIST_MAX_CALLS": "fusionsolar_station_list_max_calls",
+    "FUSIONSOLAR_STATION_LIST_WINDOW_SECONDS": "fusionsolar_station_list_window_seconds",
+    "FUSIONSOLAR_KPI_WINDOW_SECONDS": "fusionsolar_kpi_window_seconds",
+    "FUSIONSOLAR_STATION_LIST_MAX_PAGES": "fusionsolar_station_list_max_pages",
+}
 
 
 def validate_config(settings: Settings) -> list[str]:
@@ -99,6 +113,12 @@ def validate_config(settings: Settings) -> list[str]:
             problems.append("FUSIONSOLAR_USERNAME is not set")
         if not settings.effective_system_code:
             problems.append("FUSIONSOLAR_SYSTEM_CODE is not set")
+    # Non-positive budgets/windows make the rate limiters unconstructible;
+    # catch them here so the dry run reports EXIT_CONFIG instead of the live
+    # path dying with a traceback. Names only — never the values.
+    for name, attribute in _POSITIVE_SETTINGS.items():
+        if getattr(settings, attribute) <= 0:
+            problems.append(f"{name} must be > 0")
     return problems
 
 
@@ -123,7 +143,19 @@ async def run_live(settings: Settings, adapter: FusionSolarAdapter | None = None
     ``adapter`` is injectable for offline tests only; the default builds
     the real adapter from page-capped settings.
     """
-    adapter = adapter or build_fusionsolar_adapter(live_capped_settings(settings))
+    if adapter is None:
+        try:
+            adapter = build_fusionsolar_adapter(
+                live_capped_settings(settings),
+                # Absolute transport-level ceiling: not even a post-305
+                # re-login and its retry may exceed the advertised cap.
+                max_total_calls=LIVE_MAX_CALLS,
+            )
+        except ValueError as exc:
+            # Unusable configuration (e.g. a non-positive budget) -> the
+            # documented deterministic exit code, never a traceback.
+            print(f"CONFIG ERROR: {exc}", file=sys.stderr)
+            return EXIT_CONFIG
     calls_used = 0
     try:
         await adapter.authenticate()

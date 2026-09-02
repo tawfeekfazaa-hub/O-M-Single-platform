@@ -108,6 +108,10 @@ class IngestionScheduler:
         self._adapter = adapter
         self._repository = repository
         # min_interval lets real-mode wiring enforce the KPI window+margin.
+        # It is a floor on EVERY delay, not just the success interval: after
+        # a failed cycle a shorter backoff would just hit the client-side
+        # KPI limiter again and manufacture another failure.
+        self._min_interval = min_interval_seconds
         self._interval = max(interval_seconds, min_interval_seconds)
         self._inventory_refresh = inventory_refresh_seconds
         # Station-list budget (when wired) stretches the effective refresh
@@ -153,11 +157,24 @@ class IngestionScheduler:
             result.calls_consumed += diag.calls_consumed
             calls = max(diag.calls_consumed, 1)
         if self._station_list_max_calls and self._station_list_window:
-            # Each page spent one station-list call: keep calls/day within
-            # the budget by stretching the spacing between refreshes.
-            self._inventory_min_spacing = (
-                self._station_list_window * calls / self._station_list_max_calls
-            )
+            self._inventory_min_spacing = self._derive_inventory_spacing(calls)
+
+    def _derive_inventory_spacing(self, calls: int) -> float:
+        """Spacing that lets the NEXT refresh spend all its pages at once.
+
+        The budget is a rolling window, not an average allowance: the
+        previous refresh's calls keep occupying slots until they age out.
+        Spending ``calls`` slots in one burst therefore needs
+        ``budget - calls >= calls`` free slots while the previous burst is
+        still counted; when the budget is too small for two bursts the only
+        safe spacing is a full window, after which the previous burst has
+        expired.
+        """
+        window = self._station_list_window or 0.0
+        budget = self._station_list_max_calls or 1
+        if budget >= 2 * calls:
+            return window * calls / budget
+        return window
 
     async def run_cycle(self) -> CycleResult:
         """One ingestion pass. Never raises — errors land in the result."""
@@ -249,7 +266,9 @@ class IngestionScheduler:
         if result.retry_after_seconds is not None:
             delay = max(delay, result.retry_after_seconds)
         # 0.75x..1.25x jitter so multiple deployments don't sync up.
-        return delay * (0.75 + 0.5 * self._jitter())
+        delay *= 0.75 + 0.5 * self._jitter()
+        # The configured minimum interval is a hard floor, jitter included.
+        return max(delay, self._min_interval)
 
     async def run_forever(self) -> None:
         logger.info("ingestion scheduler started (interval=%ss)", self._interval)

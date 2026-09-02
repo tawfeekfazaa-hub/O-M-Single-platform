@@ -168,3 +168,46 @@ def test_exit_codes_are_deterministic_constants():
         check.EXIT_SAFETY,
         check.EXIT_PROTOCOL,
     ) == (0, 2, 3, 4, 6, 7)
+
+
+@pytest.mark.parametrize(
+    ("field", "name"),
+    [
+        ("fusionsolar_station_list_max_calls", "FUSIONSOLAR_STATION_LIST_MAX_CALLS"),
+        ("fusionsolar_login_max_calls", "FUSIONSOLAR_LOGIN_MAX_CALLS"),
+        ("fusionsolar_kpi_window_seconds", "FUSIONSOLAR_KPI_WINDOW_SECONDS"),
+        ("fusionsolar_station_list_max_pages", "FUSIONSOLAR_STATION_LIST_MAX_PAGES"),
+    ],
+)
+def test_non_positive_safety_settings_are_config_errors(
+    field: str, name: str, capsys: pytest.CaptureFixture
+):
+    # These would make the rate limiters unconstructible; the dry run must
+    # report them rather than letting the live path die with a traceback.
+    code = check.main([], settings=make_settings(**{field: 0}))
+    assert code == check.EXIT_CONFIG
+    assert name in capsys.readouterr().err  # names only, never values
+
+
+async def test_unusable_budget_gives_a_config_exit_not_a_traceback(
+    capsys: pytest.CaptureFixture,
+):
+    settings = make_settings(
+        fusionsolar_mode="real",
+        fusionsolar_base_url="https://host.test/thirdData",
+        fusionsolar_username="user",
+        fusionsolar_system_code=SECRET,
+        fusionsolar_station_list_max_calls=0,
+    )
+    code = await check.run_live(settings)
+    captured = capsys.readouterr()
+    assert code == check.EXIT_CONFIG
+    assert SECRET not in captured.out + captured.err
+
+
+def test_dry_run_states_the_cap_covers_authentication_recovery(
+    capsys: pytest.CaptureFixture,
+):
+    check.main([], settings=make_settings())
+    out = capsys.readouterr().out
+    assert "transport level" in out and "305" in out

@@ -89,3 +89,44 @@ def test_rate_budget_safety_defaults():
     assert settings.fusionsolar_station_list_window_seconds == 86_400.0
     assert settings.fusionsolar_kpi_window_seconds == 300.0
     assert settings.fusionsolar_inventory_refresh_seconds == 21_600.0
+
+
+def test_ipv6_host_keeps_its_brackets():
+    # urlsplit strips the brackets; without them the authority is malformed
+    # and the HTTP client rejects the URL before any request is sent.
+    assert (
+        normalize_fusionsolar_base_url("https://[2001:db8::1]:8443/thirdData")
+        == "https://[2001:db8::1]:8443/thirdData"
+    )
+    assert (
+        normalize_fusionsolar_base_url("https://[2001:db8::1]") == "https://[2001:db8::1]/thirdData"
+    )
+    # A plain host is unaffected.
+    assert (
+        normalize_fusionsolar_base_url("https://host.test:8443")
+        == "https://host.test:8443/thirdData"
+    )
+
+
+def test_station_list_page_guard_is_bounded_by_the_daily_budget():
+    from app.adapters.fusionsolar import effective_station_list_page_guard
+
+    # A refresh cannot be resumed across windows, so attempting more pages
+    # than the budget allows would make the inventory unretrievable.
+    assert (
+        effective_station_list_page_guard(
+            Settings(_env_file=None, fusionsolar_station_list_max_pages=50)
+        )
+        == 4  # the 4/day safety default
+    )
+    # A generous budget lets the configured page guard apply unchanged.
+    assert (
+        effective_station_list_page_guard(
+            Settings(
+                _env_file=None,
+                fusionsolar_station_list_max_pages=10,
+                fusionsolar_station_list_max_calls=40,
+            )
+        )
+        == 10
+    )

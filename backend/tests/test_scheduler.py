@@ -344,3 +344,71 @@ async def test_valid_pagination_still_refreshes_the_inventory(repository: InMemo
     assert result.inventory_pages == 2
     assert {p.vendor_plant_id for p in await repository.list_plants()} == {"NE=1", "NE=2"}
     await client.close()
+
+
+async def test_spacing_reserves_a_whole_burst_in_the_rolling_window(
+    repository: InMemoryRepository,
+):
+    """A 3-page inventory on a 4/day budget needs a FULL window of spacing.
+
+    The budget is a rolling window, not an average allowance: at
+    window x 3/4 the previous three calls still occupy slots, so only one
+    page would fit and the refresh would die part-way.
+    """
+    client = MockFusionSolarClient(
+        now=lambda: FIXED_NOON_UTC, station_list_variant="paginated", page_size=1
+    )
+    clock = FakeClock()
+    scheduler = IngestionScheduler(
+        mock_adapter(client),
+        repository,
+        interval_seconds=300.0,
+        inventory_refresh_seconds=21_600.0,
+        station_list_max_calls=4,
+        station_list_window_seconds=86_400.0,
+        jitter=lambda: 0.5,
+        clock=clock,
+    )
+    result = await scheduler.run_cycle()
+    assert result.inventory_pages == 3  # 3 mock stations, one per page
+
+    clock.now = 64_801.0  # window * pages / budget — NOT enough
+    assert not (await scheduler.run_cycle()).inventory_refreshed
+    clock.now = 86_401.0  # a full window: the previous burst has aged out
+    assert (await scheduler.run_cycle()).inventory_refreshed
+
+
+def test_derived_spacing_uses_the_average_rate_only_when_two_bursts_fit(
+    repository: InMemoryRepository,
+):
+    scheduler = IngestionScheduler(
+        mock_adapter(),
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=86_400.0,
+    )
+    assert scheduler._derive_inventory_spacing(1) == 21_600.0  # 4 >= 2 -> average
+    assert scheduler._derive_inventory_spacing(2) == 43_200.0  # 4 >= 4 -> average
+    assert scheduler._derive_inventory_spacing(3) == 86_400.0  # 4 <  6 -> full window
+    assert scheduler._derive_inventory_spacing(4) == 86_400.0
+
+
+async def test_min_interval_floor_also_applies_to_failure_backoff(
+    repository: InMemoryRepository,
+):
+    # Without the floor the first backoff (60 s) would fire well inside the
+    # KPI window and just hit the client-side limiter again.
+    scheduler = IngestionScheduler(
+        FailingAdapter(AdapterError("boom")),
+        repository,
+        interval_seconds=300.0,
+        min_interval_seconds=330.0,
+        backoff_base_seconds=60.0,
+        jitter=lambda: 0.5,
+    )
+    result = await scheduler.run_cycle()
+    assert scheduler.next_delay(result) == 330.0
+    # Once the backoff outgrows the floor it wins again.
+    for _ in range(4):
+        result = await scheduler.run_cycle()
+    assert scheduler.next_delay(result) == 960.0

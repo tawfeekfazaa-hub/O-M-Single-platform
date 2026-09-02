@@ -88,6 +88,10 @@ class ClientCallCounts:
             "station_real_kpi": self.station_real_kpi,
         }
 
+    def total(self) -> int:
+        """Every request actually sent, retries and re-logins included."""
+        return self.login + self.station_list + self.station_real_kpi
+
 
 class FusionSolarClient(Protocol):
     """Vendor-shaped operations shared by the mock and real clients."""
@@ -128,6 +132,12 @@ def _parse_retry_after(value: str | None) -> float | None:
         return None
     if when is None:
         return None
+    if when.tzinfo is None:
+        # RFC 9110 requires HTTP-dates in GMT; some servers omit the zone.
+        # Assume UTC rather than subtracting a naive from an aware datetime
+        # (a TypeError there would escape the adapter error taxonomy and
+        # could take the scheduler task down).
+        when = when.replace(tzinfo=dt.UTC)
     delta = (when - dt.datetime.now(dt.UTC)).total_seconds()
     return max(delta, 0.0)
 
@@ -155,6 +165,7 @@ class RealFusionSolarClient:
         transport: httpx.AsyncBaseTransport | None = None,
         timeout: httpx.Timeout = DEFAULT_TIMEOUT,
         max_station_list_pages: int = 50,
+        max_total_calls: int | None = None,
     ) -> None:
         self._username = username
         self._system_code = system_code
@@ -163,6 +174,11 @@ class RealFusionSolarClient:
         self._login_lock = asyncio.Lock()
         self._counts = ClientCallCounts()
         self._max_pages = max_station_list_pages
+        # Optional absolute ceiling on requests sent by this client instance,
+        # enforced at the transport level so that NO path — including the
+        # post-305 re-login and its retry, which deliberately bypass the
+        # per-endpoint budget — can exceed an advertised hard cap.
+        self._max_total_calls = max_total_calls
         self._http = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=timeout,
@@ -191,6 +207,11 @@ class RealFusionSolarClient:
         *,
         consume_budget: bool = True,
     ) -> httpx.Response:
+        if self._max_total_calls is not None and self._counts.total() >= self._max_total_calls:
+            raise AdapterError(
+                f"client call cap reached ({self._max_total_calls} requests); "
+                "refusing to send another vendor request"
+            )
         if consume_budget:
             await self._policy.acquire(endpoint)
         if endpoint is Endpoint.LOGIN:
@@ -331,7 +352,14 @@ class RealFusionSolarClient:
     def _parse_page_count(self, data: dict[str, Any]) -> int:
         count = self._require_int(data, "pageCount")
         if count > self._max_pages:
-            raise AdapterProtocolError(f"impossible station list pageCount={count}")
+            # Fail on page 1 (one call) instead of burning the whole budget
+            # and dying part-way. The guard is min(configured pages, the
+            # station-list budget): a refresh must fit in ONE window.
+            raise AdapterProtocolError(
+                f"station list needs {count} pages but the effective guard is "
+                f"{self._max_pages}; raise FUSIONSOLAR_STATION_LIST_MAX_CALLS "
+                "(and _MAX_PAGES) to retrieve this inventory"
+            )
         return count
 
     async def list_stations(self) -> StationListResult:
@@ -400,6 +428,11 @@ class RealFusionSolarClient:
                     raise AdapterProtocolError("station list pageSize changed during pagination")
                 elif echoed_total != total:
                     raise AdapterProtocolError("station list total changed during pagination")
+                if echoed_page_count == 0 and (rows or echoed_total):
+                    # Zero pages is only coherent for an empty fleet.
+                    raise AdapterProtocolError(
+                        "station list reported pageCount=0 with a non-empty inventory"
+                    )
                 if rows == [] and page_no < (page_count or 0):
                     raise AdapterProtocolError(
                         "station list returned an empty page before pageCount was reached"

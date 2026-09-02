@@ -33,7 +33,11 @@ Decisions (full contract: docs/FUSIONSOLAR-CONTRACT.md):
    pageNo/pageSize/pageCount/total mandatory, stable across pages, final
    unique-station count reconciled against `total` — and a failed
    validation aborts the refresh without touching the stored inventory,
-   so a truncated list can never pass as the complete fleet.
+   so a truncated list can never pass as the complete fleet. Because a
+   refresh cannot be resumed across rate-limit windows, the effective page
+   guard is bounded by the station-list budget, and the refresh spacing is
+   derived from the pages consumed with rolling-window burst capacity in
+   mind (full window when the budget cannot hold two bursts).
 5. **Real-mode safety gate**: the app refuses FUSIONSOLAR_MODE=real +
    SCHEDULER_ENABLED=true until Raw/Quarantine storage (PR-2) exists.
    The diagnostic checker is offline/dry-run by default and its live path
