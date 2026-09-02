@@ -244,13 +244,18 @@ mask authentication/version errors).
   station-list failure would defer the inventory and carry on to KPI
   polling, which finds no token and logs in AGAIN, inside the delay the
   vendor asked for or into the same outage. The error carries this
-  regardless of its kind, and the whole cycle backs off instead.
+  regardless of its kind, and the whole cycle backs off instead. A repeated
+  failCode 305 counts as one: the login endpoint answered, but the token it
+  issued is rejected too, so the token is DROPPED and the session marked
+  unusable — keeping it would send the next call out with a token the
+  vendor has already refused and spend a third login to learn that again.
 - A capacity that is present but unreadable is COUNTED, never written. The
   adapter reports `None` both for an absent capacity and for one that
   failed validation, so an upsert that wrote it would silently replace a
   good stored value: a missing capacity means "not reported", not "the
-  plant lost its capacity". The count marks the cycle incomplete, which is
-  the only trace the vendor sent something unusable.
+  plant lost its capacity". The count marks the cycle incomplete, and the
+  pre-flight check refuses to certify such an inventory, so the scheduler
+  and the contract check treat the same rows the same way.
 - Timeouts, connection failures, 500/502/503/504 → transient error →
   scheduler backoff with jitter (no blind retries). Jitter (0.75x–1.25x)
   applies to the BACKOFF only: a vendor `Retry-After` and the configured
