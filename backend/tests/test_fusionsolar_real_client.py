@@ -5,6 +5,7 @@ behaviour, all offline. No real credentials, no real plant data."""
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 import httpx
@@ -434,4 +435,22 @@ async def test_call_counts_total_sums_every_endpoint():
     await client.get_station_real_kpi(["NE=1"])
     counts = client.call_counts()
     assert counts.total() == sum(counts.as_dict().values()) == 3
+    await client.close()
+
+
+@pytest.mark.parametrize("header", ["9" * 400, "1" * 500])
+async def test_overflowing_retry_after_falls_back_to_the_budget_hint(header: str):
+    # float() on a few hundred digits returns infinity instead of raising;
+    # an infinite delay would become the scheduler's hard lower bound and
+    # stall KPI polling for good.
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = header
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    delay = excinfo.value.retry_after_seconds
+    assert delay is not None and math.isfinite(delay)
+    assert delay >= 300.0  # the documented endpoint-window fallback
     await client.close()

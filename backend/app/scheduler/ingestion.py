@@ -85,11 +85,21 @@ class CycleResult:
         )
 
     @property
+    def inventory_stale(self) -> bool:
+        """The inventory could not be refreshed this cycle (any reason).
+
+        A rate-limited refresh is just as stale as a failed one — the
+        difference is only whose limit stopped it — so both disqualify a
+        complete success and both are counted in the incomplete statistic.
+        """
+        return self.inventory_rate_limited or self.inventory_error is not None
+
+    @property
     def complete_success(self) -> bool:
-        """A cycle counts as fully successful ONLY with no error and no
-        partial/malformed data — a partial response is never reported as
-        a complete ingestion."""
-        return self.error is None and self.inventory_error is None and not self.partial
+        """A cycle counts as fully successful ONLY with no error, a current
+        inventory, and no partial/malformed data — a partial response or a
+        stale inventory is never reported as a complete ingestion."""
+        return self.error is None and not self.inventory_stale and not self.partial
 
 
 @dataclass(slots=True)
@@ -300,7 +310,7 @@ class IngestionScheduler:
         else:
             self.stats.cycles_failed += 1
             self.stats.consecutive_failures += 1
-        if result.error is None and (result.partial or result.inventory_error):
+        if result.error is None and (result.partial or result.inventory_stale):
             self.stats.cycles_partial += 1
             # Counts only — no identifiers or values in this log line.
             logger.warning(

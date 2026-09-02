@@ -393,3 +393,28 @@ async def test_inventory_larger_than_the_guard_fails_on_the_first_page():
     assert "FUSIONSOLAR_STATION_LIST_MAX_CALLS" in str(excinfo.value)
     assert len(server.requests) == 1  # only page 1 was ever requested
     await client.close()
+
+
+async def test_empty_terminal_page_in_a_non_empty_inventory_is_rejected():
+    """pageCount=2 / total=1 with an empty page 2 is malformed, not complete.
+
+    Accepting it would certify a contradictory envelope, waste a
+    station-list call, and inflate pages_retrieved — which stretches the
+    next inventory refresh from 6 h to 12 h on the 4/day default.
+    """
+    server = StationListServer(pages=[[station(1)], []])
+    server.page_count_override = 2
+    server.total_override = 1
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_empty_page_is_still_accepted_for_a_genuinely_empty_fleet():
+    # total=0 with a single empty page stays the legitimate empty-fleet case.
+    server = StationListServer(pages=[[]])
+    client = make_client(server)
+    result = await client.list_stations()
+    assert result.stations == [] and result.pages_retrieved == 1
+    await client.close()

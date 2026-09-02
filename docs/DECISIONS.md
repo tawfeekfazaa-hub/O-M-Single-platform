@@ -38,7 +38,9 @@ Decisions (full contract: docs/FUSIONSOLAR-CONTRACT.md):
    guard is bounded by the station-list budget, and the refresh spacing is
    `window / floor(budget / pages)` — the number of COMPLETE bursts the
    rolling window can hold, never an average rate. A budget-rejected
-   refresh defers a full window so its own partial burst has expired.
+   refresh defers a full window so its own partial burst has expired, and
+   a cycle whose inventory is stale for ANY reason (rate limit or failure)
+   is never reported as a complete ingestion.
 5. **Real-mode safety gate**: the app refuses FUSIONSOLAR_MODE=real +
    SCHEDULER_ENABLED=true until Raw/Quarantine storage (PR-2) exists.
    The diagnostic checker is offline/dry-run by default and its live path

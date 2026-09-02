@@ -175,6 +175,9 @@ async def test_inventory_rate_limit_defers_and_never_aborts_kpi_polling(
     assert result.error is None  # the cycle itself did not fail
     assert result.readings_written == 3  # KPI polling still ran
     assert scheduler.next_delay(result) == 300.0  # normal interval, no backoff
+    # A stale inventory is never a complete success, and it is counted.
+    assert result.inventory_stale and not result.complete_success
+    assert scheduler.stats.cycles_partial == 1
 
     # The refresh deferred itself: no second attempt inside the window.
     clock.now = 300.0

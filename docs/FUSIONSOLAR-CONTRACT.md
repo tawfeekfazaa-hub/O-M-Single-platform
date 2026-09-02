@@ -83,6 +83,11 @@ mask authentication/version errors).
   impossible-metadata detection; deterministic `stationCode` dedup (the
   unique count, not the row count, is what `total` is checked against);
   conflicting duplicates rejected; malformed pages never skipped silently.
+  An EMPTY page is coherent only for an empty fleet (`total = 0`) — an
+  empty page anywhere in a non-empty inventory, terminal one included, is
+  rejected: accepting it would certify a contradictory envelope, waste a
+  station-list call, and inflate `pages_retrieved`, which stretches the
+  next refresh (2 pages → 12 h instead of 6 h).
 - A failed validation means **no inventory update at all**: the
   repository keeps the previously stored plants, the refresh is never
   reported as successful, and the cycle is never a complete success (see
@@ -180,9 +185,11 @@ mask authentication/version errors).
   against the endpoint quota:* `unverified`.
 - HTTP `429` → rate-limit error; `Retry-After` parsed safely
   (delta-seconds or HTTP-date; a timezone-less date is read as GMT per
-  RFC 9110; garbage → endpoint-window hint). Parsing never raises outside
-  the adapter error taxonomy. *Whether your tenant sends Retry-After:*
-  `unverified`.
+  RFC 9110; garbage, and any value that is not FINITE — a few hundred
+  digits overflow to infinity rather than raising — → endpoint-window
+  hint). Parsing never raises outside the adapter error taxonomy and never
+  yields a delay that could stall the scheduler. *Whether your tenant
+  sends Retry-After:* `unverified`.
 - Timeouts, connection failures, 500/502/503/504 → transient error →
   scheduler backoff with jitter (no blind retries). Jitter (0.75x–1.25x)
   applies to the BACKOFF only: a vendor `Retry-After` and the configured

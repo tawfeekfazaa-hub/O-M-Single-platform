@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import email.utils
+import math
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -125,7 +126,12 @@ def _parse_retry_after(value: str | None) -> float | None:
         return None
     text = value.strip()
     if text.isdigit():
-        return float(text)
+        seconds = float(text)
+        # A few hundred digits overflow to infinity instead of raising; an
+        # infinite delay would become the scheduler's hard lower bound and
+        # stall KPI polling forever. Treat it as a malformed header so the
+        # endpoint-window fallback applies.
+        return seconds if math.isfinite(seconds) else None
     try:
         when = email.utils.parsedate_to_datetime(text)
     except (TypeError, ValueError):
@@ -139,6 +145,8 @@ def _parse_retry_after(value: str | None) -> float | None:
         # could take the scheduler task down).
         when = when.replace(tzinfo=dt.UTC)
     delta = (when - dt.datetime.now(dt.UTC)).total_seconds()
+    if not math.isfinite(delta):
+        return None
     return max(delta, 0.0)
 
 
@@ -433,9 +441,14 @@ class RealFusionSolarClient:
                     raise AdapterProtocolError(
                         "station list reported pageCount=0 with a non-empty inventory"
                     )
-                if rows == [] and page_no < (page_count or 0):
+                if rows == [] and (echoed_total > 0 or page_no < (page_count or 0)):
+                    # An empty page is only coherent for an empty fleet. A
+                    # terminal empty page would otherwise be certified as
+                    # complete while wasting a station-list call and
+                    # inflating pages_retrieved, which stretches the next
+                    # refresh (2 pages -> 12 h instead of 6 h).
                     raise AdapterProtocolError(
-                        "station list returned an empty page before pageCount was reached"
+                        "station list returned an empty page in a non-empty inventory"
                     )
             else:
                 raise AdapterProtocolError("station list data is neither a list nor an object")
