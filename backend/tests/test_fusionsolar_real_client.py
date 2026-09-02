@@ -621,3 +621,21 @@ async def test_ambiguous_token_cookies_are_an_adapter_error():
     assert excinfo.value.blocks_authentication is True
     assert client.is_logged_in() is False
     await client.close()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_an_unauthorized_status_drops_the_session(status: int):
+    # An expired session can arrive as a STATUS rather than failCode 305.
+    # Keeping the token would send the next call out with credentials the
+    # vendor just rejected, and authenticate() would keep seeing a
+    # logged-in client on every later cycle too.
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()  # a healthy call first
+    assert client.is_logged_in()
+    fake.http_status = status
+    with pytest.raises(AdapterAuthError) as excinfo:
+        await client.list_stations()
+    assert excinfo.value.blocks_authentication is True
+    assert client.is_logged_in() is False
+    await client.close()

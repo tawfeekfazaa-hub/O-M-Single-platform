@@ -50,6 +50,10 @@ _MAX_EPOCH_MS = 4_000_000_000_000
 
 _RETRYABLE_STATUS = {500, 502, 503, 504}
 
+# An authenticated call answered with one of these has no usable session,
+# however the vendor chose to say so.
+_UNAUTHORIZED_STATUS = {401, 403}
+
 # Plausibility ceiling for a Retry-After hint: one day, the largest window
 # any of our endpoint budgets uses. Anything beyond that is not a usable
 # instruction — honouring e.g. 1e299 s (a few hundred digits stay FINITE)
@@ -282,6 +286,16 @@ class RealFusionSolarClient:
             )
         if status in _RETRYABLE_STATUS:
             raise AdapterTransientError(f"FusionSolar HTTP {status} on {path}")
+        if status in _UNAUTHORIZED_STATUS:
+            # An expired session delivered as a STATUS rather than failCode
+            # 305. Keeping the token would send the next call out with
+            # credentials the vendor just rejected, and authenticate() would
+            # keep seeing a logged-in client for every later cycle too.
+            self._token = None
+            raise AdapterAuthError(
+                f"FusionSolar rejected the session on {path} (HTTP {status})",
+                blocks_authentication=True,
+            )
         if status != 200:
             raise AdapterError(f"FusionSolar HTTP {status} on {path}")
         try:
@@ -415,11 +429,16 @@ class RealFusionSolarClient:
         raw = data.get(key)
         if raw is None:
             raise AdapterProtocolError(f"paginated station list is missing {key}")
-        if isinstance(raw, bool) or isinstance(raw, float) and not raw.is_integer():
+        if isinstance(raw, bool) or not isinstance(raw, int | float):
+            # Text is not an integer field either: int("2") would let a
+            # malformed envelope through the strict contract this method
+            # promises, and a truncated inventory pass as a complete one.
+            raise AdapterProtocolError(f"paginated station list has non-numeric {key}")
+        if isinstance(raw, float) and not raw.is_integer():
             raise AdapterProtocolError(f"paginated station list has non-integer {key}")
         try:
             value = int(raw)
-        except (TypeError, ValueError) as exc:
+        except (OverflowError, ValueError) as exc:
             raise AdapterProtocolError(f"paginated station list has non-numeric {key}") from exc
         if value < 0:
             raise AdapterProtocolError(f"paginated station list has negative {key}")

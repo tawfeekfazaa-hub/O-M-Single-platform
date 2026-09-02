@@ -532,3 +532,23 @@ async def test_the_deferral_hint_covers_every_page_the_retry_needs():
     result = await client.list_stations()
     assert result.pages_retrieved == 3
     await client.close()
+
+
+@pytest.mark.parametrize("field", ["pageCount", "total", "pageNo", "pageSize"])
+async def test_textual_pagination_metadata_is_a_protocol_error(field: str):
+    # int("2") would let a malformed envelope through the strict contract
+    # _require_int promises — and a truncated inventory pass as a complete
+    # one, which is the whole point of validating pagination.
+    server = StationListServer([[station(1)]])
+    if field == "pageCount":
+        server.page_count_per_page = {1: "1"}
+    elif field == "total":
+        server.total_override = "1"
+    elif field == "pageNo":
+        server.page_no_per_page = {1: "1"}
+    else:
+        server.page_size_per_page = {1: "100"}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()

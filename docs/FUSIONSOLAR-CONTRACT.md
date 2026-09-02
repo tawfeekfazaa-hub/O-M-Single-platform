@@ -272,15 +272,25 @@ mask authentication/version errors).
   never an `OverflowError` outside the taxonomy. Validation follows the
   value through any CONVERSION: 1e308 MW is finite but overflows to
   infinity in kWp, and what gets stored is what has to be checked. Integer
-  codes must arrive as JSON numbers — `"3"` is text, not the healthy code.
+  codes and pagination metadata must arrive as JSON NUMBERS — `"3"` is
+  text, not the healthy code, and `pageCount: "2"` is not a page count.
 - Ambiguous XSRF-TOKEN cookies (several paths or domains) are an
   authentication failure, not a choice to make: httpx raises
   `CookieConflict`, which is not an `HTTPError`, and picking one could send
   a token meant for another context.
-- Diagnostics are published on the FAILING path too. A KPI batch that
-  raises has already spent its calls; leaving the previous fetch's counts
-  in place would show a complete result that never happened and hide
-  budget already consumed.
+- Diagnostics are published on the FAILING path too, and copied onto the
+  cycle result there as well. A KPI batch that raises has already spent its
+  calls; leaving the previous fetch's counts in place — or publishing them
+  where the cycle never reads them — would show a complete result that
+  never happened and hide budget already consumed.
+- Only ONE staleness reason is reported at a time: the refresh that just
+  failed, never whatever stopped an earlier attempt before its deferral
+  expired.
+- HTTP **401/403** on an authenticated call is an expired session expressed
+  as a status instead of failCode 305: the token is dropped and the error
+  is session-blocking. Otherwise the next call would go out with
+  credentials the vendor just rejected, and `authenticate()` would keep
+  seeing a logged-in client on every later cycle.
 - HTTPS only; TLS verification enabled; redirects disabled; explicit
   connect/read/write/pool timeouts; the token goes only to the single
   configured origin. Nothing vendor-specific is ever logged.

@@ -309,6 +309,18 @@ class IngestionScheduler:
             # configured refresh cadence still applies.
             return 0.0
 
+    def _copy_kpi_diagnostics(self, result: CycleResult) -> None:
+        """Mirror the adapter's KPI counts onto the cycle result."""
+        diag = getattr(self._adapter, "last_kpi_diagnostics", None)
+        if diag is None:
+            return
+        result.readings_missing = diag.missing
+        result.readings_duplicate = diag.duplicates
+        result.readings_unexpected = diag.unexpected
+        result.invalid_values = diag.invalid_values
+        result.batches = diag.batches
+        result.calls_consumed += diag.calls_consumed
+
     async def run_cycle(self) -> CycleResult:
         """One ingestion pass. Never raises — errors land in the result."""
         result = CycleResult()
@@ -323,7 +335,11 @@ class IngestionScheduler:
                     # The station-list budget is independent of the KPI
                     # budget: a rate-limited refresh defers itself and must
                     # never abort KPI polling for this cycle.
+                    # One reason at a time: the refresh that just failed is
+                    # the one being reported, not whatever stopped an earlier
+                    # attempt before its deferral expired.
                     self._stale_rate_limited = True
+                    self._stale_error = None
                     if getattr(exc, "blocks_authentication", False):
                         # Unless what was throttled is the session itself —
                         # a re-login after failCode 305 can come back 429.
@@ -359,6 +375,7 @@ class IngestionScheduler:
                     # and aborting the cycle would stop KPI monitoring too.
                     # Defer the refresh instead and keep polling.
                     self._stale_error = str(exc)
+                    self._stale_rate_limited = False
                     if getattr(exc, "blocks_authentication", False):
                         # Except when the failure was the session itself: a
                         # re-login after failCode 305 can time out or answer
@@ -405,17 +422,18 @@ class IngestionScheduler:
                     )
             result.requested_plants = len(codes)
             if codes:
-                readings = await self._adapter.fetch_plant_kpis(codes)
+                try:
+                    readings = await self._adapter.fetch_plant_kpis(codes)
+                except AdapterError:
+                    # The batches already sent SPENT their calls, and the
+                    # adapter publishes what the failed attempt did. Copy it
+                    # before the error propagates, or the cycle would report
+                    # zero KPI calls and hide budget it actually consumed.
+                    self._copy_kpi_diagnostics(result)
+                    raise
                 result.readings_returned = len(readings)
                 result.readings_written = await self._repository.record_kpis(readings)
-                diag = getattr(self._adapter, "last_kpi_diagnostics", None)
-                if diag is not None:
-                    result.readings_missing = diag.missing
-                    result.readings_duplicate = diag.duplicates
-                    result.readings_unexpected = diag.unexpected
-                    result.invalid_values = diag.invalid_values
-                    result.batches = diag.batches
-                    result.calls_consumed += diag.calls_consumed
+                self._copy_kpi_diagnostics(result)
         except AdapterRateLimitError as exc:
             result.rate_limited = True
             result.error = str(exc)

@@ -13,7 +13,7 @@ from app.adapters.base import (
     PlantKpiReading,
     VendorAdapter,
 )
-from app.adapters.fusionsolar.adapter import FusionSolarAdapter
+from app.adapters.fusionsolar.adapter import FusionSolarAdapter, KpiDiagnostics
 from app.adapters.fusionsolar.client import XSRF_HEADER, RealFusionSolarClient
 from app.adapters.fusionsolar.mock_client import MockFusionSolarClient
 from app.adapters.fusionsolar.policy import FusionSolarRatePolicy
@@ -511,6 +511,70 @@ async def test_a_growing_inventory_waits_for_the_earlier_bursts_to_expire(
     await scheduler._refresh_inventory(CycleResult())
     assert scheduler._inventory_min_spacing == 12 * hour
     await client.close()
+
+
+async def test_a_new_refresh_failure_replaces_the_previous_reason(
+    repository: InMemoryRepository,
+):
+    # A rate-limited refresh followed, after its deferral, by a protocol
+    # failure used to report BOTH: the cycle carried a stale reason from an
+    # earlier, different attempt.
+    clock = FakeClock()
+
+    class TwoFailuresAdapter(FusionSolarAdapter):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.failures = [
+                AdapterRateLimitError("budget exhausted", retry_after_seconds=60.0),
+                AdapterProtocolError("station list pageCount changed"),
+            ]
+
+        async def list_plants(self) -> list[PlantInfo]:
+            raise self.failures.pop(0)
+
+    scheduler = IngestionScheduler(
+        TwoFailuresAdapter(
+            MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+        ),
+        repository,
+        clock=clock,
+        station_list_max_calls=4,
+        station_list_window_seconds=86_400.0,
+    )
+    first = await scheduler.run_cycle()
+    assert first.inventory_rate_limited and first.inventory_error is None
+
+    clock.now = 90_000.0  # past the deferral
+    second = await scheduler.run_cycle()
+    assert second.inventory_error is not None
+    assert not second.inventory_rate_limited  # the earlier reason is gone
+
+
+async def test_a_failed_kpi_fetch_reports_the_calls_it_spent(
+    repository: InMemoryRepository,
+):
+    # The adapter publishes what the failed attempt spent; the cycle result
+    # has to carry it too, or the scheduler's own view of the Huawei budget
+    # is short by every call the failed fetch made.
+    class FailingKpiAdapter(FusionSolarAdapter):
+        async def fetch_plant_kpis(self, vendor_plant_ids: list[str]) -> list[PlantKpiReading]:
+            self.last_kpi_diagnostics = KpiDiagnostics(
+                requested=len(vendor_plant_ids), returned=0, batches=1, calls_consumed=1
+            )
+            raise AdapterTransientError("vendor failed the batch")
+
+    await repository.upsert_plants(
+        [PlantInfo(vendor="fusionsolar", vendor_plant_id="NE=1", name="x")]
+    )
+    scheduler = IngestionScheduler(
+        FailingKpiAdapter(
+            MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+        ),
+        repository,
+    )
+    result = await scheduler.run_cycle()
+    assert result.transient and result.error is not None
+    assert result.batches == 1 and result.calls_consumed >= 1
 
 
 async def test_a_transient_relogin_failure_aborts_the_cycle_too(
