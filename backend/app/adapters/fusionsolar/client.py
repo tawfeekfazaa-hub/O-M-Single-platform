@@ -252,6 +252,16 @@ class RealFusionSolarClient:
         headers = {XSRF_HEADER: self._token} if self._token else {}
         try:
             return await self._http.post(path, json=json, headers=headers)
+        except httpx.DecodingError as exc:
+            # A body whose declared content-encoding will not decode (a
+            # corrupt gzip response). httpx raises this from post() while
+            # reading the response, and it is a RequestError but NOT a
+            # TransportError, so the clause below misses it. The bytes are
+            # unusable, not a network fault: a protocol error, and above all
+            # inside the taxonomy rather than escaping into run_forever().
+            raise AdapterProtocolError(
+                f"FusionSolar response on {path} could not be decoded: {type(exc).__name__}"
+            ) from exc
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise AdapterTransientError(
                 f"FusionSolar transport failure on {path}: {type(exc).__name__}"
@@ -285,7 +295,11 @@ class RealFusionSolarClient:
     def _fail_code(payload: dict[str, Any]) -> int:
         try:
             return int(payload.get("failCode") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: JSON 1e309 decodes to infinity, which int()
+            # refuses. Like any other unusable failCode it means "not one of
+            # the codes we act on" — never an exception outside the adapter
+            # taxonomy, which would take the scheduler task down.
             return 0
 
     async def login(self) -> None:
@@ -455,16 +469,23 @@ class RealFusionSolarClient:
                     # page since the last refresh would take the free
                     # slots and be rejected on its last page. Stop here
                     # instead, with the wait the scheduler needs.
-                    remaining = max((page_count or 0) - 1, 0)
-                    wait = self._policy.wait_for_slots(Endpoint.STATION_LIST, remaining)
-                    if wait > 0:
+                    pages_needed = page_count or 0
+                    remaining = max(pages_needed - 1, 0)
+                    if self._policy.wait_for_slots(Endpoint.STATION_LIST, remaining) > 0:
+                        # The wait is measured for the WHOLE next attempt,
+                        # which restarts at page 1 and therefore needs every
+                        # page again — page 1's own call included, since it
+                        # keeps occupying its slot until it expires. Asking
+                        # only for the pages still missing here would hand
+                        # back a delay that lets the retry spend the one slot
+                        # that just freed and stop at the same place, over
+                        # and over, never refreshing at all.
                         raise AdapterRateLimitError(
                             "station list needs more pages than the station-list "
                             "budget has free; deferring the whole refresh",
-                            retry_after_seconds=wait,
-                            # Measured for EVERY page the next attempt needs,
-                            # not for one freed slot: the scheduler can act on
-                            # it as-is instead of waiting out a whole window.
+                            retry_after_seconds=self._policy.wait_for_slots(
+                                Endpoint.STATION_LIST, pages_needed
+                            ),
                             retry_after_covers_whole_attempt=True,
                         )
                 elif echoed_page_count != page_count:

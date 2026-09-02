@@ -130,7 +130,11 @@ mask authentication/version errors).
   plain rate-limit hint frees ONE slot and is widened to a full window
   (retrying on it would fail on the same page forever), but a hint
   measured for every page of the next attempt is already sufficient, and
-  widening it would only add staleness. A refresh that fails part-way has still spent its calls,
+  widening it would only add staleness. That hint counts EVERY page the
+  retry needs — the rejected attempt's own page-1 call included, since it
+  holds its slot until it expires — because the retry restarts at page 1;
+  a hint covering only the missing pages lets each attempt spend the slot
+  that just freed and stop at the same place, indefinitely. A refresh that fails part-way has still spent its calls,
   so its slots are recorded like a successful burst's and the deferral
   covers them — otherwise the retry walks into a budget that cannot carry
   it, wastes another call and extends the staleness it was meant to end.
@@ -239,7 +243,14 @@ mask authentication/version errors).
   minimum interval are hard lower bounds applied afterwards, so the next
   request is never sent before the server's requested delay.
 - Non-JSON bodies, non-object envelopes, contract-violating shapes →
-  protocol error.
+  protocol error. So is a body whose declared content-encoding will not
+  decode: httpx raises `DecodingError`, which is a `RequestError` but NOT
+  a `TransportError`, so it needs its own clause or it escapes the
+  taxonomy entirely.
+- Numbers arrive as JSON, so they can be larger than a float: an oversized
+  `failCode` (1e309 decodes to infinity) or capacity/KPI value is treated
+  as unusable data — a code we do not act on, a counted invalid value —
+  never an `OverflowError` outside the taxonomy.
 - HTTPS only; TLS verification enabled; redirects disabled; explicit
   connect/read/write/pool timeouts; the token goes only to the single
   configured origin. Nothing vendor-specific is ever logged.

@@ -93,7 +93,10 @@ def _finite_float(value: Any, diagnostics: KpiDiagnostics) -> float | None:
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a JSON integer too large for a float (a thousand-digit
+        # capacity). That is malformed data like any other — counted and
+        # dropped, never an exception escaping run_cycle().
         diagnostics.invalid_values += 1
         return None
     if not math.isfinite(number):

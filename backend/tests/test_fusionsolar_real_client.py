@@ -529,3 +529,52 @@ async def test_plausible_retry_after_is_still_honoured():
         await client.get_station_real_kpi(["NE=1"])
     assert excinfo.value.retry_after_seconds == pytest.approx(86_400.0)
     await client.close()
+
+
+async def test_undecodable_body_is_a_protocol_error_not_an_escape():
+    # httpx raises DecodingError from post() when a declared content-encoding
+    # will not decode. It is a RequestError but NOT a TransportError, so the
+    # transient clause misses it and it used to escape run_forever().
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/login"):
+            return httpx.Response(
+                200, json={"success": True, "failCode": 0}, headers={XSRF_HEADER: TOKEN}
+            )
+        return httpx.Response(
+            200,
+            content=b"not-actually-gzip",
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        )
+
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username=USERNAME,
+        system_code=SYSTEM_CODE,
+        policy=generous_policy(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_non_finite_fail_code_is_not_an_escape():
+    # JSON 1e309 decodes to infinity, which int() refuses with OverflowError.
+    # An unusable failCode simply is not one of the codes we act on.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content='{"success": false, "failCode": 1e309}',
+            headers={"Content-Type": "application/json"},
+        )
+
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username=USERNAME,
+        system_code=SYSTEM_CODE,
+        policy=generous_policy(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AdapterError):  # inside the taxonomy, whatever the kind
+        await client.login()
+    await client.close()

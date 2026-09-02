@@ -479,3 +479,56 @@ async def test_a_burst_that_fits_the_remaining_budget_still_runs():
     assert result.pages_retrieved == 2
     assert len(result.stations) == 101
     await client.close()
+
+
+async def test_the_deferral_hint_covers_every_page_the_retry_needs():
+    # The retry restarts at page 1, so the hint must count EVERY page — page
+    # 1's own call included, since it keeps its slot until it expires. Asking
+    # only for the pages still missing hands back a delay that lets the retry
+    # spend the one slot that just freed and stop at the same place, forever:
+    # with calls at hours 0 and 1 and a 3-page attempt at hour 12, the old
+    # hint walked 24 -> 25 -> 36 -> 48 -> ... and never refreshed.
+    hour = 3600.0
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+    server = StationListServer(
+        [
+            [station(i) for i in range(100)],
+            [station(i) for i in range(100, 200)],
+            [station(200)],
+        ]
+    )
+    policy = FusionSolarRatePolicy(
+        login_max_calls=100,
+        station_list_max_calls=4,
+        station_list_window_seconds=24 * hour,
+        clock=clock,
+    )
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username="nb-user",
+        system_code="nb-system-code",
+        policy=policy,
+        transport=httpx.MockTransport(server.handler),
+    )
+    await policy.acquire(Endpoint.STATION_LIST)  # an earlier call at hour 0
+    clock.now = hour
+    await policy.acquire(Endpoint.STATION_LIST)  # and another at hour 1
+
+    clock.now = 12 * hour
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.list_stations()
+    # Hour 25, when the hour-1 call expires and three slots are free at once
+    # beside the page-1 call just made — not hour 24, which frees only two.
+    assert clock.now + excinfo.value.retry_after_seconds == 25 * hour
+
+    clock.now = 25 * hour
+    result = await client.list_stations()
+    assert result.pages_retrieved == 3
+    await client.close()

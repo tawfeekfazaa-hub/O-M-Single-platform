@@ -13,6 +13,7 @@ from app.adapters.base import PlantStatus
 from app.adapters.fusionsolar.adapter import (
     FusionSolarAdapter,
     KpiDiagnostics,
+    _finite_float,
     normalize_performance_ratio,
 )
 from app.adapters.fusionsolar.client import ClientCallCounts, KpiBatchResult, StationListResult
@@ -89,6 +90,17 @@ def test_already_normalized_pr_is_accepted_as_compatibility():
     assert normalize_performance_ratio(0.0, diag) == 0.0
     assert normalize_performance_ratio(1.0, diag) == 1.0
     assert diag.invalid_values == 0
+
+
+def test_a_json_integer_too_large_for_a_float_is_counted_not_raised():
+    # JSON decoding yields a Python int of any size, but float() overflows on
+    # a thousand-digit one. That is malformed data like NaN or "abc": counted
+    # and dropped, never an OverflowError escaping run_cycle().
+    diag = KpiDiagnostics()
+    huge = int("1" * 1000)
+    assert normalize_performance_ratio(huge, diag) is None
+    assert _finite_float(huge, diag) is None
+    assert diag.invalid_values == 2
 
 
 def test_invalid_pr_values_are_rejected_and_counted():
