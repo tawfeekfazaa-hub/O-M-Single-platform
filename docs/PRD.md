@@ -67,7 +67,15 @@ come in a later phase once meteo data is ingested.
 
 ## 7. Rollout
 
-1. Mock mode everywhere (dev, CI).
-2. Staging: `FUSIONSOLAR_MODE=real` with a dedicated Northbound API account,
-   scheduler interval tuned to stay far under the rate limit.
-3. Prod: same as staging after a week of stable staging ingestion.
+1. Mock mode everywhere (dev, CI). *(done)*
+2. **PR-1** — FusionSolar connector contract validated OFFLINE
+   (legacy_system_code profile, pagination, per-endpoint rate budgets,
+   normalization, real-mode safety gate). No live vendor call. *(done)*
+3. **PR-2** — Raw/Quarantine storage: every real payload lands in raw
+   storage first; malformed data is quarantined, never silently ingested.
+4. Only after PR-2 **and** an approved staging host **and** the company
+   data-location policy decision: one controlled live contract-validation
+   check (see docs/FUSIONSOLAR-CONTRACT.md "live unknowns"), then
+   `FUSIONSOLAR_MODE=real` on staging with the scheduler's conservative
+   cadences.
+5. Prod: same as staging after a week of stable staging ingestion.

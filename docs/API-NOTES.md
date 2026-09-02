@@ -1,55 +1,72 @@
 # Vendor API Notes
 
-## Huawei FusionSolar Northbound API (openapi)
+## Huawei FusionSolar Northbound API (legacy_system_code profile)
 
-Reference: iMaster NetEco / FusionSolar "Northbound Interface Reference"
-(SmartPVMS). Base URL is region-specific, e.g.
-`https://eu5.fusionsolar.huawei.com/thirdData` — configure via
-`FUSIONSOLAR_BASE_URL`, never hardcode.
+**The normative contract lives in docs/FUSIONSOLAR-CONTRACT.md** (with
+the Huawei source URLs, verification levels, and live unknowns). This
+file is the quick operational summary.
+
+Base URL is region-specific (your portal host + `/thirdData`) —
+configured via `FUSIONSOLAR_BASE_URL`, HTTPS only, never hardcoded.
 
 ### Authentication & session
 
-- `POST /login` with `userName` + `systemCode` (Northbound account password).
-- On success the response carries an `XSRF-TOKEN` cookie/header; every
-  subsequent call must send it (`XSRF-TOKEN` header).
-- **Single session per user**: logging in again invalidates the previous
-  token. Only ONE process (the scheduler) may hold a session.
-- Tokens expire (~30 min idle). Re-login on `failCode` 305 (not logged in).
+- `POST /login` with `userName` + `systemCode`
+  (env: `FUSIONSOLAR_USERNAME` + `FUSIONSOLAR_SYSTEM_CODE`; the
+  systemCode is a dedicated API credential, not a portal password).
+- `XSRF-TOKEN` comes back in the response header (some deployments: as a
+  cookie); it must accompany every subsequent call, and is only ever sent
+  to the configured origin.
+- **Single session per user** — only ONE process (the scheduler) may hold
+  a session. Token validity ≈ 30 min; `failCode 305` → at most one
+  controlled re-login + one retry.
 
-### Rate limiting — THE critical constraint
+### Rate limiting — per endpoint, NOT one global budget
 
-- ~**5 calls per 10 minutes per user** (varies by tenant/endpoint class).
-- Exceeding it returns `failCode` **407** ("access frequency too high").
-- Behaviour on 407: back off exponentially (with jitter), do NOT retry
-  immediately, do NOT re-login (login calls count against the budget).
-- Consequence for design: batch endpoints only (station list, station KPIs
-  for many plants per call). Never fan out per-device calls in Phase 1.
+The old "~5 calls / 10 min for everything" description was wrong; Huawei
+limits each endpoint class separately:
+
+| Endpoint | Official limit | Our client-side budget |
+|----------|----------------|------------------------|
+| `POST /login` | 5 / 10 min per user (also: 5 wrong passwords → 30-min lock) | 4 / 600 s (margin) |
+| `POST /getStationList` | small daily-style allowance; exact formula varies by SmartPVMS version | **safety default** 4 / day; inventory cadence 6 h |
+| `POST /getStationRealKpi` | ceil(plants/100) / 5 min, ≤100 codes per call | derived at runtime from plant count |
+
+`failCode 407` **or HTTP 429** = frequency exceeded → back off (jitter),
+never retry immediately, never re-login in response. All vendor calls are
+sequential. Exhausting one budget never spends another.
 
 ### Endpoints used in Phase 1
 
 | Endpoint | Purpose | Notes |
 |----------|---------|-------|
-| `POST /login` | obtain XSRF token | counts toward budget |
-| `POST /getStationList` | list plants (name, code, capacity, address) | paginated |
-| `POST /getStationRealKpi` | real-time station KPIs | up to 100 `stationCodes` per call, comma-separated |
+| `POST /login` | obtain XSRF token | counts toward the login budget |
+| `POST /getStationList` | plant inventory | `pageNo`/`pageSize=100`; BOTH documented variants parsed on this path (direct list and `{list,pageNo,pageSize,pageCount,total}`); refreshed on the 6-h cadence, never every KPI cycle |
+| `POST /getStationRealKpi` | real-time station KPIs | ≤100 `stationCodes` per sequential batch |
 
-Response envelope: `{"success": bool, "failCode": int, "data": ...}`.
-`success=false` + `failCode=407` → rate limited; `failCode=305` → re-login.
+`/thirdData/stations` + OAuth are a documented FUTURE upgrade path
+(newer SmartPVMS): out of scope, no code, **no auto-fallback**.
+
+Response envelope: `{"success": bool, "failCode": int, "data": ...,
+"params": {"currentTime": ms, ...}}`. `params.currentTime` is vendor
+SERVER time (not a device measurement timestamp).
 
 ### Station KPI payload mapping (getStationRealKpi → our model)
 
-| FusionSolar field | Our field |
-|-------------------|-----------|
-| `dataItemMap.day_power` | `daily_energy_kwh` |
-| `dataItemMap.total_power` | `total_energy_kwh` |
-| `dataItemMap.real_health_state` | plant status (1 disconnected, 2 faulty, 3 healthy) |
-| — (derived/vendor) | `active_power_kw`, `performance_ratio` when exposed |
+| FusionSolar field | Our field | Notes |
+|-------------------|-----------|-------|
+| `dataItemMap.day_power` | `daily_energy_kwh` | kWh, finite-validated |
+| `dataItemMap.total_power` | `total_energy_kwh` | kWh, finite-validated |
+| `dataItemMap.real_health_state` | plant status | 1 disconnected, 2 faulty, 3 healthy, else unknown |
+| `dataItemMap.performance_ratio` | `performance_ratio` | tenant-dependent; normalized to 0..1 (89 → 0.89) |
+| — | `active_power_kw` | **no documented station-level field → None in real mode** (mock's `real_power` is synthetic) |
+| `params.currentTime` | `vendor_server_time` | vendor server clock |
 
-Field availability differs by tenant/version — the adapter treats every
-field as optional and stores NULL when absent.
+Field availability differs by tenant/version — every field is optional
+and invalid values (NaN/∞/impossible) are rejected, not stored.
 
 ## Sungrow iSolarCloud (Phase 2 — placeholder)
 
 - OpenAPI with appkey/token auth; different rate limits.
-- Must fit the same `VendorAdapter` interface; no schema changes expected
-  (vendor-specific fields go to the adapter, not the DB).
+- Must fit the same `VendorAdapter` interface; the generic rate-limiter
+  and per-endpoint policy pattern are reusable.

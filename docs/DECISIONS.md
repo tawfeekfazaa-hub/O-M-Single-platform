@@ -3,6 +3,39 @@
 Format: newest first. Every change to the fixed architecture in CLAUDE.md
 requires an entry here.
 
+## ADR-005 — 2026-09-01 — FusionSolar contract hardening (PR-1)
+
+Decisions (full contract: docs/FUSIONSOLAR-CONTRACT.md):
+
+1. **legacy_system_code is the only API profile** (`FUSIONSOLAR_API_PROFILE`),
+   speaking `/thirdData/getStationList`; the OAuth `/thirdData/stations`
+   stack is a documented future upgrade with zero code and **no
+   auto-fallback in either direction** — endpoint probing on failure would
+   burn rate budget and mask auth/version errors.
+2. **Per-endpoint rate budgets** replace the old single shared budget:
+   login 4/600 s (official 5/10 min minus margin), real-time KPI
+   ceil(plants/100)/5 min derived at runtime (official), station list
+   4/day as a configurable SAFETY DEFAULT (the official daily formula
+   varies by SmartPVMS version and is deliberately not encoded as a
+   universal constant). Budgets are independent; no retry may spend
+   another endpoint's budget.
+3. **Inventory and KPI schedules are separate**: station inventory
+   refreshes on a conservative 6-hour default cadence; KPI cycles read
+   the repository cache and never call the station-list endpoint.
+4. **Station-list pagination** (pageNo/pageSize=100) with both documented
+   response variants on the same path, finite page guards, repeated-page
+   detection, deterministic dedup, and no silent skipping of malformed
+   pages.
+5. **Real-mode safety gate**: the app refuses FUSIONSOLAR_MODE=real +
+   SCHEDULER_ENABLED=true until Raw/Quarantine storage (PR-2) exists.
+   The diagnostic checker is offline/dry-run by default and its live path
+   stays prohibited until PR-2 + approved hosting + the data-location
+   policy decision.
+6. Real mapping never invents station active power (no documented field →
+   None); the mock's synthetic fields are mock-only and documented as
+   such. Vendor `params.currentTime` is stored as server time, never as a
+   measurement timestamp.
+
 ## ADR-004 — 2026-09-01 — Repository layer with in-memory + Postgres backends
 
 The API and scheduler depend on a `Repository` protocol, not on SQLAlchemy
