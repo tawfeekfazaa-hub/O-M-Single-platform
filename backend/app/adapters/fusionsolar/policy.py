@@ -81,9 +81,7 @@ class FusionSolarRatePolicy:
         return max(1, math.ceil(max(plant_count, 0) / KPI_BATCH_SIZE))
 
     def set_kpi_plant_count(self, plant_count: int) -> None:
-        self._limiters[Endpoint.STATION_REAL_KPI].set_max_calls(
-            self.kpi_calls_for(plant_count)
-        )
+        self._limiters[Endpoint.STATION_REAL_KPI].set_max_calls(self.kpi_calls_for(plant_count))
 
     def window_seconds(self, endpoint: Endpoint) -> float:
         return self._limiters[endpoint].window_seconds

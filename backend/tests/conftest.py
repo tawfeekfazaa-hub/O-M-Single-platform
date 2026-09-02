@@ -21,7 +21,8 @@ def mock_client() -> MockFusionSolarClient:
 
 @pytest.fixture
 def adapter(mock_client: MockFusionSolarClient) -> FusionSolarAdapter:
-    return FusionSolarAdapter(mock_client)
+    # Mirrors the factory: only the mock adapter maps synthetic fields.
+    return FusionSolarAdapter(mock_client, allow_synthetic_fields=True)
 
 
 @pytest.fixture

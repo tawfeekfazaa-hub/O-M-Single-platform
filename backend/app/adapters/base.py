@@ -36,16 +36,25 @@ class PlantInfo:
 
 @dataclass(frozen=True, slots=True)
 class PlantKpiReading:
-    """One normalized KPI sample for one plant (IEC 61724-1 subset)."""
+    """One normalized KPI sample for one plant (IEC 61724-1 subset).
+
+    Timestamp provenance:
+    - ``ts`` is the local RECEIVED-AT time (when our process ingested the
+      sample), timezone-aware UTC. It is what gets stored.
+    - ``vendor_server_time`` is the vendor's SERVER clock as reported in
+      the response envelope (FusionSolar ``params.currentTime``). It is
+      NOT a device measurement timestamp and must not be presented as one.
+    """
 
     vendor: str
     vendor_plant_id: str
-    ts: datetime  # timezone-aware UTC
+    ts: datetime  # timezone-aware UTC, local received-at time
     active_power_kw: float | None = None
     daily_energy_kwh: float | None = None
     total_energy_kwh: float | None = None
-    performance_ratio: float | None = None  # 0..1
+    performance_ratio: float | None = None  # normalized 0..1
     status: PlantStatus = PlantStatus.UNKNOWN
+    vendor_server_time: datetime | None = None  # vendor server clock, UTC
 
 
 class AdapterError(Exception):
@@ -54,6 +63,16 @@ class AdapterError(Exception):
 
 class AdapterAuthError(AdapterError):
     """Authentication failed or session expired and re-login failed."""
+
+
+class AdapterTransientError(AdapterError):
+    """Timeout, connection failure, or retryable 5xx — safe to retry LATER
+    (after scheduler backoff), never immediately."""
+
+
+class AdapterProtocolError(AdapterError):
+    """The vendor answered with a malformed or contract-violating payload
+    (non-JSON, unexpected envelope shape, impossible pagination metadata)."""
 
 
 class AdapterRateLimitError(AdapterError):

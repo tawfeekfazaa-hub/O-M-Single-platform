@@ -1,25 +1,93 @@
-"""FusionSolar Northbound API clients.
+"""FusionSolar Northbound API clients — legacy_system_code profile only.
 
-Both clients speak the *vendor* payload shapes; the adapter maps them to
-our normalized model. The real client is the only place in the codebase
-that performs vendor HTTP calls, and every call goes through the shared
-rate limiter (~5 calls / 10 min / user, failCode 407 — docs/API-NOTES.md).
+Contract profile (docs/FUSIONSOLAR-CONTRACT.md): userName + systemCode
+login yielding an XSRF-TOKEN, ``/thirdData/getStationList`` for the plant
+inventory (both documented response variants: legacy direct list and the
+paginated ``{list,pageNo,pageSize,pageCount,total}`` envelope on the SAME
+path) and ``/thirdData/getStationRealKpi`` for real-time KPIs. There is
+deliberately NO fallback to another endpoint and NO OAuth here: a failure
+is raised as a typed error with zero additional vendor calls.
+
+Security invariants of this module:
+- the XSRF token is only ever attached to requests built from the single
+  configured base_url origin (relative paths only, redirects disabled);
+- nothing vendor-specific is logged or printed — no headers, cookies,
+  tokens, bodies, station identifiers, or KPI values (this module has no
+  logging at all by design);
+- TLS verification stays at the httpx default (enabled).
 """
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
+import email.utils
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
 
-from app.adapters.base import AdapterAuthError, AdapterError, AdapterRateLimitError
-from app.core.ratelimit import RateLimitExceeded, RollingWindowRateLimiter
+from app.adapters.base import (
+    AdapterAuthError,
+    AdapterError,
+    AdapterProtocolError,
+    AdapterRateLimitError,
+    AdapterTransientError,
+)
+from app.adapters.fusionsolar.policy import KPI_BATCH_SIZE, Endpoint, FusionSolarRatePolicy
 
-# FusionSolar failCodes we handle explicitly.
+# FusionSolar failCodes handled explicitly (docs/FUSIONSOLAR-CONTRACT.md).
 FAIL_CODE_NOT_LOGGED_IN = 305
 FAIL_CODE_RATE_LIMITED = 407
 
 XSRF_HEADER = "XSRF-TOKEN"
+
+# Vendor-side epoch-milliseconds plausibility window (2001..2096) for
+# params.currentTime; anything outside is treated as absent, not guessed.
+_MIN_EPOCH_MS = 1_000_000_000_000
+_MAX_EPOCH_MS = 4_000_000_000_000
+
+_RETRYABLE_STATUS = {500, 502, 503, 504}
+
+DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+
+STATION_LIST_PAGE_SIZE = 100
+
+
+@dataclass(slots=True)
+class StationListResult:
+    """Vendor-shaped station rows plus pagination diagnostics (counts only)."""
+
+    stations: list[dict[str, Any]]
+    variant: str  # "direct_list" | "paginated"
+    pages_retrieved: int
+    duplicates_removed: int = 0
+    metadata_missing: bool = False
+
+
+@dataclass(slots=True)
+class KpiBatchResult:
+    """Vendor-shaped KPI rows for one batch plus envelope server time."""
+
+    rows: list[dict[str, Any]]
+    vendor_current_time_ms: int | None = None
+    calls_consumed: int = 1
+
+
+@dataclass(slots=True)
+class ClientCallCounts:
+    """Per-endpoint call counters for diagnostics/tests (counts only)."""
+
+    login: int = 0
+    station_list: int = 0
+    station_real_kpi: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "login": self.login,
+            "station_list": self.station_list,
+            "station_real_kpi": self.station_real_kpi,
+        }
 
 
 class FusionSolarClient(Protocol):
@@ -27,73 +95,121 @@ class FusionSolarClient(Protocol):
 
     async def login(self) -> None: ...
 
-    async def get_station_list(self) -> list[dict[str, Any]]: ...
+    async def list_stations(self) -> StationListResult: ...
 
-    async def get_station_real_kpi(self, station_codes: list[str]) -> list[dict[str, Any]]: ...
+    async def get_station_real_kpi(self, station_codes: list[str]) -> KpiBatchResult: ...
 
     def is_logged_in(self) -> bool: ...
+
+    def call_counts(self) -> ClientCallCounts: ...
 
     async def close(self) -> None: ...
 
 
-class RealFusionSolarClient:
-    """Talks to the FusionSolar Northbound API over HTTPS.
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header safely: delta-seconds or HTTP-date."""
+    if not value:
+        return None
+    text = value.strip()
+    if text.isdigit():
+        return float(text)
+    try:
+        when = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    delta = (when - dt.datetime.now(dt.UTC)).total_seconds()
+    return max(delta, 0.0)
 
-    Session rules (docs/API-NOTES.md): single session per user, XSRF token
-    from /login must accompany every call, re-login on failCode 305. Login
-    calls consume rate budget too, so they also acquire the limiter.
+
+def _station_signature(rows: list[dict[str, Any]]) -> tuple[Any, ...]:
+    return tuple(row.get("stationCode") for row in rows)
+
+
+class RealFusionSolarClient:
+    """Talks to the FusionSolar Northbound API over HTTPS (real mode only).
+
+    Session rules: single session per user; at most ONE controlled
+    re-login (behind a lock) followed by one retry on failCode 305; NEVER
+    a re-login in response to 407/429 — those map to rate-limit errors
+    with a lower-bound retry delay from the endpoint's own budget.
     """
 
     def __init__(
         self,
         base_url: str,
         username: str,
-        password: str,
-        rate_limiter: RollingWindowRateLimiter,
+        system_code: str,
+        policy: FusionSolarRatePolicy,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
-        timeout_seconds: float = 30.0,
+        timeout: httpx.Timeout = DEFAULT_TIMEOUT,
+        max_station_list_pages: int = 50,
     ) -> None:
         self._username = username
-        self._password = password
-        self._limiter = rate_limiter
+        self._system_code = system_code
+        self._policy = policy
         self._token: str | None = None
+        self._login_lock = asyncio.Lock()
+        self._counts = ClientCallCounts()
+        self._max_pages = max_station_list_pages
         self._http = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            timeout=timeout_seconds,
+            timeout=timeout,
             transport=transport,
+            follow_redirects=False,  # redirects are not part of the contract
         )
+
+    # ------------------------------------------------------------------ #
+    # transport                                                          #
+    # ------------------------------------------------------------------ #
 
     def is_logged_in(self) -> bool:
         return self._token is not None
 
-    async def _post(self, path: str, json: dict[str, Any]) -> dict[str, Any]:
-        try:
-            await self._limiter.acquire(wait=False)
-        except RateLimitExceeded as exc:
-            raise AdapterRateLimitError(
-                "client-side FusionSolar rate budget exhausted",
-                retry_after_seconds=exc.retry_after_seconds,
-            ) from exc
+    def call_counts(self) -> ClientCallCounts:
+        return self._counts
+
+    async def _post(self, endpoint: Endpoint, path: str, json: dict[str, Any]) -> httpx.Response:
+        await self._policy.acquire(endpoint)
+        if endpoint is Endpoint.LOGIN:
+            self._counts.login += 1
+        elif endpoint is Endpoint.STATION_LIST:
+            self._counts.station_list += 1
+        else:
+            self._counts.station_real_kpi += 1
 
         headers = {XSRF_HEADER: self._token} if self._token else {}
         try:
-            response = await self._http.post(path, json=json, headers=headers)
-        except httpx.HTTPError as exc:
-            raise AdapterError(f"FusionSolar request failed: {exc}") from exc
+            return await self._http.post(path, json=json, headers=headers)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise AdapterTransientError(
+                f"FusionSolar transport failure on {path}: {type(exc).__name__}"
+            ) from exc
 
-        if response.status_code != 200:
-            raise AdapterError(f"FusionSolar HTTP {response.status_code} on {path}")
+    def _payload_from(
+        self, endpoint: Endpoint, path: str, response: httpx.Response
+    ) -> dict[str, Any]:
+        status = response.status_code
+        if status == 429:
+            retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+            raise AdapterRateLimitError(
+                f"FusionSolar HTTP 429 on {path}",
+                retry_after_seconds=retry_after
+                if retry_after is not None
+                else self._policy.retry_after_hint(endpoint),
+            )
+        if status in _RETRYABLE_STATUS:
+            raise AdapterTransientError(f"FusionSolar HTTP {status} on {path}")
+        if status != 200:
+            raise AdapterError(f"FusionSolar HTTP {status} on {path}")
         try:
-            payload: dict[str, Any] = response.json()
+            payload = response.json()
         except ValueError as exc:
-            raise AdapterError(f"FusionSolar returned non-JSON body on {path}") from exc
-
-        if path == "/login" and payload.get("success"):
-            token = response.headers.get(XSRF_HEADER) or response.cookies.get(XSRF_HEADER)
-            if not token:
-                raise AdapterAuthError("FusionSolar login succeeded but returned no XSRF token")
-            self._token = token
+            raise AdapterProtocolError(f"FusionSolar returned non-JSON body on {path}") from exc
+        if not isinstance(payload, dict):
+            raise AdapterProtocolError(f"FusionSolar envelope on {path} is not an object")
         return payload
 
     @staticmethod
@@ -103,45 +219,186 @@ class RealFusionSolarClient:
         except (TypeError, ValueError):
             return 0
 
-    async def _call(self, path: str, json: dict[str, Any], *, retry_auth: bool = True) -> Any:
-        """POST with envelope handling: 407 -> rate limit, 305 -> re-login once."""
-        payload = await self._post(path, json)
-        if payload.get("success"):
-            return payload.get("data")
-
-        fail_code = self._fail_code(payload)
-        if fail_code == FAIL_CODE_RATE_LIMITED:
-            raise AdapterRateLimitError("FusionSolar failCode 407 (access frequency too high)")
-        if fail_code == FAIL_CODE_NOT_LOGGED_IN and retry_auth:
-            self._token = None
-            await self.login()
-            return await self._call(path, json, retry_auth=False)
-        raise AdapterError(f"FusionSolar call {path} failed (failCode={fail_code})")
-
     async def login(self) -> None:
-        payload = await self._post(
-            "/login",
-            {"userName": self._username, "systemCode": self._password},
-        )
-        if not payload.get("success"):
+        """Establish a session. Single-flight: concurrent callers share one login."""
+        async with self._login_lock:
+            if self._token is not None:
+                return
+            response = await self._post(
+                Endpoint.LOGIN,
+                "/login",
+                {"userName": self._username, "systemCode": self._system_code},
+            )
+            payload = self._payload_from(Endpoint.LOGIN, "/login", response)
+            if not payload.get("success"):
+                fail_code = self._fail_code(payload)
+                if fail_code == FAIL_CODE_RATE_LIMITED:
+                    raise AdapterRateLimitError(
+                        "FusionSolar rate-limited the login call (failCode 407)",
+                        retry_after_seconds=self._policy.retry_after_hint(Endpoint.LOGIN),
+                    )
+                raise AdapterAuthError(f"FusionSolar login failed (failCode={fail_code})")
+            # Documented delivery is the XSRF-TOKEN response header; some
+            # deployments deliver it as a cookie — accept both.
+            token = response.headers.get(XSRF_HEADER) or response.cookies.get(XSRF_HEADER)
+            if not token:
+                raise AdapterAuthError("FusionSolar login succeeded but returned no XSRF token")
+            self._token = token
+
+    async def _call(self, endpoint: Endpoint, path: str, json: dict[str, Any]) -> dict[str, Any]:
+        """Authenticated envelope call: 407 -> rate limit; 305 -> at most one
+        controlled re-login and one retry; anything malformed -> protocol error."""
+        if self._token is None:
+            await self.login()
+
+        for attempt in (1, 2):
+            response = await self._post(endpoint, path, json)
+            payload = self._payload_from(endpoint, path, response)
+            if payload.get("success"):
+                return payload
             fail_code = self._fail_code(payload)
             if fail_code == FAIL_CODE_RATE_LIMITED:
-                raise AdapterRateLimitError("FusionSolar rate-limited the login call")
-            raise AdapterAuthError(f"FusionSolar login failed (failCode={fail_code})")
+                raise AdapterRateLimitError(
+                    f"FusionSolar failCode 407 on {path} (access frequency too high)",
+                    retry_after_seconds=self._policy.retry_after_hint(endpoint),
+                )
+            if fail_code == FAIL_CODE_NOT_LOGGED_IN and attempt == 1:
+                self._token = None
+                await self.login()
+                continue
+            if fail_code == FAIL_CODE_NOT_LOGGED_IN:
+                raise AdapterAuthError(
+                    "FusionSolar session could not be re-established (repeated failCode 305)"
+                )
+            raise AdapterError(f"FusionSolar call {path} failed (failCode={fail_code})")
+        raise AdapterError(f"FusionSolar call {path} failed")  # pragma: no cover
 
-    async def get_station_list(self) -> list[dict[str, Any]]:
-        if not self._token:
-            await self.login()
-        data = await self._call("/getStationList", {})
-        return list(data or [])
+    # ------------------------------------------------------------------ #
+    # station list (/thirdData/getStationList) — both documented variants #
+    # ------------------------------------------------------------------ #
 
-    async def get_station_real_kpi(self, station_codes: list[str]) -> list[dict[str, Any]]:
+    async def list_stations(self) -> StationListResult:
+        stations: list[dict[str, Any]] = []
+        seen: dict[str, dict[str, Any]] = {}
+        duplicates_removed = 0
+        variant: str | None = None
+        metadata_missing = False
+        previous_signature: tuple[Any, ...] | None = None
+        page_no = 1
+        page_count: int | None = None
+
+        while True:
+            if page_no > self._max_pages:
+                raise AdapterProtocolError(
+                    f"station list exceeded the {self._max_pages}-page guard"
+                )
+            payload = await self._call(
+                Endpoint.STATION_LIST,
+                "/getStationList",
+                {"pageNo": page_no, "pageSize": STATION_LIST_PAGE_SIZE},
+            )
+            data = payload.get("data")
+
+            if isinstance(data, list):
+                # Legacy variant: the whole inventory in one direct list.
+                if page_no != 1:
+                    raise AdapterProtocolError(
+                        "station list switched to direct-list variant mid-pagination"
+                    )
+                variant = "direct_list"
+                rows = data
+                page_count = 1
+            elif isinstance(data, dict):
+                variant = "paginated"
+                rows = data.get("list")
+                if not isinstance(rows, list):
+                    raise AdapterProtocolError("paginated station list has no 'list' array")
+                raw_page_count = data.get("pageCount")
+                if raw_page_count is None:
+                    metadata_missing = True
+                    page_count = page_no  # accept what we got, flagged
+                else:
+                    try:
+                        page_count = int(raw_page_count)
+                    except (TypeError, ValueError) as exc:
+                        raise AdapterProtocolError(
+                            "paginated station list has non-numeric pageCount"
+                        ) from exc
+                    if page_count < 0 or page_count > self._max_pages:
+                        raise AdapterProtocolError(
+                            f"impossible station list pageCount={page_count}"
+                        )
+                if rows == [] and page_no < (page_count or 0):
+                    raise AdapterProtocolError(
+                        "station list returned an empty page before pageCount was reached"
+                    )
+            else:
+                raise AdapterProtocolError("station list data is neither a list nor an object")
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise AdapterProtocolError("station list row is not an object")
+                code = row.get("stationCode")
+                if not code:
+                    raise AdapterProtocolError("station list row lacks stationCode")
+                code = str(code)
+                if code in seen:
+                    if seen[code] == row:
+                        duplicates_removed += 1
+                        continue
+                    raise AdapterProtocolError(
+                        "station list contains conflicting duplicate stationCode entries"
+                    )
+                seen[code] = row
+                stations.append(row)
+
+            signature = _station_signature(rows)
+            if previous_signature is not None and signature == previous_signature and rows:
+                raise AdapterProtocolError("station list repeated an identical page")
+            previous_signature = signature
+
+            if page_count is None or page_no >= page_count:
+                break
+            page_no += 1
+
+        return StationListResult(
+            stations=stations,
+            variant=variant or "direct_list",
+            pages_retrieved=page_no,
+            duplicates_removed=duplicates_removed,
+            metadata_missing=metadata_missing,
+        )
+
+    # ------------------------------------------------------------------ #
+    # real-time KPIs (/thirdData/getStationRealKpi)                      #
+    # ------------------------------------------------------------------ #
+
+    async def get_station_real_kpi(self, station_codes: list[str]) -> KpiBatchResult:
         if not station_codes:
-            return []
-        if not self._token:
-            await self.login()
-        data = await self._call("/getStationRealKpi", {"stationCodes": ",".join(station_codes)})
-        return list(data or [])
+            return KpiBatchResult(rows=[], calls_consumed=0)
+        if len(station_codes) > KPI_BATCH_SIZE:
+            raise AdapterError(
+                f"getStationRealKpi accepts at most {KPI_BATCH_SIZE} station codes per call"
+            )
+        payload = await self._call(
+            Endpoint.STATION_REAL_KPI,
+            "/getStationRealKpi",
+            {"stationCodes": ",".join(station_codes)},
+        )
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise AdapterProtocolError("getStationRealKpi data is not a list")
+        for row in data:
+            if not isinstance(row, dict):
+                raise AdapterProtocolError("getStationRealKpi row is not an object")
+
+        vendor_ms: int | None = None
+        params = payload.get("params")
+        if isinstance(params, dict):
+            raw = params.get("currentTime")
+            if isinstance(raw, int | float) and _MIN_EPOCH_MS <= raw <= _MAX_EPOCH_MS:
+                vendor_ms = int(raw)
+        return KpiBatchResult(rows=data, vendor_current_time_ms=vendor_ms)
 
     async def close(self) -> None:
         await self._http.aclose()

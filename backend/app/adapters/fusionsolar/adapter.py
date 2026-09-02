@@ -1,16 +1,33 @@
 """FusionSolar adapter: maps vendor payloads to the normalized model.
 
-The mapping treats every vendor field as optional — field availability
-differs by tenant/version (docs/API-NOTES.md).
+Mapping rules (docs/FUSIONSOLAR-CONTRACT.md):
+- station ``capacity`` is reported in MW and stored as kWp;
+- ``day_power``/``total_power`` are kWh and stay kWh;
+- ``performance_ratio`` is tenant/version-dependent: percent-style values
+  (1 < v <= 100) normalize to 0..1, already-normalized 0..1 values are an
+  explicitly tested compatibility case, anything else is rejected (None);
+- NaN/infinity are rejected for every numeric field;
+- ``real_health_state``: 1 disconnected, 2 faulty, 3 healthy, else unknown;
+- active power: the documented getStationRealKpi contract exposes NO
+  station-level active-power field, so the REAL adapter stores None. Only
+  the mock adapter (allow_synthetic_fields=True) maps the synthetic
+  ``real_power`` field so the MVP dashboard has data to render;
+- ``params.currentTime`` is preserved as the vendor SERVER time (never a
+  device measurement timestamp) next to the local received-at time.
+
+Diagnostics carry counts only — never station identifiers or values.
 """
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 from app.adapters.base import PlantInfo, PlantKpiReading, PlantStatus, VendorAdapter
 from app.adapters.fusionsolar.client import FusionSolarClient
+from app.adapters.fusionsolar.policy import KPI_BATCH_SIZE
 
 _HEALTH_TO_STATUS = {
     1: PlantStatus.DISCONNECTED,
@@ -18,21 +35,75 @@ _HEALTH_TO_STATUS = {
     3: PlantStatus.HEALTHY,
 }
 
-# getStationRealKpi accepts up to 100 station codes per call.
-KPI_BATCH_SIZE = 100
+
+@dataclass(slots=True)
+class InventoryDiagnostics:
+    """Counts-only summary of the last station-list retrieval."""
+
+    stations: int = 0
+    pages_retrieved: int = 0
+    variant: str = ""
+    duplicates_removed: int = 0
+    metadata_missing: bool = False
+    calls_consumed: int = 0
 
 
-def _as_float(value: Any) -> float | None:
+@dataclass(slots=True)
+class KpiDiagnostics:
+    """Counts-only summary of the last KPI fetch (no identifiers/values)."""
+
+    requested: int = 0
+    returned: int = 0
+    missing: int = 0
+    duplicates: int = 0
+    unexpected: int = 0
+    invalid_values: int = 0
+    batches: int = 0
+    calls_consumed: int = 0
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self.missing == 0
+            and self.duplicates == 0
+            and self.unexpected == 0
+            and self.invalid_values == 0
+        )
+
+
+def _finite_float(value: Any, diagnostics: KpiDiagnostics) -> float | None:
+    """Best-effort float that rejects NaN/inf/garbage (counted, not stored)."""
     if value is None:
         return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
+    if isinstance(value, bool):
+        diagnostics.invalid_values += 1
         return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        diagnostics.invalid_values += 1
+        return None
+    if not math.isfinite(number):
+        diagnostics.invalid_values += 1
+        return None
+    return number
+
+
+def normalize_performance_ratio(value: Any, diagnostics: KpiDiagnostics) -> float | None:
+    """Normalize a tenant-dependent PR to the internal 0..1 contract."""
+    number = _finite_float(value, diagnostics)
+    if number is None:
+        return None
+    if 0.0 <= number <= 1.0:
+        return number  # already-normalized compatibility form
+    if 1.0 < number <= 100.0:
+        return number / 100.0  # documented percent-style form (e.g. 89 -> 0.89)
+    diagnostics.invalid_values += 1  # negative or impossible (> 100)
+    return None
 
 
 def _as_int(value: Any) -> int | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
         return int(value)
@@ -43,21 +114,28 @@ def _as_int(value: Any) -> int | None:
 class FusionSolarAdapter(VendorAdapter):
     vendor: ClassVar[str] = "fusionsolar"
 
-    def __init__(self, client: FusionSolarClient) -> None:
+    def __init__(self, client: FusionSolarClient, *, allow_synthetic_fields: bool = False) -> None:
         self._client = client
+        # True ONLY for the mock client: permits mapping the synthetic
+        # mock-only fields (real_power, see mock_client docstring).
+        self._allow_synthetic_fields = allow_synthetic_fields
+        self.last_inventory_diagnostics = InventoryDiagnostics()
+        self.last_kpi_diagnostics = KpiDiagnostics()
 
     async def authenticate(self) -> None:
         if not self._client.is_logged_in():
             await self._client.login()
 
     async def list_plants(self) -> list[PlantInfo]:
-        stations = await self._client.get_station_list()
+        before = self._client.call_counts().station_list
+        result = await self._client.list_stations()
         plants: list[PlantInfo] = []
-        for station in stations:
+        throwaway = KpiDiagnostics()  # numeric validation counter for capacity
+        for station in result.stations:
             code = station.get("stationCode")
             if not code:
-                continue
-            capacity_mw = _as_float(station.get("capacity"))
+                continue  # client already rejects these; belt and braces
+            capacity_mw = _finite_float(station.get("capacity"), throwaway)
             plants.append(
                 PlantInfo(
                     vendor=self.vendor,
@@ -68,32 +146,84 @@ class FusionSolarAdapter(VendorAdapter):
                     address=station.get("stationAddr"),
                 )
             )
+        self.last_inventory_diagnostics = InventoryDiagnostics(
+            stations=len(plants),
+            pages_retrieved=result.pages_retrieved,
+            variant=result.variant,
+            duplicates_removed=result.duplicates_removed,
+            metadata_missing=result.metadata_missing,
+            calls_consumed=self._client.call_counts().station_list - before,
+        )
         return plants
 
     async def fetch_plant_kpis(self, vendor_plant_ids: list[str]) -> list[PlantKpiReading]:
+        diagnostics = KpiDiagnostics(requested=len(vendor_plant_ids))
+        requested = set(vendor_plant_ids)
+        seen: set[str] = set()
         readings: list[PlantKpiReading] = []
+        before = self._client.call_counts().station_real_kpi
+
+        # Sequential batches of at most 100 codes — never concurrent.
         for start in range(0, len(vendor_plant_ids), KPI_BATCH_SIZE):
             batch = vendor_plant_ids[start : start + KPI_BATCH_SIZE]
-            rows = await self._client.get_station_real_kpi(batch)
-            ts = datetime.now(UTC)
-            for row in rows:
+            result = await self._client.get_station_real_kpi(batch)
+            diagnostics.batches += 1
+            received_at = datetime.now(UTC)
+            vendor_time = (
+                datetime.fromtimestamp(result.vendor_current_time_ms / 1000.0, tz=UTC)
+                if result.vendor_current_time_ms is not None
+                else None
+            )
+            for row in result.rows:
                 code = row.get("stationCode")
                 if not code:
+                    diagnostics.invalid_values += 1
                     continue
-                item = row.get("dataItemMap") or {}
-                health = _as_int(item.get("real_health_state"))
+                code = str(code)
+                if code not in requested:
+                    diagnostics.unexpected += 1
+                    continue
+                if code in seen:
+                    diagnostics.duplicates += 1
+                    continue
+                seen.add(code)
+                item = row.get("dataItemMap")
+                if not isinstance(item, dict):
+                    diagnostics.invalid_values += 1
+                    item = {}
+
+                if self._allow_synthetic_fields:
+                    # SYNTHETIC mock-only field; see mock_client docstring.
+                    active_power = _finite_float(item.get("real_power"), diagnostics)
+                else:
+                    # The documented station real-KPI contract exposes no
+                    # active-power field — never derived, stays None.
+                    active_power = None
+
                 readings.append(
                     PlantKpiReading(
                         vendor=self.vendor,
-                        vendor_plant_id=str(code),
-                        ts=ts,
-                        active_power_kw=_as_float(item.get("real_power")),
-                        daily_energy_kwh=_as_float(item.get("day_power")),
-                        total_energy_kwh=_as_float(item.get("total_power")),
-                        performance_ratio=_as_float(item.get("performance_ratio")),
-                        status=_HEALTH_TO_STATUS.get(health, PlantStatus.UNKNOWN),
+                        vendor_plant_id=code,
+                        ts=received_at,
+                        active_power_kw=active_power,
+                        daily_energy_kwh=_finite_float(item.get("day_power"), diagnostics),
+                        total_energy_kwh=_finite_float(item.get("total_power"), diagnostics),
+                        performance_ratio=normalize_performance_ratio(
+                            item.get("performance_ratio"), diagnostics
+                        )
+                        if item.get("performance_ratio") is not None
+                        else None,
+                        status=_HEALTH_TO_STATUS.get(
+                            _as_int(item.get("real_health_state")), PlantStatus.UNKNOWN
+                        ),
+                        vendor_server_time=vendor_time,
                     )
                 )
+
+        diagnostics.returned = len(readings)
+        diagnostics.missing = len(requested - seen)
+        diagnostics.calls_consumed = self._client.call_counts().station_real_kpi - before
+        self.last_kpi_diagnostics = diagnostics
         return readings
 
     async def health_check(self) -> bool:
