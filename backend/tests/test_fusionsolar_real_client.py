@@ -402,6 +402,31 @@ async def test_http_date_retry_after_never_raises(header: str):
     await client.close()
 
 
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Sun, 06 Nov 999999999999999999999999 08:49:37 GMT",  # year overflows a C long
+        "Sun, 06 Nov 2994 08:49:37 -999999999999999999999 ",  # offset overflows too
+    ],
+)
+async def test_overflowing_http_date_falls_back_to_the_budget_hint(header: str):
+    # parsedate_to_datetime() raises OverflowError (not ValueError) on a date
+    # whose year does not fit a C long. That is just another malformed header:
+    # it must fall back to the endpoint-window hint, never escape the adapter
+    # taxonomy and terminate run_forever().
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = header
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    delay = excinfo.value.retry_after_seconds
+    assert delay is not None and math.isfinite(delay)
+    assert delay >= 300.0  # the documented endpoint-window fallback
+    await client.close()
+
+
 # --------------------------------------------------------------------- #
 # absolute transport-level call cap                                     #
 # --------------------------------------------------------------------- #

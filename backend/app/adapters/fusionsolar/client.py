@@ -148,7 +148,11 @@ def _parse_retry_after(value: str | None) -> float | None:
         return _plausible_delay(float(text))
     try:
         when = email.utils.parsedate_to_datetime(text)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: an ASCII HTTP-date whose year does not fit a C long
+        # ("Sun, 06 Nov 999999999999999999999999 08:49:37 GMT"). Like any
+        # other malformed header it must fall back to the budget hint, not
+        # escape the adapter taxonomy and take the scheduler task down.
         return None
     if when is None:
         return None

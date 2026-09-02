@@ -193,7 +193,9 @@ mask authentication/version errors).
   plausibility ceiling of **one day** — the largest window our budgets
   use; anything else (garbage, infinity from an overflowing digit string,
   or a merely absurd finite value such as 1e299, which Python does not
-  overflow) falls back to the endpoint-window hint. Parsing never raises
+  overflow, or an HTTP-date whose year or offset overflows a C long and
+  makes the stdlib parser raise OverflowError) falls back to the
+  endpoint-window hint. Parsing never raises
   outside the adapter error taxonomy and can never yield a delay that
   stalls the scheduler. *Whether your tenant sends Retry-After:*
   `unverified`.
