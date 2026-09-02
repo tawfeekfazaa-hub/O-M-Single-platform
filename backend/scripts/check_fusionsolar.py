@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import math
 import sys
 from pathlib import Path
 
@@ -95,32 +94,15 @@ def _plan_lines(settings: Settings) -> list[str]:
     ]
 
 
-# Safety settings that must be positive for the rate limiters to be
-# constructible at all: variable name -> attribute.
-_POSITIVE_SETTINGS = {
-    "FUSIONSOLAR_LOGIN_MAX_CALLS": "fusionsolar_login_max_calls",
-    "FUSIONSOLAR_LOGIN_WINDOW_SECONDS": "fusionsolar_login_window_seconds",
-    "FUSIONSOLAR_STATION_LIST_MAX_CALLS": "fusionsolar_station_list_max_calls",
-    "FUSIONSOLAR_STATION_LIST_WINDOW_SECONDS": "fusionsolar_station_list_window_seconds",
-    "FUSIONSOLAR_KPI_WINDOW_SECONDS": "fusionsolar_kpi_window_seconds",
-    "FUSIONSOLAR_STATION_LIST_MAX_PAGES": "fusionsolar_station_list_max_pages",
-    # Cadences, not budgets, but the same arithmetic and the same failure:
-    # a NaN inventory cadence makes the elapsed-time comparison never true,
-    # so the inventory is refreshed once and never again (new and retired
-    # stations go unnoticed for good); a NaN or infinite poll interval is
-    # slept on directly and stalls the loop outright.
-    "FUSIONSOLAR_INVENTORY_REFRESH_SECONDS": "fusionsolar_inventory_refresh_seconds",
-    "SCHEDULER_INTERVAL_SECONDS": "scheduler_interval_seconds",
-}
-
-# Zero is legitimate here (no extra margin), so these are checked separately.
-_NON_NEGATIVE_SETTINGS = {
-    "FUSIONSOLAR_KPI_MARGIN_SECONDS": "fusionsolar_kpi_margin_seconds",
-}
-
-
 def validate_config(settings: Settings) -> list[str]:
-    """Names-only validation report. Never returns a value of any secret."""
+    """Names-only validation report. Never returns a value of any secret.
+
+    Budgets, windows and cadences are NOT checked here: Settings validates
+    them itself, so `uvicorn app.main:app` — which never runs this script —
+    is covered by the same rule. What is left is mode-dependent and cannot
+    live on the field: real mode needs a base URL and credentials, mock
+    mode needs neither.
+    """
     problems: list[str] = []
     if settings.fusionsolar_mode == "real":
         if not settings.fusionsolar_base_url:
@@ -129,39 +111,7 @@ def validate_config(settings: Settings) -> list[str]:
             problems.append("FUSIONSOLAR_USERNAME is not set")
         if not settings.effective_system_code:
             problems.append("FUSIONSOLAR_SYSTEM_CODE is not set")
-    # Non-positive budgets/windows make the rate limiters unconstructible;
-    # catch them here so the dry run reports EXIT_CONFIG instead of the live
-    # path dying with a traceback. Names only — never the values.
-    for name, attribute in _POSITIVE_SETTINGS.items():
-        value = getattr(settings, attribute)
-        if not _usable_budget(value):
-            problems.append(f"{name} must be a finite value > 0")
-    for name, attribute in _NON_NEGATIVE_SETTINGS.items():
-        # A non-finite margin silently drops the KPI-window floor it exists
-        # to enforce (or, infinite, freezes the loop): both defeat the
-        # protection against the vendor's own limiter.
-        if not _usable_budget(getattr(settings, attribute), allow_zero=True):
-            problems.append(f"{name} must be a finite value >= 0")
     return problems
-
-
-def _usable_budget(value: float, *, allow_zero: bool = False) -> bool:
-    """Finite, positive, and representable in the float math downstream.
-
-    NaN/infinity pass every "<= 0" test but break the limiter for good: a
-    NaN window never prunes its history and an infinite one never frees a
-    slot, blocking the endpoint permanently. A huge-but-parseable INTEGER
-    (a 1000-digit FUSIONSOLAR_LOGIN_MAX_CALLS) is just as unusable — the
-    limiter and the scheduler's spacing arithmetic are float maths — and
-    converting it raises OverflowError, which happens past main()'s
-    ValidationError handler and would print a traceback instead of the
-    documented EXIT_CONFIG.
-    """
-    try:
-        as_float = float(value)
-    except (OverflowError, TypeError, ValueError):
-        return False
-    return math.isfinite(as_float) and (as_float >= 0 if allow_zero else as_float > 0)
 
 
 def sanitize_error(exc: Exception) -> str:

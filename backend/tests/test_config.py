@@ -130,3 +130,32 @@ def test_station_list_page_guard_is_bounded_by_the_daily_budget():
         )
         == 10
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("fusionsolar_inventory_refresh_seconds", float("nan")),
+        ("scheduler_interval_seconds", float("inf")),
+        ("fusionsolar_kpi_margin_seconds", float("nan")),
+    ],
+)
+def test_the_application_entry_point_refuses_an_unusable_timing_setting(
+    field: str, bad: float, monkeypatch: pytest.MonkeyPatch
+):
+    # `uvicorn app.main:app` runs create_app() -> get_settings() -> Settings()
+    # straight from the environment and never touches the diagnostic script's
+    # checks. Before the rule moved onto the field, SCHEDULER_ENABLED=true
+    # started happily with a NaN cadence and refreshed its inventory exactly
+    # once, so the load-from-environment path is what has to refuse.
+    from app.config import get_settings
+
+    monkeypatch.setenv("SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv(field.upper(), repr(bad))
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(ValidationError) as excinfo:
+            get_settings()
+    finally:
+        get_settings.cache_clear()
+    assert [error["loc"] for error in excinfo.value.errors()] == [(field,)]

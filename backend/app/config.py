@@ -5,6 +5,7 @@ Credential values (system code / deprecated password) must never be logged
 or printed; only variable NAMES may appear in messages.
 """
 
+import math
 from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlsplit
@@ -13,6 +14,42 @@ from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 THIRD_DATA_PATH = "/thirdData"
+
+# Budgets, windows and cadences all end up in the same float arithmetic: the
+# rolling-window limiters, the scheduler's spacing maths and asyncio.sleep().
+# They are validated HERE, on the settings object itself, so that every entry
+# point is covered — `uvicorn app.main:app` builds the scheduler straight from
+# Settings and never calls the diagnostic script's checks.
+_FINITE_POSITIVE_SETTINGS = (
+    "fusionsolar_login_max_calls",
+    "fusionsolar_login_window_seconds",
+    "fusionsolar_station_list_max_calls",
+    "fusionsolar_station_list_window_seconds",
+    "fusionsolar_kpi_window_seconds",
+    "fusionsolar_station_list_max_pages",
+    "fusionsolar_inventory_refresh_seconds",
+    "scheduler_interval_seconds",
+)
+# Zero is a deliberate choice here (no extra margin), not a misconfiguration.
+_FINITE_NON_NEGATIVE_SETTINGS = ("fusionsolar_kpi_margin_seconds",)
+
+
+def _usable_number(value: float, *, allow_zero: bool) -> bool:
+    """Finite, in range, and representable in the float math downstream.
+
+    NaN and infinity pass every "<= 0" test but break their consumer for
+    good: a NaN window never prunes its limiter history, an infinite one
+    never frees a slot, a NaN cadence makes the elapsed-time comparison
+    never true (the inventory is refreshed once and never again), and a
+    non-finite poll interval is slept on and never wakes. A
+    huge-but-parseable INTEGER is just as unusable, and converting it
+    raises OverflowError rather than returning a value.
+    """
+    try:
+        as_float = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(as_float) and (as_float >= 0 if allow_zero else as_float > 0)
 
 
 def normalize_fusionsolar_base_url(raw: str) -> str:
@@ -121,6 +158,20 @@ class Settings(BaseSettings):
                 "set with different values; remove FUSIONSOLAR_PASSWORD"
             )
         return self
+
+    @field_validator(*_FINITE_POSITIVE_SETTINGS)
+    @classmethod
+    def _require_finite_positive(cls, value: float) -> float:
+        if not _usable_number(value, allow_zero=False):
+            raise ValueError("must be a finite value > 0")
+        return value
+
+    @field_validator(*_FINITE_NON_NEGATIVE_SETTINGS)
+    @classmethod
+    def _require_finite_non_negative(cls, value: float) -> float:
+        if not _usable_number(value, allow_zero=True):
+            raise ValueError("must be a finite value >= 0")
+        return value
 
     @property
     def effective_system_code(self) -> str | None:

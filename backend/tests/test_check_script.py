@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from app.adapters.base import (
     AdapterAuthError,
@@ -172,34 +173,46 @@ def test_exit_codes_are_deterministic_constants():
 
 
 @pytest.mark.parametrize(
-    ("field", "name"),
+    "field",
     [
-        ("fusionsolar_station_list_max_calls", "FUSIONSOLAR_STATION_LIST_MAX_CALLS"),
-        ("fusionsolar_login_max_calls", "FUSIONSOLAR_LOGIN_MAX_CALLS"),
-        ("fusionsolar_kpi_window_seconds", "FUSIONSOLAR_KPI_WINDOW_SECONDS"),
-        ("fusionsolar_station_list_max_pages", "FUSIONSOLAR_STATION_LIST_MAX_PAGES"),
+        "fusionsolar_station_list_max_calls",
+        "fusionsolar_login_max_calls",
+        "fusionsolar_kpi_window_seconds",
+        "fusionsolar_station_list_max_pages",
+        "fusionsolar_inventory_refresh_seconds",
+        "scheduler_interval_seconds",
     ],
 )
-def test_non_positive_safety_settings_are_config_errors(
-    field: str, name: str, capsys: pytest.CaptureFixture
-):
-    # These would make the rate limiters unconstructible; the dry run must
-    # report them rather than letting the live path die with a traceback.
-    code = check.main([], settings=make_settings(**{field: 0}))
-    assert code == check.EXIT_CONFIG
-    assert name in capsys.readouterr().err  # names only, never values
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), int("1" * 1000)])
+def test_unusable_budgets_and_cadences_are_rejected_by_settings(field: str, bad):
+    # The rule lives on Settings, not in this script: `uvicorn app.main:app`
+    # builds the scheduler straight from Settings and never runs these
+    # checks, so an unusable value has to be refused where EVERY entry point
+    # sees it. 0 and -1 make the limiters unconstructible; NaN and infinity
+    # break their consumer for good (a NaN cadence refreshes the inventory
+    # once and never again, a non-finite interval is slept on and never
+    # wakes); a 1000-digit integer cannot even be converted to a float.
+    with pytest.raises(ValidationError) as excinfo:
+        make_settings(**{field: bad})
+    # The field name IS the environment variable name, so main()'s handler
+    # can report it without ever touching the value.
+    assert [error["loc"] for error in excinfo.value.errors()] == [(field,)]
 
 
 async def test_unusable_budget_gives_a_config_exit_not_a_traceback(
     capsys: pytest.CaptureFixture,
 ):
-    settings = make_settings(
+    # model_construct skips field validation deliberately: Settings refuses
+    # this value now, and run_live must still degrade to an exit code rather
+    # than a traceback if one ever reaches it by another route.
+    fields = make_settings(
         fusionsolar_mode="real",
         fusionsolar_base_url="https://host.test/thirdData",
         fusionsolar_username="user",
         fusionsolar_system_code=SECRET,
-        fusionsolar_station_list_max_calls=0,
-    )
+    ).model_dump()
+    fields["fusionsolar_station_list_max_calls"] = 0
+    settings = Settings.model_construct(**fields)
     code = await check.run_live(settings)
     captured = capsys.readouterr()
     assert code == check.EXIT_CONFIG
@@ -214,63 +227,42 @@ def test_dry_run_states_the_cap_covers_authentication_recovery(
     assert "transport level" in out and "305" in out
 
 
-@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
-@pytest.mark.parametrize(
-    ("field", "name"),
-    [
-        ("fusionsolar_inventory_refresh_seconds", "FUSIONSOLAR_INVENTORY_REFRESH_SECONDS"),
-        ("scheduler_interval_seconds", "SCHEDULER_INTERVAL_SECONDS"),
-    ],
-)
-def test_non_finite_cadences_are_config_errors(
-    field: str, name: str, bad: float, capsys: pytest.CaptureFixture
+def test_unusable_cadence_reaches_the_dry_run_as_a_named_config_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ):
-    # A NaN inventory cadence makes the elapsed-time comparison never true:
-    # the inventory is refreshed once and never again, so new and retired
-    # stations go unnoticed while the dry run calls the config valid. A
-    # non-finite poll interval is slept on directly and stalls the loop.
-    code = check.main([], settings=make_settings(**{field: bad}))
+    # End to end: a bad value in the environment still leaves the script with
+    # the documented exit code and the variable NAME only, now by way of the
+    # ValidationError that Settings itself raises.
+    monkeypatch.setattr(
+        check,
+        "get_settings",
+        lambda: make_settings(fusionsolar_inventory_refresh_seconds=float("nan")),
+    )
+    code = check.main([])
+    captured = capsys.readouterr()
     assert code == check.EXIT_CONFIG
-    assert name in capsys.readouterr().err
+    assert "FUSIONSOLAR_INVENTORY_REFRESH_SECONDS" in captured.err
+    assert "Traceback" not in captured.err
 
 
-@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
-def test_non_finite_kpi_margin_is_a_config_error(bad: float, capsys: pytest.CaptureFixture):
-    # The margin enforces the KPI-window floor in real mode; non-finite, it
+@pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+def test_unusable_kpi_margin_is_rejected_by_settings(bad: float):
+    # The margin enforces the KPI-window floor in real mode; non-finite it
     # either drops that floor silently or freezes the loop.
-    code = check.main([], settings=make_settings(fusionsolar_kpi_margin_seconds=bad))
-    assert code == check.EXIT_CONFIG
-    assert "FUSIONSOLAR_KPI_MARGIN_SECONDS" in capsys.readouterr().err
+    with pytest.raises(ValidationError) as excinfo:
+        make_settings(fusionsolar_kpi_margin_seconds=bad)
+    assert [error["loc"] for error in excinfo.value.errors()] == [
+        ("fusionsolar_kpi_margin_seconds",)
+    ]
 
 
 def test_zero_kpi_margin_is_accepted(capsys: pytest.CaptureFixture):
-    # Zero margin is a deliberate choice, not a misconfiguration.
+    # Zero margin is a deliberate choice, not a misconfiguration: the rule
+    # must not drift into rejecting a valid configuration.
     assert (
         check.main([], settings=make_settings(fusionsolar_kpi_margin_seconds=0.0)) == check.EXIT_OK
     )
     assert "FUSIONSOLAR_KPI_MARGIN_SECONDS" not in capsys.readouterr().err
-
-
-def test_absurdly_large_integer_budget_is_a_config_error(capsys: pytest.CaptureFixture):
-    # A huge-but-parseable integer passes pydantic, but float() overflows on
-    # it — and that conversion happens past main()'s ValidationError handler,
-    # so it used to print a traceback instead of the documented exit code.
-    # The value is unusable anyway: the limiter and the scheduler's spacing
-    # arithmetic are float maths.
-    code = check.main([], settings=make_settings(fusionsolar_login_max_calls=int("1" * 1000)))
-    captured = capsys.readouterr()
-    assert code == check.EXIT_CONFIG
-    assert "FUSIONSOLAR_LOGIN_MAX_CALLS" in captured.err  # names only
-    assert "Traceback" not in captured.err
-
-
-@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
-def test_non_finite_windows_are_config_errors(bad: float, capsys: pytest.CaptureFixture):
-    # NaN/inf pass every "<= 0" test but break the limiter permanently: a
-    # NaN window never prunes its history, an infinite one never frees a slot.
-    code = check.main([], settings=make_settings(fusionsolar_kpi_window_seconds=bad))
-    assert code == check.EXIT_CONFIG
-    assert "FUSIONSOLAR_KPI_WINDOW_SECONDS" in capsys.readouterr().err
 
 
 def test_unparseable_settings_exit_config_without_a_traceback(

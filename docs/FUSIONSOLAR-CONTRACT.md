@@ -101,8 +101,11 @@ mask authentication/version errors).
   client-side budget of **4 calls/day** and the **6-hour inventory
   cadence are SAFETY DEFAULTS**, both configurable.
 - Every configured budget, window and cadence must be **finite and > 0**
-  (the KPI margin may be 0), and the pre-flight check rejects anything else
-  by NAME. A non-finite value is not merely odd: a NaN inventory cadence
+  (the KPI margin may be 0), enforced on `Settings` itself so that EVERY
+  entry point is covered — `uvicorn app.main:app` builds the scheduler
+  straight from settings and never runs the diagnostic script. Rejection is
+  by variable NAME, never the value. A non-finite value is not merely odd:
+  a NaN inventory cadence
   makes the elapsed-time comparison never true, so the inventory is
   refreshed once and never again — new and retired stations go unnoticed
   indefinitely — and a non-finite poll interval is slept on directly and
