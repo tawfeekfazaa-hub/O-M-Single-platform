@@ -72,10 +72,18 @@ mask authentication/version errors).
 - **Strict paginated-envelope contract.** `pageNo`, `pageSize`,
   `pageCount` and `total` are all MANDATORY and validated on every page:
   the echoed `pageNo` must equal the requested page; `pageSize` must be
-  >= 1 and never smaller than the rows delivered; the FIRST page's
+  >= 1 and never smaller than the rows delivered; page 1's advertised
+  pages must be able to HOLD its advertised total
+  (`total <= pageCount x pageSize`); the FIRST page's
   `pageCount`/`pageSize`/`total` are authoritative and any change on a
   later page is rejected; and at the end the number of unique stations
-  must equal `total`. Missing or contradictory metadata raises
+  must equal `total`. Only the SHORT direction is a fault: an over-count
+  walks into the empty-page check on the page that does not exist, so
+  rejecting it too would turn the ceil() rounding of a shrinking fleet
+  into a failed refresh, while `pageCount=1, pageSize=100, total=200` ends
+  the loop a page early and — caught only by the closing total check —
+  would already have recorded ONE page as the estimate for an inventory
+  needing two. Missing or contradictory metadata raises
   `AdapterProtocolError` — nothing is defaulted or guessed, because a
   truncated inventory that passed as complete would retire live plants
   downstream.
@@ -109,7 +117,15 @@ mask authentication/version errors).
   makes the elapsed-time comparison never true, so the inventory is
   refreshed once and never again — new and retired stations go unnoticed
   indefinitely — and a non-finite poll interval is slept on directly and
-  stalls the loop.
+  stalls the loop. Every setting measured in SECONDS additionally has a
+  practical ceiling of **one year**: `1e308` is finite, so every
+  `isfinite()` guard passes it, and it then fails in exactly the same
+  ways — a wake scheduled ~1e300 years out, a cadence that never comes
+  due, a rolling window that never frees the slot it holds. A duration is
+  only a duration if it can elapse, so the boundary rejects it rather than
+  letting finite arithmetic hide a permanent stall. Call and page BUDGETS
+  are not bounded this way: a large budget is an explicit "do not limit me"
+  and still limits nothing more than the operator asked for.
 - Cadence vs pagination: each page spends one station-list call, and the
   budget is a ROLLING window, so only a whole number of complete refreshes
   fits it. The scheduler spaces refreshes by
@@ -143,8 +159,10 @@ mask authentication/version errors).
   until the configuration changes, so it must wait a full window rather
   than spend page 1 every 6 h — and is kept until page 1 actually answers,
   since a page-1 timeout would otherwise erase the only estimate there is.
-  Only PAGE 1 updates it: a later page's differing count is rejected as
-  inconsistent moments later and must not leave its claim behind — otherwise the retry walks into a budget that cannot carry
+  Only PAGE 1 updates it, and only once page 1's own envelope has held
+  together: a later page's differing count is rejected as inconsistent
+  moments later and must not leave its claim behind, and neither may a
+  page 1 that contradicts itself — otherwise the retry walks into a budget that cannot carry
   it, wastes another call and extends the staleness it was meant to end.
   `pages` here means BUDGET SLOTS, not HTTP attempts: the retry after a
   failCode 305 reuses the slot its rejected attempt already paid for, so it

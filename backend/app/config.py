@@ -22,19 +22,31 @@ THIRD_DATA_PATH = "/thirdData"
 # Settings and never calls the diagnostic script's checks.
 _FINITE_POSITIVE_SETTINGS = (
     "fusionsolar_login_max_calls",
-    "fusionsolar_login_window_seconds",
     "fusionsolar_station_list_max_calls",
+    "fusionsolar_station_list_max_pages",
+)
+# Every setting measured in SECONDS: a rolling window, a cadence or a sleep.
+_POSITIVE_DURATION_SETTINGS = (
+    "fusionsolar_login_window_seconds",
     "fusionsolar_station_list_window_seconds",
     "fusionsolar_kpi_window_seconds",
-    "fusionsolar_station_list_max_pages",
     "fusionsolar_inventory_refresh_seconds",
     "scheduler_interval_seconds",
 )
 # Zero is a deliberate choice here (no extra margin), not a misconfiguration.
-_FINITE_NON_NEGATIVE_SETTINGS = ("fusionsolar_kpi_margin_seconds",)
+_NON_NEGATIVE_DURATION_SETTINGS = ("fusionsolar_kpi_margin_seconds",)
+
+# A duration is only a duration if it can elapse. One year is far beyond any
+# real budget window (the widest default is a day) or cadence, so anything
+# above it is a units mistake or an accidental exponent — and it fails the
+# same way an infinity does: a window that never frees its slots stops the
+# ingestion for good, a cadence that never comes due refreshes the inventory
+# once and never again, and a sleep that long never wakes. Finite arithmetic
+# hides all three, so they are rejected at the settings boundary instead.
+_MAX_DURATION_SECONDS = 366 * 24 * 60 * 60.0
 
 
-def _usable_number(value: float, *, allow_zero: bool) -> bool:
+def _usable_number(value: float, *, allow_zero: bool, maximum: float | None = None) -> bool:
     """Finite, in range, and representable in the float math downstream.
 
     NaN and infinity pass every "<= 0" test but break their consumer for
@@ -43,13 +55,18 @@ def _usable_number(value: float, *, allow_zero: bool) -> bool:
     never true (the inventory is refreshed once and never again), and a
     non-finite poll interval is slept on and never wakes. A
     huge-but-parseable INTEGER is just as unusable, and converting it
-    raises OverflowError rather than returning a value.
+    raises OverflowError rather than returning a value. ``maximum`` covers
+    the finite values that are just as unreachable in practice.
     """
     try:
         as_float = float(value)
     except (OverflowError, TypeError, ValueError):
         return False
-    return math.isfinite(as_float) and (as_float >= 0 if allow_zero else as_float > 0)
+    if not math.isfinite(as_float):
+        return False
+    if maximum is not None and as_float > maximum:
+        return False
+    return as_float >= 0 if allow_zero else as_float > 0
 
 
 def normalize_fusionsolar_base_url(raw: str) -> str:
@@ -198,11 +215,24 @@ class Settings(BaseSettings):
             raise ValueError("must be a finite value > 0")
         return value
 
-    @field_validator(*_FINITE_NON_NEGATIVE_SETTINGS)
+    @field_validator(*_POSITIVE_DURATION_SETTINGS)
     @classmethod
-    def _require_finite_non_negative(cls, value: float) -> float:
-        if not _usable_number(value, allow_zero=True):
-            raise ValueError("must be a finite value >= 0")
+    def _require_usable_positive_duration(cls, value: float) -> float:
+        if not _usable_number(value, allow_zero=False, maximum=_MAX_DURATION_SECONDS):
+            raise ValueError(
+                f"must be a finite number of seconds > 0 and <= {_MAX_DURATION_SECONDS:.0f} "
+                "(one year); a longer duration never elapses in practice"
+            )
+        return value
+
+    @field_validator(*_NON_NEGATIVE_DURATION_SETTINGS)
+    @classmethod
+    def _require_usable_non_negative_duration(cls, value: float) -> float:
+        if not _usable_number(value, allow_zero=True, maximum=_MAX_DURATION_SECONDS):
+            raise ValueError(
+                f"must be a finite number of seconds >= 0 and <= {_MAX_DURATION_SECONDS:.0f} "
+                "(one year); a longer duration never elapses in practice"
+            )
         return value
 
     @property

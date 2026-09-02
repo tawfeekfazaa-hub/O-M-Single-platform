@@ -162,6 +162,50 @@ def test_the_application_entry_point_refuses_an_unusable_timing_setting(
 
 
 @pytest.mark.parametrize(
+    "field",
+    [
+        "fusionsolar_login_window_seconds",
+        "fusionsolar_station_list_window_seconds",
+        "fusionsolar_kpi_window_seconds",
+        "fusionsolar_inventory_refresh_seconds",
+        "scheduler_interval_seconds",
+        "fusionsolar_kpi_margin_seconds",
+    ],
+)
+def test_a_duration_that_cannot_elapse_is_refused(field: str, monkeypatch: pytest.MonkeyPatch):
+    # 1e308 is finite, so every isfinite() guard waves it through — and it
+    # then fails exactly the way infinity does: SCHEDULER_INTERVAL_SECONDS
+    # schedules the next wake ~1e300 years out, the inventory cadence never
+    # comes due, and a rolling window never frees the slot it is holding.
+    # A duration is only a duration if it can elapse.
+    from app.config import get_settings
+
+    monkeypatch.setenv("SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv(field.upper(), "1e308")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(ValidationError) as excinfo:
+            get_settings()
+    finally:
+        get_settings.cache_clear()
+    assert [error["loc"] for error in excinfo.value.errors()] == [(field,)]
+
+
+def test_the_duration_ceiling_leaves_realistic_configuration_alone():
+    # The ceiling has to sit far above anything an operator would really
+    # set, or it becomes the misconfiguration. A month-long window, a
+    # week-long inventory cadence and a zero margin all stay legal.
+    settings = make_settings(
+        fusionsolar_station_list_window_seconds=30 * 86_400.0,
+        fusionsolar_inventory_refresh_seconds=7 * 86_400.0,
+        fusionsolar_kpi_margin_seconds=0.0,
+    )
+    assert settings.fusionsolar_station_list_window_seconds == 30 * 86_400.0
+    assert settings.fusionsolar_inventory_refresh_seconds == 7 * 86_400.0
+    assert settings.fusionsolar_kpi_margin_seconds == 0.0
+
+
+@pytest.mark.parametrize(
     ("legacy", "replacement"),
     [
         ("FUSIONSOLAR_MAX_CALLS_PER_WINDOW", "FUSIONSOLAR_LOGIN_MAX_CALLS"),

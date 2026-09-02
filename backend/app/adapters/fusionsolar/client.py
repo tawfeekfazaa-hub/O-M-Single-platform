@@ -476,23 +476,24 @@ class RealFusionSolarClient:
 
     def _parse_page_count(self, data: dict[str, Any], *, authoritative: bool = False) -> int:
         count = self._require_int(data, "pageCount")
-        if authoritative:
-            # Page 1 is the only page whose count we believe — a later page
-            # claiming something else is rejected as inconsistent a moment
-            # later, and must not leave its claim behind as the estimate.
-            # Recorded BEFORE the guard rejects an over-guard count, since
-            # that inventory cannot succeed until the configuration changes
-            # and reporting one page would have the caller retry on the
-            # ordinary cadence, spending page 1 again every time.
-            self.last_advertised_pages = count
         if count > self._max_pages:
+            if authoritative:
+                # The ONE claim worth recording before it is validated any
+                # further: this inventory cannot be retrieved until the
+                # configuration changes, so the caller must defer a full
+                # window instead of spending page 1 on the ordinary cadence.
+                self.last_advertised_pages = count
             # Fail on page 1 (one call) instead of burning the whole budget
             # and dying part-way. The guard is min(configured pages, the
-            # station-list budget): a refresh must fit in ONE window.
+            # station-list budget): a refresh must fit in ONE window, so
+            # BOTH variables have to allow it — naming only one of them
+            # would send the operator to a setting that changes nothing.
             raise AdapterProtocolError(
                 f"station list needs {count} pages but the effective guard is "
-                f"{self._max_pages}; raise FUSIONSOLAR_STATION_LIST_MAX_CALLS "
-                "(and _MAX_PAGES) to retrieve this inventory"
+                f"{self._max_pages}; the guard is the lower of "
+                "FUSIONSOLAR_STATION_LIST_MAX_PAGES and "
+                "FUSIONSOLAR_STATION_LIST_MAX_CALLS — raise whichever is "
+                "limiting (or both) to retrieve this inventory"
             )
         return count
 
@@ -531,8 +532,7 @@ class RealFusionSolarClient:
                 variant = "direct_list"
                 rows = data
                 page_count = 1
-                # Confirmed only now: a direct list IS one complete call.
-                self.last_advertised_pages = 1
+                self.last_advertised_pages = 1  # confirmed: one complete call
             elif isinstance(data, dict):
                 variant = "paginated"
                 rows = data.get("list")
@@ -556,9 +556,28 @@ class RealFusionSolarClient:
                 echoed_page_count = self._parse_page_count(data, authoritative=page_no == 1)
                 echoed_total = self._require_int(data, "total")
                 if page_no == 1:
+                    if echoed_total > echoed_page_count * echoed_page_size:
+                        # The pages on offer cannot hold the total they
+                        # advertise. Only the SHORT direction is a fault: an
+                        # over-count merely walks into the empty-page check,
+                        # while `pageCount=1, pageSize=100, total=200` ends
+                        # the loop a page early and is caught only by the
+                        # closing total check — after the estimate below has
+                        # recorded one page for an inventory needing two,
+                        # shrinking the reservation the retry is sized from.
+                        raise AdapterProtocolError(
+                            f"station list advertises total={echoed_total} but "
+                            f"pageCount={echoed_page_count} x pageSize="
+                            f"{echoed_page_size} cannot hold it"
+                        )
                     page_count = echoed_page_count
                     page_size = echoed_page_size
                     total = echoed_total
+                    # Page 1 is the only page whose count we believe, and it
+                    # is believed only once page 1's whole envelope has held
+                    # together: a self-contradictory page must not leave its
+                    # claim behind as the estimate the retry is sized from.
+                    self.last_advertised_pages = page_count
                     # Page 1 is the first moment the burst size is known.
                     # Starting a burst the budget cannot finish spends
                     # calls on an inventory that is never retrieved, and

@@ -593,3 +593,39 @@ async def test_only_page_one_updates_the_cached_page_count():
         await client.list_stations()
     assert client.last_advertised_pages == 2  # page 1 remains authoritative
     await client.close()
+
+
+async def test_page_one_metadata_that_cannot_hold_its_total_is_rejected_on_page_one():
+    # pageCount x pageSize is the capacity page 1 advertises; a larger total
+    # means the loop would stop before the inventory ends. Left to the
+    # closing total check, that truncation is only noticed after page 1 has
+    # already recorded ONE page for an inventory that needs two — and the
+    # retry is then reserved for a single call and rejected on its last page,
+    # refresh after refresh. Page 1 has to reject itself before it is
+    # believed, and the previous estimate has to survive intact.
+    server = StationListServer([[station(i) for i in range(100)], [station(100)]])
+    client = make_client(server)
+    await client.list_stations()
+    assert client.last_advertised_pages == 2
+
+    server.page_count_per_page = {1: 1}  # one page ...
+    server.total_override = 200  # ... for two pages' worth of plants
+    with pytest.raises(AdapterProtocolError) as excinfo:
+        await client.list_stations()
+    assert "cannot hold it" in str(excinfo.value)
+    assert len(server.requests) == 3  # 2 for the good pass, then page 1 only
+    assert client.last_advertised_pages == 2  # NOT overwritten by the bad 1
+    await client.close()
+
+
+async def test_a_page_count_larger_than_the_total_needs_is_not_a_fault_on_page_one():
+    # Only the SHORT direction truncates. An over-count walks into the
+    # empty-page check on the page that does not exist, so rejecting it here
+    # too would turn the ceil() rounding of a shrinking fleet into a failed
+    # refresh.
+    server = StationListServer([[station(i) for i in range(100)], [station(100)]])
+    server.page_count_per_page = {1: 2, 2: 2}
+    client = make_client(server)
+    result = await client.list_stations()
+    assert len(result.stations) == 101
+    await client.close()
