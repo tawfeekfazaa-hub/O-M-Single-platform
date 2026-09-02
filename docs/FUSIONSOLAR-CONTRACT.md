@@ -110,6 +110,11 @@ mask authentication/version errors).
   rejected: accepting it would certify a contradictory envelope, waste a
   station-list call, and inflate `pages_retrieved`, which stretches the
   next refresh (2 pages → 12 h instead of 6 h).
+  For a TERMINAL page 1 the closing reconciliation runs BEFORE the page
+  count is recorded as the retry estimate: it is the last check available,
+  and a one-page response that passes every other check can still
+  contradict its own `total`, which used to overwrite a four-page estimate
+  with one and size the retry for a single call.
 - A failed validation means **no inventory update at all**: the
   repository keeps the previously stored plants, the refresh is never
   reported as successful, and the cycle is never a complete success (see
@@ -212,7 +217,11 @@ mask authentication/version errors).
   cycle: retrying it every cycle would spend page 1 of the budget until the
   window is exhausted, and aborting would stop KPI monitoring with it. The
   failure is recorded on the cycle (`inventory_error`) and the cycle is
-  never a complete success while it stands.
+  never a complete success while it stands. A vendor-requested delay is a
+  lower bound for THAT deferral too, not only for the cycle's backoff:
+  because this path swallows the error so KPI polling can continue, the
+  outer transient handler never sees it, and a 503 asking for a day would
+  otherwise be answered after the 6 h cadence.
 - **Pages per refresh may never exceed the budget.** A paginated refresh
   cannot be resumed across windows, so the effective page guard is
   `min(FUSIONSOLAR_STATION_LIST_MAX_PAGES, FUSIONSOLAR_STATION_LIST_MAX_CALLS)`.
@@ -249,13 +258,17 @@ mask authentication/version errors).
     closes the station to further copies. A later copy REPLACES a partial
     one in place — never appended beside it, so a station still yields
     exactly one reading — but **only if it both reads cleanly AND carries
-    every field the held one carries.** Both halves are load-bearing:
+    STRICTLY MORE fields than the held one.** Every word is load-bearing:
     "clean" is satisfied vacuously by a copy whose fields are simply
     ABSENT, so replacing on it alone would let an empty `dataItemMap`
     overwrite a reading holding valid daily energy and a HEALTHY status
     with all-`None` and UNKNOWN — persisted as the plant's latest point. A
-    replacement may only ever ADD. An UNKNOWN status counts as absent for
-    this comparison, for the same reason the health rule below exists.
+    replacement may only ever ADD, and a copy carrying the SAME fields adds
+    nothing: swapping the values would be an arbitrary choice between two
+    equally readable reports, and accepting on it would lock out a
+    genuinely richer third copy. The FIRST report wins unless a later one
+    actually adds a field. An UNKNOWN status counts as absent for this
+    comparison, for the same reason the health rule below exists.
 - `real_health_state`: 1 disconnected, 2 faulty, 3 healthy, else unknown.
   An ABSENT field and a numeric code outside 1/2/3 are both the documented
   "else unknown" case and are not counted as invalid; a value that is

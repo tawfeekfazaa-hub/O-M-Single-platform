@@ -525,6 +525,19 @@ class RealFusionSolarClient:
             )
         return count
 
+    @staticmethod
+    def _reconcile_total(unique_stations: int, total: int | None) -> None:
+        """The unique stations retrieved must equal the advertised total.
+
+        Counts only — never identifiers. A short (or long) inventory is a
+        failed retrieval, not a smaller plant fleet.
+        """
+        if total is not None and unique_stations != total:
+            raise AdapterProtocolError(
+                f"station list returned {unique_stations} unique stations "
+                f"but the envelope reported total={total}"
+            )
+
     async def list_stations(self) -> StationListResult:
         stations: list[dict[str, Any]] = []
         # NOT reset here: until page 1 answers, the last known size is the
@@ -660,6 +673,14 @@ class RealFusionSolarClient:
 
             if page_no == 1:
                 pages_needed = page_count or 0
+                if pages_needed <= 1:
+                    # This page IS the whole inventory, so the closing
+                    # reconciliation can run now — and must, before the count
+                    # is believed. A terminal page claiming pageCount=1 with a
+                    # total its own rows contradict passed every check above
+                    # and overwrote a four-page estimate with one; the retry
+                    # was then sized for a single call.
+                    self._reconcile_total(len(stations), total)
                 # Page 1 has now held together END TO END — envelope AND
                 # rows. Only here does its count become the estimate the
                 # retry is sized from: a page the row checks just rejected
@@ -697,13 +718,7 @@ class RealFusionSolarClient:
                 break
             page_no += 1
 
-        if total is not None and len(stations) != total:
-            # Counts only — never identifiers. A short (or long) inventory is
-            # a failed retrieval, not a smaller plant fleet.
-            raise AdapterProtocolError(
-                f"station list returned {len(stations)} unique stations "
-                f"but the envelope reported total={total}"
-            )
+        self._reconcile_total(len(stations), total)
 
         return StationListResult(
             stations=stations,

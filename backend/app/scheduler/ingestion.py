@@ -398,17 +398,25 @@ class IngestionScheduler:
                     # Defer the refresh instead and keep polling.
                     self._stale_error = str(exc)
                     self._stale_rate_limited = False
+                    # A server that named its own delay (Retry-After on a 503
+                    # from /getStationList) is asking for more than our
+                    # cadence would give it. This branch SWALLOWS the error so
+                    # KPI polling can continue, so the outer transient handler
+                    # never sees it — the lower bound has to be applied here
+                    # or a day-long request is answered after six hours.
+                    requested = getattr(exc, "retry_after_seconds", None) or 0.0
                     if getattr(exc, "blocks_authentication", False):
                         # Except when the failure was the session itself: a
                         # re-login after failCode 305 can time out or answer
                         # 5xx just as it can be throttled. Polling on would
                         # log in again into the same outage.
                         self._inventory_not_before = self._clock() + self._failed_deferral(
-                            self._inventory_refresh, result
+                            max(self._inventory_refresh, requested), result
                         )
                         raise
                     self._inventory_not_before = self._clock() + self._failed_deferral(
-                        max(self._inventory_refresh, self._inventory_min_spacing), result
+                        max(self._inventory_refresh, self._inventory_min_spacing, requested),
+                        result,
                     )
                     logger.warning(
                         "inventory refresh failed (%s), deferred; KPI polling continues",

@@ -370,18 +370,21 @@ class FusionSolarAdapter(VendorAdapter):
                     # A partial reading is still worth keeping — one bad field
                     # must not cost the three good ones beside it — but it is
                     # NOT the final word: a later copy of the same station
-                    # that reads cleanly AND carries everything the held one
-                    # carries REPLACES it. Both halves matter. "Clean" alone
-                    # is satisfied vacuously by a copy whose fields are simply
-                    # ABSENT, so replacing on it would let an empty
-                    # dataItemMap overwrite a reading holding valid daily
-                    # energy and a HEALTHY status with all-None and UNKNOWN —
-                    # persisted as the plant's latest point. A replacement may
-                    # only ever add.
+                    # that reads cleanly AND carries STRICTLY MORE than the
+                    # held one REPLACES it. Every word is load-bearing.
+                    # "Clean" alone is satisfied vacuously by a copy whose
+                    # fields are simply ABSENT, so an empty dataItemMap could
+                    # overwrite valid daily energy and a HEALTHY status with
+                    # all-None and UNKNOWN. And a copy carrying the SAME
+                    # fields adds nothing: swapping the values would be an
+                    # arbitrary choice between two equally readable reports,
+                    # and marking the station accepted on it would lock out a
+                    # genuinely richer third copy. The first report wins
+                    # unless a later one actually adds a field.
                     clean = diagnostics.invalid_values == row_start
                     if code in held_at:
                         held = readings[held_at[code]]
-                        if clean and _populated_fields(reading) >= _populated_fields(held):
+                        if clean and _populated_fields(reading) > _populated_fields(held):
                             readings[held_at[code]] = reading
                             accepted.add(code)
                         else:

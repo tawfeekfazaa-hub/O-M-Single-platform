@@ -193,6 +193,33 @@ async def test_inventory_rate_limit_defers_and_never_aborts_kpi_polling(
     assert adapter.list_calls == 1
 
 
+async def test_a_server_requested_delay_extends_the_inventory_deferral(
+    repository: InMemoryRepository,
+):
+    # /getStationList answering 503 with Retry-After: 86400 is asking for a
+    # day. This branch SWALLOWS the error so KPI polling continues, so the
+    # outer transient handler never sees the delay — without the lower bound
+    # applied here the inventory came back after the 6 h cadence instead.
+    class ShedddingInventoryAdapter(FusionSolarAdapter):
+        async def list_plants(self) -> list[PlantInfo]:
+            raise AdapterTransientError("FusionSolar HTTP 503 on /getStationList", 86_400.0)
+
+    seed = FusionSolarAdapter(
+        MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+    )
+    await repository.upsert_plants(await seed.list_plants())
+    adapter = ShedddingInventoryAdapter(
+        MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+    )
+    clock = FakeClock()
+    scheduler = make_scheduler(adapter, repository, clock=clock)
+
+    result = await scheduler.run_cycle()
+    assert result.error is None  # the cycle itself did not fail ...
+    assert result.readings_written == 3  # ... and KPI polling still ran
+    assert scheduler._inventory_not_before == 86_400.0  # the day the server asked for
+
+
 async def test_min_interval_floor_is_enforced(repository: InMemoryRepository):
     scheduler = IngestionScheduler(
         mock_adapter(),

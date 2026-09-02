@@ -357,6 +357,25 @@ async def test_a_sparser_clean_copy_never_replaces_a_richer_partial_one():
     assert diag.invalid_values == 1  # the one bad field, counted once
 
 
+async def test_an_equal_shaped_copy_adds_nothing_and_never_replaces():
+    # A copy carrying the SAME fields is not an upgrade: swapping the values
+    # would be an arbitrary choice between two equally readable reports, and
+    # accepting on it would lock out a genuinely richer third copy. The
+    # superset test therefore has to be STRICT.
+    rows = [
+        kpi_row("NE=1", day_power=100.0, total_power="bad", real_health_state=3),
+        kpi_row("NE=1", day_power=0.0, real_health_state=2),  # same shape, worse values
+        kpi_row("NE=1", day_power=100.0, total_power=5000.0, real_health_state=3),
+    ]
+    adapter = real_adapter(ScriptedClient(rows))
+    (reading,) = await adapter.fetch_plant_kpis(["NE=1"])
+
+    # The equal-shaped copy was skipped; the third, strictly richer one won.
+    assert (reading.daily_energy_kwh, reading.total_energy_kwh) == (100.0, 5000.0)
+    assert reading.status is PlantStatus.HEALTHY
+    assert adapter.last_kpi_diagnostics.duplicates == 1  # only the equal-shaped one
+
+
 async def test_a_clean_copy_that_covers_the_partial_one_still_wins():
     # The guard above must not block a genuine upgrade: a copy that reads
     # cleanly AND carries everything the held one carries still replaces it.

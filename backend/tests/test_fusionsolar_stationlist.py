@@ -719,3 +719,27 @@ async def test_a_genuinely_identical_duplicate_row_is_still_removed():
     assert [s["stationCode"] for s in result.stations] == ["NE=1"]
     assert result.duplicates_removed == 1
     await client.close()
+
+
+async def test_a_terminal_page_one_is_reconciled_before_its_count_is_believed():
+    # A one-page response can pass every envelope and row check and still
+    # fail the closing unique-count reconciliation. Recording its count
+    # first overwrote a four-page estimate with one, so the retry reserved a
+    # single call for a refresh needing four. For a TERMINAL page 1 the
+    # reconciliation is the last check available, so it runs before the
+    # estimate is replaced.
+    pages = [[station(n * 100 + i) for i in range(100)] for n in range(4)]
+    server = StationListServer(pages)
+    server.page_count_per_page = {2: 3}  # page 2 disagrees: fails after page 1
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    assert client.last_advertised_pages == 4
+
+    server.pages = [[station(1)]]
+    server.page_count_per_page = {1: 1}
+    server.total_override = 0  # contradicted by the one row it returns
+    with pytest.raises(AdapterProtocolError, match="but the envelope reported total=0"):
+        await client.list_stations()
+    assert client.last_advertised_pages == 4  # NOT shrunk to the rejected 1
+    await client.close()
