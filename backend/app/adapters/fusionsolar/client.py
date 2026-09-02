@@ -375,8 +375,15 @@ class RealFusionSolarClient:
                 await self.login()
                 continue
             if fail_code == FAIL_CODE_NOT_LOGGED_IN:
+                # The login endpoint answered, but the token it issued is
+                # rejected too: the session cannot authenticate anything.
+                # Drop it — keeping it would send the next call out with a
+                # token the vendor has already refused, spending a third
+                # login inside the same cycle to discover that again.
+                self._token = None
                 raise AdapterAuthError(
-                    "FusionSolar session could not be re-established (repeated failCode 305)"
+                    "FusionSolar session could not be re-established (repeated failCode 305)",
+                    blocks_authentication=True,
                 )
             raise AdapterError(f"FusionSolar call {path} failed (failCode={fail_code})")
         raise AdapterError(f"FusionSolar call {path} failed")  # pragma: no cover

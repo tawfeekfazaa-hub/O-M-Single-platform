@@ -578,3 +578,18 @@ async def test_non_finite_fail_code_is_not_an_escape():
     with pytest.raises(AdapterError):  # inside the taxonomy, whatever the kind
         await client.login()
     await client.close()
+
+
+async def test_a_repeated_305_drops_the_token_and_blocks_the_session():
+    # The login endpoint answered, but the token it issued is rejected too.
+    # Keeping it would send the next call out with a token the vendor has
+    # already refused — spending a third login in the same cycle to learn
+    # that again — so the session is marked unusable and the token dropped.
+    fake = FakeFusionSolar()
+    fake.expire_session_times = 99  # every authenticated call answers 305
+    client = make_client(fake)
+    with pytest.raises(AdapterAuthError) as excinfo:
+        await client.list_stations()
+    assert excinfo.value.blocks_authentication is True
+    assert client.is_logged_in() is False
+    await client.close()

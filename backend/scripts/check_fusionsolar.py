@@ -162,10 +162,22 @@ async def run_live(settings: Settings, adapter: FusionSolarAdapter | None = None
             # on the cap here means pagination consumed it — stop.
             print("call cap reached — stopping before KPI fetch")
             return EXIT_OK
-        print(
-            f"[2/3] station list ......... OK "
-            f"(count={inv.stations}, pages={inv.pages_retrieved}, variant={inv.variant})"
+        inventory_counts = (
+            f"(count={inv.stations}, pages={inv.pages_retrieved}, variant={inv.variant}, "
+            f"invalid_capacity={inv.invalid_capacity})"
         )
+        if inv.invalid_capacity:
+            # The scheduler counts these same rows as an incomplete cycle
+            # (their stored capacity is deliberately kept rather than
+            # overwritten); a contract check must not certify them as sane.
+            print(f"[2/3] station list ......... INCOMPLETE {inventory_counts}")
+            print(
+                "\nFAILED: the station list carried unreadable capacity values "
+                "(counts above); the contract is NOT validated.",
+                file=sys.stderr,
+            )
+            return EXIT_PROTOCOL
+        print(f"[2/3] station list ......... OK {inventory_counts}")
         if not plants:
             print("      WARNING: 0 plants — check the API account's plant scope.")
             return EXIT_OK

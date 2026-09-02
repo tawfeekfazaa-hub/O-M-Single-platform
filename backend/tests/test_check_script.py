@@ -356,3 +356,45 @@ async def test_live_check_reports_success_only_on_complete_diagnostics(
     out = capsys.readouterr().out
     assert code == check.EXIT_OK
     assert "SUCCESS" in out and "duplicate=0" in out
+
+
+async def test_live_run_refuses_to_certify_an_unreadable_capacity(
+    capsys: pytest.CaptureFixture,
+):
+    # The scheduler counts these rows as an incomplete cycle, so the contract
+    # check must not print SUCCESS and exit OK on the same inventory.
+    class Adapter:
+        vendor = "fusionsolar"
+
+        def __init__(self) -> None:
+            self.last_inventory_diagnostics = InventoryDiagnostics(
+                stations=2,
+                pages_retrieved=1,
+                variant="paginated",
+                calls_consumed=1,
+                invalid_capacity=1,
+            )
+            self.last_kpi_diagnostics = KpiDiagnostics()
+            self.kpi_called = False
+
+        async def authenticate(self) -> None: ...
+
+        async def list_plants(self) -> list:
+            return [
+                SimpleNamespace(vendor_plant_id="NE=1"),
+                SimpleNamespace(vendor_plant_id="NE=2"),
+            ]
+
+        async def fetch_plant_kpis(self, vendor_plant_ids: list[str]) -> list:
+            self.kpi_called = True
+            return []
+
+        async def close(self) -> None: ...
+
+    adapter = Adapter()
+    code = await check.run_live(make_settings(), adapter=adapter)
+    captured = capsys.readouterr()
+    assert code == check.EXIT_PROTOCOL
+    assert "INCOMPLETE" in captured.out and "invalid_capacity=1" in captured.out
+    assert "SUCCESS" not in captured.out
+    assert adapter.kpi_called is False  # stopped before spending a KPI call
