@@ -120,6 +120,10 @@ mask authentication/version errors).
   to a full window, which is far worse than briefly polling a retired one.
   The set self-corrects at the first successful refresh; PR-2 persists the
   snapshot and closes the gap for good.
+- Staleness is a STATE, not an event: once a refresh is rate-limited or
+  fails, every cycle of the deferral window reports it (the cycle runs on
+  the same old list), is excluded from `complete_success` and is counted
+  in the incomplete statistic. Only a successful refresh clears it.
 - A refresh rejected by the budget never aborts KPI polling, and defers
   itself by a **full window** rather than the limiter's next-slot hint:
   one freed slot is not enough for a paginated refresh, so retrying earlier
@@ -185,11 +189,14 @@ mask authentication/version errors).
   against the endpoint quota:* `unverified`.
 - HTTP `429` → rate-limit error; `Retry-After` parsed safely
   (delta-seconds or HTTP-date; a timezone-less date is read as GMT per
-  RFC 9110; garbage, and any value that is not FINITE — a few hundred
-  digits overflow to infinity rather than raising — → endpoint-window
-  hint). Parsing never raises outside the adapter error taxonomy and never
-  yields a delay that could stall the scheduler. *Whether your tenant
-  sends Retry-After:* `unverified`.
+  RFC 9110). A hint is only accepted when it is FINITE and within a
+  plausibility ceiling of **one day** — the largest window our budgets
+  use; anything else (garbage, infinity from an overflowing digit string,
+  or a merely absurd finite value such as 1e299, which Python does not
+  overflow) falls back to the endpoint-window hint. Parsing never raises
+  outside the adapter error taxonomy and can never yield a delay that
+  stalls the scheduler. *Whether your tenant sends Retry-After:*
+  `unverified`.
 - Timeouts, connection failures, 500/502/503/504 → transient error →
   scheduler backoff with jitter (no blind retries). Jitter (0.75x–1.25x)
   applies to the BACKOFF only: a vendor `Retry-After` and the configured

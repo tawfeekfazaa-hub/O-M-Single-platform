@@ -657,3 +657,84 @@ async def test_guard_exceeded_inventory_defers_instead_of_retrying_every_cycle(
     clock.now = 21_601.0  # after the inventory cadence it may try again
     await scheduler.run_cycle()
     assert adapter.list_calls == 2
+
+
+async def test_stale_inventory_is_reported_for_the_whole_deferral(
+    repository: InMemoryRepository,
+):
+    """Every cycle of the deferral window runs on the SAME stale inventory.
+
+    The flags describe the current inventory, not just the attempt that
+    failed, so a cycle suppressed by the deferral must not look healthy to
+    a health consumer.
+    """
+
+    class InventoryLimitedAdapter(FusionSolarAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+            )
+            self.fail = True
+
+        async def list_plants(self) -> list[PlantInfo]:
+            if self.fail:
+                raise AdapterRateLimitError("budget exhausted", retry_after_seconds=86_400.0)
+            return await super().list_plants()
+
+    await repository.upsert_plants(await mock_adapter().list_plants())
+    adapter = InventoryLimitedAdapter()
+    clock = FakeClock()
+    scheduler = IngestionScheduler(
+        adapter,
+        repository,
+        interval_seconds=300.0,
+        station_list_max_calls=4,
+        station_list_window_seconds=86_400.0,
+        jitter=lambda: 0.5,
+        clock=clock,
+    )
+
+    first = await scheduler.run_cycle()
+    assert first.inventory_rate_limited and not first.complete_success
+
+    # Cycles suppressed by the deferral report the same stale state.
+    for tick in (300.0, 600.0, 900.0):
+        clock.now = tick
+        result = await scheduler.run_cycle()
+        assert not result.inventory_refreshed
+        assert result.inventory_rate_limited and result.inventory_stale
+        assert not result.complete_success
+        assert result.readings_written == 3  # monitoring never stopped
+    assert scheduler.stats.cycles_partial == 4  # every stale cycle counted
+
+    # A successful refresh clears it.
+    adapter.fail = False
+    clock.now = 86_401.0
+    healthy = await scheduler.run_cycle()
+    assert healthy.inventory_refreshed and not healthy.inventory_stale
+    assert healthy.complete_success
+
+
+async def test_inventory_failure_state_also_survives_the_deferral(
+    repository: InMemoryRepository,
+):
+    class GuardFailAdapter(FusionSolarAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+            )
+
+        async def list_plants(self) -> list[PlantInfo]:
+            raise AdapterProtocolError("station list needs more pages than the guard allows")
+
+    await repository.upsert_plants(await mock_adapter().list_plants())
+    clock = FakeClock()
+    scheduler = make_scheduler(GuardFailAdapter(), repository, clock=clock)
+
+    first = await scheduler.run_cycle()
+    assert first.inventory_error is not None
+
+    clock.now = 300.0
+    deferred = await scheduler.run_cycle()
+    assert not deferred.inventory_refreshed
+    assert deferred.inventory_error is not None and not deferred.complete_success

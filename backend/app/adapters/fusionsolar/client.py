@@ -50,6 +50,13 @@ _MAX_EPOCH_MS = 4_000_000_000_000
 
 _RETRYABLE_STATUS = {500, 502, 503, 504}
 
+# Plausibility ceiling for a Retry-After hint: one day, the largest window
+# any of our endpoint budgets uses. Anything beyond that is not a usable
+# instruction — honouring e.g. 1e299 s (a few hundred digits stay FINITE)
+# would stop KPI polling for good — so it is treated as a malformed header
+# and the endpoint-window fallback applies.
+_MAX_RETRY_AFTER_SECONDS = 86_400.0
+
 DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 
 STATION_LIST_PAGE_SIZE = 100
@@ -120,18 +127,25 @@ class FusionSolarClient(Protocol):
     async def close(self) -> None: ...
 
 
+def _plausible_delay(seconds: float) -> float | None:
+    """A retry hint we can actually act on, else None (use the budget hint).
+
+    Rejects both the overflow case (infinity) and merely absurd finite
+    values: ``float("1" * 300)`` is ~1e299 and would freeze the scheduler
+    just as effectively as infinity.
+    """
+    if not math.isfinite(seconds) or seconds > _MAX_RETRY_AFTER_SECONDS:
+        return None
+    return seconds
+
+
 def _parse_retry_after(value: str | None) -> float | None:
     """Parse a Retry-After header safely: delta-seconds or HTTP-date."""
     if not value:
         return None
     text = value.strip()
     if text.isdigit():
-        seconds = float(text)
-        # A few hundred digits overflow to infinity instead of raising; an
-        # infinite delay would become the scheduler's hard lower bound and
-        # stall KPI polling forever. Treat it as a malformed header so the
-        # endpoint-window fallback applies.
-        return seconds if math.isfinite(seconds) else None
+        return _plausible_delay(float(text))
     try:
         when = email.utils.parsedate_to_datetime(text)
     except (TypeError, ValueError):
@@ -145,9 +159,7 @@ def _parse_retry_after(value: str | None) -> float | None:
         # could take the scheduler task down).
         when = when.replace(tzinfo=dt.UTC)
     delta = (when - dt.datetime.now(dt.UTC)).total_seconds()
-    if not math.isfinite(delta):
-        return None
-    return max(delta, 0.0)
+    return _plausible_delay(max(delta, 0.0)) if math.isfinite(delta) else None
 
 
 def _station_signature(rows: list[dict[str, Any]]) -> tuple[Any, ...]:

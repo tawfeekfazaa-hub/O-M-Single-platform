@@ -438,11 +438,18 @@ async def test_call_counts_total_sums_every_endpoint():
     await client.close()
 
 
-@pytest.mark.parametrize("header", ["9" * 400, "1" * 500])
-async def test_overflowing_retry_after_falls_back_to_the_budget_hint(header: str):
-    # float() on a few hundred digits returns infinity instead of raising;
-    # an infinite delay would become the scheduler's hard lower bound and
-    # stall KPI polling for good.
+@pytest.mark.parametrize(
+    "header",
+    [
+        "9" * 400,  # overflows to infinity
+        "1" * 500,
+        "1" * 300,  # stays FINITE (~1e299) and would freeze the loop just as well
+        "86401",  # one second past the plausibility ceiling
+    ],
+)
+async def test_unusable_retry_after_falls_back_to_the_budget_hint(header: str):
+    # An unusable delay must never become the scheduler's hard lower bound:
+    # infinity and ~1e299 stall KPI polling identically.
     fake = FakeFusionSolar()
     client = make_client(fake)
     await client.list_stations()
@@ -453,4 +460,17 @@ async def test_overflowing_retry_after_falls_back_to_the_budget_hint(header: str
     delay = excinfo.value.retry_after_seconds
     assert delay is not None and math.isfinite(delay)
     assert delay >= 300.0  # the documented endpoint-window fallback
+    await client.close()
+
+
+async def test_plausible_retry_after_is_still_honoured():
+    # The ceiling rejects absurd values only — a usable hint is respected.
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = "86400"  # exactly the ceiling, still usable
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    assert excinfo.value.retry_after_seconds == pytest.approx(86_400.0)
     await client.close()

@@ -49,6 +49,10 @@ class CycleResult:
 
     inventory_refreshed: bool = False
     inventory_pages: int = 0
+    # These two describe the CURRENT inventory, not just this cycle's
+    # attempt: they stay set for the whole deferral window, because a cycle
+    # that skipped the refresh is running on exactly the same stale list as
+    # the cycle whose refresh failed.
     inventory_rate_limited: bool = False
     # True when KPI polling ran against the repository WITHOUT a confirmed
     # inventory from this process (restart before the first successful
@@ -155,6 +159,10 @@ class IngestionScheduler:
         # KPIs for retired stations forever — every cycle partial, and KPI
         # capacity wasted on rows the vendor will never answer for.
         self._current_inventory: set[str] | None = None
+        # Why the inventory is stale, carried across the deferral window and
+        # cleared only by a successful refresh.
+        self._stale_rate_limited = False
+        self._stale_error: str | None = None
         self.stats = SchedulerStats()
         self._stopping = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -177,6 +185,8 @@ class IngestionScheduler:
         await self._repository.upsert_plants(plants)
         self._last_inventory_at = self._clock()
         self._inventory_not_before = None
+        self._stale_rate_limited = False
+        self._stale_error = None
         result.inventory_refreshed = True
         result.plants_upserted = len(plants)
         self._current_inventory = {p.vendor_plant_id for p in plants}
@@ -225,7 +235,7 @@ class IngestionScheduler:
                     # The station-list budget is independent of the KPI
                     # budget: a rate-limited refresh defers itself and must
                     # never abort KPI polling for this cycle.
-                    result.inventory_rate_limited = True
+                    self._stale_rate_limited = True
                     # The limiter's hint frees ONE slot, which is not enough
                     # for a paginated refresh: retrying then would spend the
                     # same partial burst again and fail on the same page,
@@ -245,7 +255,7 @@ class IngestionScheduler:
                     # the budget every cycle until the window is exhausted,
                     # and aborting the cycle would stop KPI monitoring too.
                     # Defer the refresh instead and keep polling.
-                    result.inventory_error = str(exc)
+                    self._stale_error = str(exc)
                     self._inventory_not_before = self._clock() + max(
                         self._inventory_refresh, self._inventory_min_spacing
                     )
@@ -253,6 +263,11 @@ class IngestionScheduler:
                         "inventory refresh failed (%s), deferred; KPI polling continues",
                         type(exc).__name__,
                     )
+
+            # Report the CURRENT staleness, not just this cycle's attempt: a
+            # cycle suppressed by the deferral runs on the same old list.
+            result.inventory_rate_limited = self._stale_rate_limited
+            result.inventory_error = self._stale_error
 
             # KPI polling uses the repository inventory, not a vendor call.
             plants = [
