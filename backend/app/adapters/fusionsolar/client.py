@@ -185,10 +185,6 @@ def _is_success(payload: dict[str, Any]) -> bool:
     return payload.get("success") is True
 
 
-def _station_signature(rows: list[dict[str, Any]]) -> tuple[Any, ...]:
-    return tuple(row.get("stationCode") for row in rows)
-
-
 class RealFusionSolarClient:
     """Talks to the FusionSolar Northbound API over HTTPS (real mode only).
 
@@ -503,9 +499,16 @@ class RealFusionSolarClient:
         # only estimate there is, and a page-1 timeout would otherwise
         # report one page for an inventory known to need four.
         seen: dict[str, dict[str, Any]] = {}
+        # EVERY non-empty page seen so far, not just the previous one: a
+        # vendor serving A, B, A passes an adjacent-pages check, the repeat
+        # is quietly dedup'd, and an envelope whose `total` happens to match
+        # the unique count is then certified complete — with pages_retrieved
+        # inflated to 3, which stretches the next refresh (12 h -> 24 h on
+        # the 4/day default). Signatures are built from the NORMALIZED codes
+        # collected below, so they are always hashable.
+        page_signatures: set[tuple[str, ...]] = set()
         duplicates_removed = 0
         variant: str | None = None
-        previous_signature: tuple[Any, ...] | None = None
         page_no = 1
         page_count: int | None = None
         page_size: int | None = None
@@ -597,6 +600,7 @@ class RealFusionSolarClient:
             else:
                 raise AdapterProtocolError("station list data is neither a list nor an object")
 
+            page_codes: list[str] = []
             for row in rows:
                 if not isinstance(row, dict):
                     raise AdapterProtocolError("station list row is not an object")
@@ -604,6 +608,7 @@ class RealFusionSolarClient:
                 if not code:
                     raise AdapterProtocolError("station list row lacks stationCode")
                 code = str(code)
+                page_codes.append(code)
                 if code in seen:
                     if seen[code] == row:
                         duplicates_removed += 1
@@ -614,10 +619,11 @@ class RealFusionSolarClient:
                 seen[code] = row
                 stations.append(row)
 
-            signature = _station_signature(rows)
-            if previous_signature is not None and signature == previous_signature and rows:
-                raise AdapterProtocolError("station list repeated an identical page")
-            previous_signature = signature
+            if page_codes:
+                signature = tuple(page_codes)
+                if signature in page_signatures:
+                    raise AdapterProtocolError("station list repeated an identical page")
+                page_signatures.add(signature)
 
             if page_no == 1:
                 pages_needed = page_count or 0

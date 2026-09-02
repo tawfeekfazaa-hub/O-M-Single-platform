@@ -87,8 +87,14 @@ mask authentication/version errors).
   `AdapterProtocolError` — nothing is defaulted or guessed, because a
   truncated inventory that passed as complete would retire live plants
   downstream.
-- Guards: every page retrieved; finite max-page bound; repeated-page and
-  impossible-metadata detection; deterministic `stationCode` dedup (the
+- Guards: every page retrieved; finite max-page bound; impossible-metadata
+  detection; repeated-page detection across the WHOLE run, not merely
+  between adjacent pages — a vendor serving A, B, A passes an adjacent
+  check, the repeat is quietly de-duplicated, and an envelope whose `total`
+  happens to equal the unique count is then certified complete with
+  `pages_retrieved` inflated to 3 (which stretches the next refresh from
+  12 h to 24 h on the 4/day default). Page signatures are built from the
+  NORMALIZED station codes; deterministic `stationCode` dedup (the
   unique count, not the row count, is what `total` is checked against);
   conflicting duplicates rejected; malformed pages never skipped silently.
   An EMPTY page is coherent only for an empty fleet (`total = 0`) — an
@@ -217,16 +223,24 @@ mask authentication/version errors).
 - Documented `dataItemMap` fields: `day_power`, `month_power`,
   `total_power`, `day_income`, `total_income`, `real_health_state`
   (`confirmed`). `day_power`/`total_power` are kWh and stay kWh.
-- **A duplicate is only a duplicate once a reading has been ACCEPTED.**
-  The vendor may repeat a requested station within one batch; the extra
-  copy is dropped and counted. But an unreadable row is a row the adapter
-  does NOT have, so it must not claim the station's slot: when the first
-  copy is unreadable and a later one is valid, the valid one is taken.
-  Keying the check on "was this code answered" instead discarded the good
-  copy and left the plant's stored KPI stale. The two questions are
-  tracked separately — answered (which is what `missing` is derived from,
-  so an unreadable row is counted invalid, never reported as absent) and
-  accepted (which is what makes a further copy a duplicate).
+- **A duplicate is only a duplicate once a CLEAN reading has been
+  accepted.** The vendor may repeat a requested station within one batch;
+  the extra copy is dropped and counted. But a row the adapter could not
+  read in full must not claim the station's slot, or the good copy loses
+  to the bad one and the plant keeps its stale stored values. Three
+  questions are tracked separately:
+  - **answered** — set as soon as the row is routed to its own batch. This
+    is what `missing` is derived from, so an unreadable row is counted
+    invalid and NEVER reported as an absent station.
+  - **held** — a reading exists for the station. A partial reading (one
+    unreadable field among readable ones) is still kept: one bad field must
+    not cost the good fields beside it, and the bad value is dropped and
+    counted as always.
+  - **accepted** — every field PRESENT in the row was readable. Only this
+    closes the station to further copies. A later copy that reads cleanly
+    REPLACES a partial one in place — never appended beside it, so a
+    station still yields exactly one reading. The replacement runs one way
+    only: a partial copy never displaces a clean one, it is an extra.
 - `real_health_state`: 1 disconnected, 2 faulty, 3 healthy, else unknown.
   An ABSENT field and a numeric code outside 1/2/3 are both the documented
   "else unknown" case and are not counted as invalid; a value that is

@@ -647,3 +647,30 @@ async def test_the_page_estimate_survives_a_page_one_rejected_by_its_rows():
         await client.list_stations()
     assert client.last_advertised_pages == 2  # NOT shrunk to the rejected 1
     await client.close()
+
+
+async def test_a_page_repeated_non_adjacently_is_rejected():
+    # Pages A, B, A. Comparing only ADJACENT pages let this through: the
+    # third page's rows were merely dedup'd away, and because `total` happens
+    # to equal the unique count the closing check passed too — a malformed
+    # envelope certified as complete, with pages_retrieved inflated to 3,
+    # which stretches the next station-list refresh (12 h -> 24 h on the
+    # 4/day default).
+    page_a = [station(i) for i in range(100)]
+    page_b = [station(100)]
+    server = StationListServer([page_a, page_b, page_a])
+    server.total_override = 101  # the number of UNIQUE stations
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError, match="repeated an identical page"):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_distinct_pages_that_merely_look_alike_are_not_rejected():
+    # The check must key on the page's stations, not on its size: two pages
+    # of one station each are perfectly legal as long as the stations differ.
+    server = StationListServer([[station(1)], [station(2)], [station(3)]])
+    client = make_client(server)
+    result = await client.list_stations()
+    assert [s["stationCode"] for s in result.stations] == ["NE=1", "NE=2", "NE=3"]
+    await client.close()

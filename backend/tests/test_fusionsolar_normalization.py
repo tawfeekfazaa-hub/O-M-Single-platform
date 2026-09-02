@@ -306,6 +306,52 @@ async def test_a_valid_duplicate_replaces_an_unreadable_first_copy():
     assert diag.missing == 0  # the station was answered, not absent
 
 
+async def test_a_clean_copy_replaces_a_partially_unreadable_one():
+    # A row with an unreadable FIELD is only partly a row we have. Marking it
+    # accepted closed the station to further copies, so a later copy carrying
+    # a valid 7.5 kWh was discarded as a duplicate and the None was persisted
+    # as the latest value — the same good-data loss the answered/accepted
+    # split was added to prevent, one level down.
+    rows = [kpi_row("NE=1", day_power="bad"), kpi_row("NE=1", day_power=7.5)]
+    adapter = real_adapter(ScriptedClient(rows))
+    readings = await adapter.fetch_plant_kpis(["NE=1"])
+
+    assert [(r.vendor_plant_id, r.daily_energy_kwh) for r in readings] == [("NE=1", 7.5)]
+    diag = adapter.last_kpi_diagnostics
+    assert diag.returned == 1  # REPLACED, never appended beside the partial one
+    assert diag.invalid_values == 1  # the unreadable field is still counted
+    assert diag.duplicates == 0  # an upgrade, not an extra
+    assert diag.missing == 0
+
+
+async def test_a_partial_copy_never_downgrades_a_clean_one():
+    # The replacement runs one way only: once every field of a copy has read,
+    # a later copy with an unreadable field is an extra, not a correction.
+    rows = [kpi_row("NE=1", day_power=7.5), kpi_row("NE=1", day_power="bad")]
+    adapter = real_adapter(ScriptedClient(rows))
+    readings = await adapter.fetch_plant_kpis(["NE=1"])
+
+    assert [r.daily_energy_kwh for r in readings] == [7.5]
+    diag = adapter.last_kpi_diagnostics
+    assert diag.duplicates == 1
+    assert diag.invalid_values == 0  # the second copy was never parsed
+
+
+async def test_a_partial_reading_is_still_kept_when_no_better_copy_arrives():
+    # One bad field must not cost the good fields beside it: the row is kept,
+    # the bad value dropped and counted, and the station is NOT reported
+    # missing. This is the pre-existing contract and the replacement above
+    # must not quietly turn it into a dropped row.
+    rows = [kpi_row("NE=1", day_power=123.5, total_power=float("inf"))]
+    adapter = real_adapter(ScriptedClient(rows))
+    (reading,) = await adapter.fetch_plant_kpis(["NE=1"])
+
+    assert reading.daily_energy_kwh == 123.5
+    assert reading.total_energy_kwh is None
+    diag = adapter.last_kpi_diagnostics
+    assert (diag.returned, diag.missing, diag.invalid_values) == (1, 0, 1)
+
+
 async def test_a_duplicate_of_an_accepted_row_is_still_a_duplicate():
     # The relaxation above must not swallow real duplicates: once a reading
     # is in hand, a further copy is an extra, not a second chance.

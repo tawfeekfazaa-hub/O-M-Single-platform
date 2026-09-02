@@ -241,11 +241,14 @@ class FusionSolarAdapter(VendorAdapter):
         requested = set(vendor_plant_ids)
         # `seen` answers "did the vendor say anything at all about this
         # station" (it is what `missing` is derived from); `accepted` answers
-        # "do we actually hold a reading for it". They differ for a row that
-        # arrived but could not be read, and the difference is what lets a
-        # second, VALID copy still be taken.
+        # "do we hold a reading whose every present field was readable".
+        # They differ for a row that arrived but could not be read in full,
+        # and the difference is what lets a second, better copy still win.
+        # `held_at` locates a station's reading so a clean copy REPLACES a
+        # partial one rather than being appended beside it.
         seen: set[str] = set()
         accepted: set[str] = set()
+        held_at: dict[str, int] = {}
         readings: list[PlantKpiReading] = []
         before = self._client.call_counts().station_real_kpi
 
@@ -282,12 +285,11 @@ class FusionSolarAdapter(VendorAdapter):
                         diagnostics.unexpected += 1
                         continue
                     if code in accepted:
-                        # A duplicate is only a duplicate once the reading is
-                        # in hand. Keying this on `seen` discarded a valid
-                        # second copy whenever the FIRST copy was unreadable,
-                        # so a row the adapter explicitly does not have beat
-                        # the row it does — the cycle then kept stale stored
-                        # data for a station the vendor had reported fine.
+                        # A duplicate is only a duplicate once a CLEAN reading
+                        # is in hand. Keying this on "was it answered" let a
+                        # row the adapter could not read beat the row it
+                        # could: the good copy was dropped and the plant kept
+                        # its stale stored values.
                         diagnostics.duplicates += 1
                         continue
                     # Answered, whatever happens below: an unreadable row is
@@ -302,6 +304,10 @@ class FusionSolarAdapter(VendorAdapter):
                         # we cannot read is a row we do not have.
                         diagnostics.invalid_values += 1
                         continue
+
+                    # Baseline for THIS row: every counted value from here on
+                    # is a field of this row that could not be read.
+                    row_start = diagnostics.invalid_values
 
                     if self._allow_synthetic_fields:
                         # SYNTHETIC mock-only field; see mock_client docstring.
@@ -324,24 +330,40 @@ class FusionSolarAdapter(VendorAdapter):
                         # knowing is the truth in those cases.
                         continue
 
-                    readings.append(
-                        PlantKpiReading(
-                            vendor=self.vendor,
-                            vendor_plant_id=code,
-                            ts=received_at,
-                            active_power_kw=active_power,
-                            daily_energy_kwh=_finite_float(item.get("day_power"), diagnostics),
-                            total_energy_kwh=_finite_float(item.get("total_power"), diagnostics),
-                            performance_ratio=normalize_performance_ratio(
-                                item.get("performance_ratio"), diagnostics
-                            )
-                            if item.get("performance_ratio") is not None
-                            else None,
-                            status=status,
-                            vendor_server_time=vendor_time,
+                    reading = PlantKpiReading(
+                        vendor=self.vendor,
+                        vendor_plant_id=code,
+                        ts=received_at,
+                        active_power_kw=active_power,
+                        daily_energy_kwh=_finite_float(item.get("day_power"), diagnostics),
+                        total_energy_kwh=_finite_float(item.get("total_power"), diagnostics),
+                        performance_ratio=normalize_performance_ratio(
+                            item.get("performance_ratio"), diagnostics
                         )
+                        if item.get("performance_ratio") is not None
+                        else None,
+                        status=status,
+                        vendor_server_time=vendor_time,
                     )
-                    accepted.add(code)
+                    # A partial reading is still worth keeping — one bad field
+                    # must not cost the three good ones beside it — but it is
+                    # NOT the final word: a later copy of the same station
+                    # whose every field reads REPLACES it, and only a clean
+                    # reading closes the station to further copies.
+                    clean = diagnostics.invalid_values == row_start
+                    if code in held_at:
+                        if clean:
+                            readings[held_at[code]] = reading
+                            accepted.add(code)
+                        else:
+                            # A second copy no better than the one already
+                            # held: an extra, not an upgrade.
+                            diagnostics.duplicates += 1
+                    else:
+                        held_at[code] = len(readings)
+                        readings.append(reading)
+                        if clean:
+                            accepted.add(code)
 
         except AdapterError:
             # The batches already sent SPENT their calls; publish what
