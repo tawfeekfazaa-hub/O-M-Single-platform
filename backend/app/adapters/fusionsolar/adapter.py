@@ -187,6 +187,8 @@ class FusionSolarAdapter(VendorAdapter):
 
     async def fetch_plant_kpis(self, vendor_plant_ids: list[str]) -> list[PlantKpiReading]:
         diagnostics = KpiDiagnostics(requested=len(vendor_plant_ids))
+        # Global set — used ONLY for the final "missing" diagnostic; each
+        # row is validated against its own batch (see the loop below).
         requested = set(vendor_plant_ids)
         seen: set[str] = set()
         readings: list[PlantKpiReading] = []
@@ -201,6 +203,11 @@ class FusionSolarAdapter(VendorAdapter):
         # Sequential batches of at most 100 codes — never concurrent.
         for start in range(0, len(vendor_plant_ids), KPI_BATCH_SIZE):
             batch = vendor_plant_ids[start : start + KPI_BATCH_SIZE]
+            # Membership is checked against THIS batch, not the whole
+            # request: a row for a station belonging to a later batch is
+            # misrouted data. Accepting it would let a stale value win and
+            # would make the station's real row look like a duplicate.
+            batch_codes = set(batch)
             result = await self._client.get_station_real_kpi(batch)
             diagnostics.batches += 1
             received_at = datetime.now(UTC)
@@ -215,7 +222,7 @@ class FusionSolarAdapter(VendorAdapter):
                     diagnostics.invalid_values += 1
                     continue
                 code = str(code)
-                if code not in requested:
+                if code not in batch_codes:
                     diagnostics.unexpected += 1
                     continue
                 if code in seen:

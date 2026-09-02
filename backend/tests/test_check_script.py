@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -237,3 +238,79 @@ def test_unparseable_settings_exit_config_without_a_traceback(
     assert "CONFIG ERROR" in captured.err
     assert "FUSIONSOLAR_BASE_URL" in captured.err
     assert "insecure.test" not in captured.err  # the value is never echoed
+
+
+@pytest.mark.parametrize(
+    "diagnostics",
+    [
+        KpiDiagnostics(requested=2, returned=1, missing=1),
+        KpiDiagnostics(requested=2, returned=2, duplicates=1),
+        KpiDiagnostics(requested=2, returned=2, unexpected=1),
+        KpiDiagnostics(requested=2, returned=2, invalid_values=1),
+    ],
+)
+async def test_live_check_fails_on_incomplete_kpi_diagnostics(
+    diagnostics: KpiDiagnostics, capsys: pytest.CaptureFixture
+):
+    # The scheduler treats these diagnostics as an incomplete ingestion, so a
+    # contract check must not print SUCCESS and exit 0 for the same data.
+    class Adapter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.last_inventory_diagnostics = InventoryDiagnostics(
+                stations=2, pages_retrieved=1, variant="direct_list", calls_consumed=1
+            )
+            self.last_kpi_diagnostics = diagnostics
+
+        async def authenticate(self) -> None:
+            return None
+
+        async def list_plants(self) -> list:
+            return [
+                SimpleNamespace(vendor_plant_id="NE=1"),
+                SimpleNamespace(vendor_plant_id="NE=2"),
+            ]
+
+        async def fetch_plant_kpis(self, vendor_plant_ids: list[str]) -> list:
+            return [object()] * diagnostics.returned
+
+        async def close(self) -> None:
+            self.closed = True
+
+    adapter = Adapter()
+    code = await check.run_live(make_settings(), adapter=adapter)
+    captured = capsys.readouterr()
+    assert code == check.EXIT_PROTOCOL
+    assert "INCOMPLETE" in captured.out
+    assert "NOT validated" in captured.err
+    assert "SUCCESS" not in captured.out
+    assert adapter.closed is True
+
+
+async def test_live_check_reports_success_only_on_complete_diagnostics(
+    capsys: pytest.CaptureFixture,
+):
+    class Adapter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.last_inventory_diagnostics = InventoryDiagnostics(
+                stations=1, pages_retrieved=1, variant="direct_list", calls_consumed=1
+            )
+            self.last_kpi_diagnostics = KpiDiagnostics(requested=1, returned=1)
+
+        async def authenticate(self) -> None:
+            return None
+
+        async def list_plants(self) -> list:
+            return [SimpleNamespace(vendor_plant_id="NE=1")]
+
+        async def fetch_plant_kpis(self, vendor_plant_ids: list[str]) -> list:
+            return [object()]
+
+        async def close(self) -> None:
+            self.closed = True
+
+    code = await check.run_live(make_settings(), adapter=Adapter())
+    out = capsys.readouterr().out
+    assert code == check.EXIT_OK
+    assert "SUCCESS" in out and "duplicate=0" in out

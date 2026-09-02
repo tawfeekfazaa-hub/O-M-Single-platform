@@ -55,6 +55,10 @@ class CycleResult:
     # station-list refresh). Such a cycle may still poll stations the vendor
     # has retired, so its "missing" count is not necessarily a data problem.
     inventory_provisional: bool = False
+    # Sanitized reason the last inventory refresh failed (protocol/contract
+    # or vendor error). The cycle is NOT a complete success while set, but
+    # KPI polling still runs and the refresh is deferred, never hammered.
+    inventory_error: str | None = None
     plants_upserted: int = 0
     requested_plants: int = 0
     readings_returned: int = 0
@@ -85,7 +89,7 @@ class CycleResult:
         """A cycle counts as fully successful ONLY with no error and no
         partial/malformed data — a partial response is never reported as
         a complete ingestion."""
-        return self.error is None and not self.partial
+        return self.error is None and self.inventory_error is None and not self.partial
 
 
 @dataclass(slots=True)
@@ -224,6 +228,21 @@ class IngestionScheduler:
                     logger.warning(
                         "inventory refresh rate-limited, deferred; KPI polling continues"
                     )
+                except AdapterError as exc:
+                    # A contract/guard failure (e.g. an inventory needing more
+                    # pages than the budget allows) will NOT fix itself on the
+                    # next cycle: retrying immediately would spend page 1 of
+                    # the budget every cycle until the window is exhausted,
+                    # and aborting the cycle would stop KPI monitoring too.
+                    # Defer the refresh instead and keep polling.
+                    result.inventory_error = str(exc)
+                    self._inventory_not_before = self._clock() + max(
+                        self._inventory_refresh, self._inventory_min_spacing
+                    )
+                    logger.warning(
+                        "inventory refresh failed (%s), deferred; KPI polling continues",
+                        type(exc).__name__,
+                    )
 
             # KPI polling uses the repository inventory, not a vendor call.
             plants = [
@@ -281,11 +300,11 @@ class IngestionScheduler:
         else:
             self.stats.cycles_failed += 1
             self.stats.consecutive_failures += 1
-        if result.error is None and result.partial:
+        if result.error is None and (result.partial or result.inventory_error):
             self.stats.cycles_partial += 1
             # Counts only — no identifiers or values in this log line.
             logger.warning(
-                "ingestion cycle partial: requested=%d returned=%d missing=%d "
+                "ingestion cycle incomplete: requested=%d returned=%d missing=%d "
                 "duplicate=%d unexpected=%d invalid=%d",
                 result.requested_plants,
                 result.readings_returned,

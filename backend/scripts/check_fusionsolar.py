@@ -189,11 +189,22 @@ async def run_live(settings: Settings, adapter: FusionSolarAdapter | None = None
         sample = [p.vendor_plant_id for p in plants[:100]]
         readings = await adapter.fetch_plant_kpis(sample)
         kpi = adapter.last_kpi_diagnostics
-        print(
-            f"[3/3] realtime KPIs ........ OK "
+        counts = (
             f"(requested={kpi.requested}, returned={len(readings)}, "
-            f"missing={kpi.missing}, invalid={kpi.invalid_values})"
+            f"missing={kpi.missing}, duplicate={kpi.duplicates}, "
+            f"unexpected={kpi.unexpected}, invalid={kpi.invalid_values})"
         )
+        if not kpi.complete:
+            # The scheduler treats these same diagnostics as an incomplete
+            # ingestion; a contract check must not certify them as sane.
+            print(f"[3/3] realtime KPIs ........ INCOMPLETE {counts}")
+            print(
+                "\nFAILED: the vendor response was incomplete or malformed "
+                "(counts above); the contract is NOT validated.",
+                file=sys.stderr,
+            )
+            return EXIT_PROTOCOL
+        print(f"[3/3] realtime KPIs ........ OK {counts}")
         print("\nSUCCESS — connectivity and contract look sane (counts only).")
         return EXIT_OK
     except AdapterAuthError as exc:

@@ -84,8 +84,9 @@ mask authentication/version errors).
   unique count, not the row count, is what `total` is checked against);
   conflicting duplicates rejected; malformed pages never skipped silently.
 - A failed validation means **no inventory update at all**: the
-  repository keeps the previously stored plants and the cycle is reported
-  as failed, never as a successful refresh.
+  repository keeps the previously stored plants, the refresh is never
+  reported as successful, and the cycle is never a complete success (see
+  the deferral rule below for what happens next).
 - The legacy direct-list variant is unchanged: one call, complete by
   definition, no pagination metadata expected.
 - Budget: Huawei documents a small daily-style allowance whose exact
@@ -118,6 +119,12 @@ mask authentication/version errors).
   itself by a **full window** rather than the limiter's next-slot hint:
   one freed slot is not enough for a paginated refresh, so retrying earlier
   would resend the same partial burst and fail on the same page forever.
+- An inventory refresh that FAILS (contract/guard/vendor error, not just a
+  rate limit) is deferred like a rate-limited one instead of aborting the
+  cycle: retrying it every cycle would spend page 1 of the budget until the
+  window is exhausted, and aborting would stop KPI monitoring with it. The
+  failure is recorded on the cycle (`inventory_error`) and the cycle is
+  never a complete success while it stands.
 - **Pages per refresh may never exceed the budget.** A paginated refresh
   cannot be resumed across windows, so the effective page guard is
   `min(FUSIONSOLAR_STATION_LIST_MAX_PAGES, FUSIONSOLAR_STATION_LIST_MAX_CALLS)`.
@@ -128,7 +135,10 @@ mask authentication/version errors).
 ## Real-time KPIs — `/thirdData/getStationRealKpi`
 
 - `stationCodes` comma-separated, **max 100 per call (official)**;
-  batches are sequential, never concurrent.
+  batches are sequential, never concurrent. Each returned row is validated
+  against the codes of ITS OWN batch — a row for a station belonging to a
+  later batch is misrouted data, counted as unexpected and dropped, so a
+  stale value can never displace the station's real row.
 - Allowance: **ceil(plants/100) calls per 5 minutes (official)** —
   derived at runtime from the plant count.
 - Documented `dataItemMap` fields: `day_power`, `month_power`,

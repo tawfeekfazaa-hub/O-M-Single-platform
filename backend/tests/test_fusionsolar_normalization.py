@@ -282,3 +282,35 @@ async def test_unexpected_rows_are_excluded_and_counted():
     readings = await adapter.fetch_plant_kpis(["NE=1"])
     assert [r.vendor_plant_id for r in readings] == ["NE=1"]
     assert adapter.last_kpi_diagnostics.unexpected == 1
+
+
+async def test_rows_are_validated_against_their_own_batch():
+    """A row belonging to a later batch must not be accepted by an earlier one.
+
+    Otherwise the misrouted (possibly stale) value wins and the station's
+    real row, arriving in its own batch, is discarded as a duplicate.
+    """
+
+    class CrossBatchClient(ScriptedClient):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.calls = 0
+
+        async def get_station_real_kpi(self, station_codes: list[str]) -> KpiBatchResult:
+            self._counts.station_real_kpi += 1
+            self.calls += 1
+            value = 999.0 if self.calls == 1 else 1.0
+            # Batch 1 (NE=0..99) wrongly carries NE=100, which is batch 2's.
+            return KpiBatchResult(
+                rows=[kpi_row("NE=100", day_power=value)], vendor_current_time_ms=VENDOR_MS
+            )
+
+    client = CrossBatchClient()
+    adapter = real_adapter(client)
+    readings = await adapter.fetch_plant_kpis([f"NE={i}" for i in range(150)])
+
+    assert len(readings) == 1
+    assert readings[0].daily_energy_kwh == 1.0  # the row from its OWN batch won
+    diag = adapter.last_kpi_diagnostics
+    assert diag.unexpected == 1  # the misrouted row was rejected and counted
+    assert diag.duplicates == 0  # the correct row was never treated as a dup

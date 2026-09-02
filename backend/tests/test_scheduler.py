@@ -4,6 +4,7 @@ from typing import ClassVar
 
 from app.adapters.base import (
     AdapterError,
+    AdapterProtocolError,
     AdapterRateLimitError,
     AdapterTransientError,
     PlantInfo,
@@ -329,6 +330,7 @@ async def test_incomplete_pagination_never_replaces_the_stored_inventory(
     """
     server = StationListServer(pages=[[station_row(1)], [station_row(2)]])
     server.total_override = 3  # promises one more station than it ever serves
+    server.serve_kpi = True  # KPI polling must keep running through the failure
     client = make_station_list_client(server)
     adapter = FusionSolarAdapter(client, allow_synthetic_fields=False)
 
@@ -350,11 +352,21 @@ async def test_incomplete_pagination_never_replaces_the_stored_inventory(
     scheduler = make_scheduler(adapter, repository)
     result = await scheduler.run_cycle()
 
-    assert result.error is not None  # the cycle failed, loudly
+    # The failure is recorded and the cycle is NOT a complete success, but it
+    # does not abort KPI polling and does not retry the inventory next cycle
+    # (that would spend page 1 of the budget every cycle).
+    assert result.inventory_error is not None
     assert not result.inventory_refreshed
+    assert not result.complete_success
     assert result.plants_upserted == 0
+    assert result.readings_written > 0  # monitoring continued
     # The stored fleet is untouched — no plant was dropped or rewritten.
     assert [(p.id, p.vendor_plant_id, p.name) for p in await repository.list_plants()] == before
+
+    # Second cycle: the refresh is deferred, not attempted again.
+    pages_before = len(server.requests)
+    await scheduler.run_cycle()
+    assert len(server.requests) == pages_before
     await client.close()
 
 
@@ -596,3 +608,49 @@ async def test_restart_without_a_snapshot_polls_provisionally(repository: InMemo
     result = await scheduler.run_cycle()
     assert result.inventory_refreshed and not result.inventory_provisional
     assert result.requested_plants == 3 and result.complete_success
+
+
+async def test_guard_exceeded_inventory_defers_instead_of_retrying_every_cycle(
+    repository: InMemoryRepository,
+):
+    """An inventory too large for the budget must not be retried every cycle.
+
+    The guard raises after ONE call by design; retrying it on the next cycle
+    would spend page 1 of the station-list budget over and over until the
+    window is exhausted, and aborting the cycle would stop KPI monitoring
+    with it.
+    """
+
+    class GuardFailAdapter(FusionSolarAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+            )
+            self.list_calls = 0
+
+        async def list_plants(self) -> list[PlantInfo]:
+            self.list_calls += 1
+            raise AdapterProtocolError(
+                "station list needs 5 pages but the effective guard is 4; "
+                "raise FUSIONSOLAR_STATION_LIST_MAX_CALLS"
+            )
+
+    await repository.upsert_plants(await mock_adapter().list_plants())
+    adapter = GuardFailAdapter()
+    clock = FakeClock()
+    scheduler = make_scheduler(adapter, repository, clock=clock)
+
+    result = await scheduler.run_cycle()
+    assert result.inventory_error is not None and not result.complete_success
+    assert result.error is None  # the cycle itself did not abort
+    assert result.readings_written == 3  # KPI polling continued
+    assert scheduler.next_delay(result) == 300.0  # normal interval, no backoff
+
+    for tick in (300.0, 600.0, 900.0):
+        clock.now = tick
+        await scheduler.run_cycle()
+    assert adapter.list_calls == 1  # deferred, not retried every cycle
+
+    clock.now = 21_601.0  # after the inventory cadence it may try again
+    await scheduler.run_cycle()
+    assert adapter.list_calls == 2
