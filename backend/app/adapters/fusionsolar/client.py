@@ -174,6 +174,17 @@ def _parse_retry_after(value: str | None) -> float | None:
     return _plausible_delay(max(delta, 0.0)) if math.isfinite(delta) else None
 
 
+def _is_success(payload: dict[str, Any]) -> bool:
+    """The success discriminator must be an actual JSON boolean.
+
+    Truthiness would read ``"success": "false"`` — a non-empty string — as a
+    success and ingest the error envelope's ``data`` as if it were plant
+    data, and ``1`` as a valid session. A malformed claim of success is not
+    a success.
+    """
+    return payload.get("success") is True
+
+
 def _station_signature(rows: list[dict[str, Any]]) -> tuple[Any, ...]:
     return tuple(row.get("stationCode") for row in rows)
 
@@ -205,6 +216,11 @@ class RealFusionSolarClient:
         self._token: str | None = None
         self._login_lock = asyncio.Lock()
         self._counts = ClientCallCounts()
+        # Pages the LAST station-list attempt advertised on page 1, kept
+        # even when the attempt then failed: the retry restarts at page 1
+        # and needs them all, so the caller must reserve that many slots,
+        # not merely the ones the failed attempt happened to spend.
+        self.last_advertised_pages = 0
         self._max_pages = max_station_list_pages
         # Optional absolute ceiling on requests sent by this client instance,
         # enforced at the transport level so that NO path — including the
@@ -308,13 +324,27 @@ class RealFusionSolarClient:
 
     @staticmethod
     def _fail_code(payload: dict[str, Any]) -> int:
+        """The failCode as the vendor sent it, or 0 for anything unusable.
+
+        This value decides whether we spend a login on a re-authentication
+        (305) or stand down for a whole endpoint window (407), so it is read
+        strictly rather than coerced: JSON ``305.9`` truncated to 305 would
+        buy a re-login the vendor never asked for, and textual ``"407"``
+        would defer ingestion on a code we did not actually receive. Bool is
+        excluded for the same reason it is everywhere else — ``True`` is not
+        the code 1. Anything unusable means "not one of the codes we act on"
+        and never an exception outside the adapter taxonomy, which would
+        take the scheduler task down.
+        """
+        raw = payload.get("failCode")
+        if raw is None or isinstance(raw, bool) or not isinstance(raw, int | float):
+            return 0
+        if isinstance(raw, float) and not raw.is_integer():
+            return 0
         try:
-            return int(payload.get("failCode") or 0)
-        except (TypeError, ValueError, OverflowError):
-            # OverflowError: JSON 1e309 decodes to infinity, which int()
-            # refuses. Like any other unusable failCode it means "not one of
-            # the codes we act on" — never an exception outside the adapter
-            # taxonomy, which would take the scheduler task down.
+            return int(raw)
+        except (OverflowError, ValueError):
+            # JSON 1e309 decodes to infinity, which int() refuses.
             return 0
 
     async def login(self) -> None:
@@ -340,7 +370,7 @@ class RealFusionSolarClient:
                 {"userName": self._username, "systemCode": self._system_code},
             )
             payload = self._payload_from(Endpoint.LOGIN, "/login", response)
-            if not payload.get("success"):
+            if not _is_success(payload):
                 fail_code = self._fail_code(payload)
                 if fail_code == FAIL_CODE_RATE_LIMITED:
                     raise AdapterRateLimitError(
@@ -387,7 +417,7 @@ class RealFusionSolarClient:
         for attempt in (1, 2):
             response = await self._post(endpoint, path, json, consume_budget=attempt == 1)
             payload = self._payload_from(endpoint, path, response)
-            if payload.get("success"):
+            if _is_success(payload):
                 return payload
             fail_code = self._fail_code(payload)
             if fail_code == FAIL_CODE_RATE_LIMITED:
@@ -459,6 +489,7 @@ class RealFusionSolarClient:
 
     async def list_stations(self) -> StationListResult:
         stations: list[dict[str, Any]] = []
+        self.last_advertised_pages = 1  # a direct list is one complete call
         seen: dict[str, dict[str, Any]] = {}
         duplicates_removed = 0
         variant: str | None = None
@@ -515,6 +546,7 @@ class RealFusionSolarClient:
                     page_count = echoed_page_count
                     page_size = echoed_page_size
                     total = echoed_total
+                    self.last_advertised_pages = echoed_page_count
                     # Page 1 is the first moment the burst size is known.
                     # Starting a burst the budget cannot finish spends
                     # calls on an inventory that is never retrieved, and

@@ -639,3 +639,44 @@ async def test_an_unauthorized_status_drops_the_session(status: int):
     assert excinfo.value.blocks_authentication is True
     assert client.is_logged_in() is False
     await client.close()
+
+
+@pytest.mark.parametrize("claim", ["false", "true", 1, 0, [], {}])
+async def test_a_non_boolean_success_claim_is_not_a_success(claim: object):
+    # Truthiness would read "success": "false" — a non-empty string — as a
+    # success and ingest the error envelope's data as plant data.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/login"):
+            return httpx.Response(
+                200, json={"success": True, "failCode": 0}, headers={XSRF_HEADER: TOKEN}
+            )
+        return httpx.Response(200, json={"success": claim, "failCode": 0, "data": []})
+
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username=USERNAME,
+        system_code=SYSTEM_CODE,
+        policy=generous_policy(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AdapterError):  # never a certified empty inventory
+        await client.list_stations()
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (305, 305),
+        (407, 407),
+        (305.0, 305),  # an integral float is still that code
+        (305.9, 0),  # truncation would buy a re-login the vendor never asked for
+        ("407", 0),  # text would defer ingestion on a code we never received
+        (True, 0),
+        (None, 0),
+    ],
+)
+def test_fail_codes_are_read_strictly(raw: object, expected: int):
+    # The failCode decides whether a scarce login is spent (305) or the
+    # scheduler stands down for a whole window (407).
+    assert RealFusionSolarClient._fail_code({"failCode": raw}) == expected

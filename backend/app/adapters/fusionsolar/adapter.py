@@ -54,6 +54,10 @@ class InventoryDiagnostics:
     variant: str = ""
     duplicates_removed: int = 0
     calls_consumed: int = 0
+    # Pages the vendor advertised on page 1. The retry restarts at page 1,
+    # so this — not the calls a failed attempt happened to spend — is what
+    # the next attempt needs.
+    pages_advertised: int = 0
     # Stations whose capacity was present but unreadable. Counted, never
     # written: an unreadable value must not replace a good stored one.
     invalid_capacity: int = 0
@@ -189,6 +193,7 @@ class FusionSolarAdapter(VendorAdapter):
             # would send it into a budget that cannot carry it.
             self.last_inventory_diagnostics = InventoryDiagnostics(
                 calls_consumed=self._client.call_counts().station_list - before,
+                pages_advertised=getattr(self._client, "last_advertised_pages", 0),
                 failed=True,
             )
             raise
@@ -220,6 +225,7 @@ class FusionSolarAdapter(VendorAdapter):
             )
         self.last_inventory_diagnostics = InventoryDiagnostics(
             invalid_capacity=capacity_check.invalid_values,
+            pages_advertised=getattr(self._client, "last_advertised_pages", 0),
             stations=len(plants),
             pages_retrieved=result.pages_retrieved,
             variant=result.variant,

@@ -513,6 +513,73 @@ async def test_a_growing_inventory_waits_for_the_earlier_bursts_to_expire(
     await client.close()
 
 
+async def test_a_failed_refresh_reserves_the_pages_the_retry_needs(
+    repository: InMemoryRepository,
+):
+    # A 3-page inventory that fails on page 2 spent two calls, but the retry
+    # restarts at page 1 and needs three. Sizing the reservation from what
+    # the failure happened to spend accepts the 6 h cadence, spends page 1
+    # again and only then discovers the rest cannot fit.
+    hour = 3600.0
+    clock = FakeClock()
+    server = StationListServer(
+        [
+            [station_row(i) for i in range(100)],
+            [station_row(i) for i in range(100, 200)],
+            [station_row(200)],
+        ]
+    )
+    server.serve_kpi = True
+    server.page_size_per_page = {2: 50}  # contract violation on page 2
+    client = make_station_list_client(server, station_list_max_calls=4, clock=clock)
+    scheduler = IngestionScheduler(
+        FusionSolarAdapter(client, allow_synthetic_fields=True),
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=24 * hour,
+        clock=clock,
+    )
+
+    result = await scheduler.run_cycle()
+    assert result.inventory_error is not None
+    assert len(server.requests) == 2  # it stopped on page 2
+    # The two station-list calls it spent are visible in the cycle totals.
+    assert result.calls_consumed >= 2
+
+    clock.now = 6 * hour  # the plain cadence would retry here and waste page 1
+    assert not scheduler._inventory_due()
+    clock.now = 24 * hour  # a full 3-page burst fits again
+    assert scheduler._inventory_due()
+    await client.close()
+
+
+async def test_a_partial_kpi_fetch_reports_the_rows_it_did_return(
+    repository: InMemoryRepository,
+):
+    # Batch 1 returns rows, batch 2 raises: the readings are discarded, but
+    # hiding that the vendor answered at all makes the failure look total.
+    class PartialKpiAdapter(FusionSolarAdapter):
+        async def fetch_plant_kpis(self, vendor_plant_ids: list[str]) -> list[PlantKpiReading]:
+            self.last_kpi_diagnostics = KpiDiagnostics(
+                requested=len(vendor_plant_ids), returned=100, batches=1, calls_consumed=1
+            )
+            raise AdapterTransientError("vendor failed the second batch")
+
+    await repository.upsert_plants(
+        [PlantInfo(vendor="fusionsolar", vendor_plant_id="NE=1", name="x")]
+    )
+    scheduler = IngestionScheduler(
+        PartialKpiAdapter(
+            MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+        ),
+        repository,
+    )
+    result = await scheduler.run_cycle()
+    assert result.error is not None
+    assert result.readings_returned == 100  # the partial answer is visible
+    assert result.readings_written == 0  # and none of it was stored
+
+
 async def test_a_new_refresh_failure_replaces_the_previous_reason(
     repository: InMemoryRepository,
 ):

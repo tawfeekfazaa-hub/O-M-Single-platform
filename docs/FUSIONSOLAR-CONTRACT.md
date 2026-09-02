@@ -135,8 +135,10 @@ mask authentication/version errors).
   holds its slot until it expires — because the retry restarts at page 1;
   a hint covering only the missing pages lets each attempt spend the slot
   that just freed and stop at the same place, indefinitely. A refresh that fails part-way has still spent its calls,
-  so its slots are recorded like a successful burst's and the deferral
-  covers them — otherwise the retry walks into a budget that cannot carry
+  so its slots are recorded like a successful burst's, counted in the
+  cycle's call total, and the deferral RESERVES the pages the vendor
+  advertised rather than the ones the failure happened to spend (the retry
+  restarts at page 1 and needs them all) — otherwise the retry walks into a budget that cannot carry
   it, wastes another call and extends the staleness it was meant to end.
   `pages` here means BUDGET SLOTS, not HTTP attempts: the retry after a
   failCode 305 reuses the slot its rejected attempt already paid for, so it
@@ -273,7 +275,11 @@ mask authentication/version errors).
   value through any CONVERSION: 1e308 MW is finite but overflows to
   infinity in kWp, and what gets stored is what has to be checked. Integer
   codes and pagination metadata must arrive as JSON NUMBERS — `"3"` is
-  text, not the healthy code, and `pageCount: "2"` is not a page count.
+  text, not the healthy code, `pageCount: "2"` is not a page count, and
+  `failCode: 305.9` is not a session expiry (truncating it would buy a
+  re-login the vendor never asked for). `success` must be an actual JSON
+  boolean: `"success": "false"` is a non-empty string, and truthiness would
+  ingest the error envelope's `data` as plant data.
 - Ambiguous XSRF-TOKEN cookies (several paths or domains) are an
   authentication failure, not a choice to make: httpx raises
   `CookieConflict`, which is not an `HTTPError`, and picking one could send

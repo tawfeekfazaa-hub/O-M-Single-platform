@@ -224,7 +224,7 @@ class IngestionScheduler:
                 self._earliest_burst_gap(self._last_inventory_at, slots),
             )
 
-    def _failed_deferral(self, deferral: float) -> float:
+    def _failed_deferral(self, deferral: float, result: CycleResult) -> float:
         """Extend a failed refresh's deferral to cover the calls it spent.
 
         A refresh that dies on page 3 has already paid for three slots, and
@@ -234,20 +234,30 @@ class IngestionScheduler:
         inventory stale for longer than simply waiting. The failed burst is
         recorded like a successful one and the wait covers it.
         """
-        slots = self._record_failed_burst()
-        if slots is None:
+        needed = self._record_failed_burst(result)
+        if needed is None:
             return deferral
-        now = self._clock()
-        return max(deferral, self._earliest_burst_gap(now, slots))
+        return max(deferral, self._earliest_burst_gap(self._clock(), needed))
 
-    def _record_failed_burst(self) -> int | None:
-        """Book the calls a failed refresh spent; None when not tracking."""
+    def _record_failed_burst(self, result: CycleResult | None = None) -> int | None:
+        """Book a failed refresh: what it spent, and what a retry will need.
+
+        The calls it spent go on the cycle result (they came out of the same
+        Huawei budget as a successful refresh's). The RESERVATION is sized
+        from the pages the vendor advertised, because the retry restarts at
+        page 1 and needs them all: sizing it from the two calls a 3-page
+        refresh managed before failing would accept a 6 h deferral, spend
+        page 1 again, and discover only then that the rest cannot fit.
+        """
+        diag = getattr(self._adapter, "last_inventory_diagnostics", None)
+        spent = max(getattr(diag, "calls_consumed", 0) or 0, 1)
+        if result is not None:
+            result.calls_consumed += getattr(diag, "calls_consumed", 0) or 0
         if not (self._station_list_max_calls and self._station_list_window):
             return None
-        diag = getattr(self._adapter, "last_inventory_diagnostics", None)
-        slots = max(getattr(diag, "calls_consumed", 0) or 0, 1)
-        self._record_inventory_burst(self._clock(), slots)
-        return slots
+        needed = max(getattr(diag, "pages_advertised", 0) or 0, spent)
+        self._record_inventory_burst(self._clock(), spent)
+        return needed
 
     def _record_inventory_burst(self, at: float, slots: int) -> None:
         """Remember one refresh's budget slots; forget what has aged out."""
@@ -314,6 +324,7 @@ class IngestionScheduler:
         diag = getattr(self._adapter, "last_kpi_diagnostics", None)
         if diag is None:
             return
+        result.readings_returned = diag.returned
         result.readings_missing = diag.missing
         result.readings_duplicate = diag.duplicates
         result.readings_unexpected = diag.unexpected
@@ -347,7 +358,7 @@ class IngestionScheduler:
                         # another request on the endpoint the vendor just
                         # throttled. The whole cycle backs off instead, on
                         # the vendor's own delay.
-                        self._record_failed_burst()
+                        self._record_failed_burst(result)
                         raise
                     # A plain limiter hint frees ONE slot, which is not
                     # enough for a paginated refresh: retrying then would
@@ -363,7 +374,9 @@ class IngestionScheduler:
                         exc, "retry_after_covers_whole_attempt", False
                     ):
                         deferral = max(deferral, self._station_list_window)
-                    self._inventory_not_before = self._clock() + self._failed_deferral(deferral)
+                    self._inventory_not_before = self._clock() + self._failed_deferral(
+                        deferral, result
+                    )
                     logger.warning(
                         "inventory refresh rate-limited, deferred; KPI polling continues"
                     )
@@ -381,10 +394,10 @@ class IngestionScheduler:
                         # re-login after failCode 305 can time out or answer
                         # 5xx just as it can be throttled. Polling on would
                         # log in again into the same outage.
-                        self._record_failed_burst()
+                        self._record_failed_burst(result)
                         raise
                     self._inventory_not_before = self._clock() + self._failed_deferral(
-                        max(self._inventory_refresh, self._inventory_min_spacing)
+                        max(self._inventory_refresh, self._inventory_min_spacing), result
                     )
                     logger.warning(
                         "inventory refresh failed (%s), deferred; KPI polling continues",
