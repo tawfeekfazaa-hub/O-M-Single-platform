@@ -11,7 +11,11 @@ Two independent cadences (docs/FUSIONSOLAR-CONTRACT.md):
   for a one-page inventory on the 4/day safety default). A rate-limited
   refresh defers itself and never aborts KPI polling for the cycle;
 - real-time KPI polling — every cycle, reading the plant list from the
-  repository cache and fetching KPIs in sequential batches.
+  repository cache and fetching KPIs in sequential batches. Only the
+  stations of the last SUCCESSFUL inventory are polled; before the first
+  successful refresh of a process the persisted plants are polled
+  provisionally (flagged on the cycle) so a restart never blacks out
+  monitoring.
 
 On rate-limit or transient vendor errors the scheduler backs off
 exponentially with jitter instead of hammering the API. Clock/sleep/
@@ -46,6 +50,11 @@ class CycleResult:
     inventory_refreshed: bool = False
     inventory_pages: int = 0
     inventory_rate_limited: bool = False
+    # True when KPI polling ran against the repository WITHOUT a confirmed
+    # inventory from this process (restart before the first successful
+    # station-list refresh). Such a cycle may still poll stations the vendor
+    # has retired, so its "missing" count is not necessarily a data problem.
+    inventory_provisional: bool = False
     plants_upserted: int = 0
     requested_plants: int = 0
     readings_returned: int = 0
@@ -224,6 +233,22 @@ class IngestionScheduler:
             if self._current_inventory is not None:
                 # Restrict to the last inventory the vendor actually served.
                 codes = [c for c in codes if c in self._current_inventory]
+            else:
+                # No confirmed inventory yet (fresh process, and the first
+                # refresh has not succeeded — e.g. it was rate-limited).
+                # Poll the persisted plants anyway: for an O&M platform a
+                # monitoring blackout is far worse than briefly polling a
+                # station the vendor has retired, and the set self-corrects
+                # at the first successful refresh. Flagged so the cycle's
+                # "missing" count is not mistaken for a data fault.
+                # PR-2 persists the inventory snapshot and removes this gap.
+                result.inventory_provisional = True
+                if codes:
+                    logger.warning(
+                        "KPI polling on a PROVISIONAL inventory (no confirmed "
+                        "station list yet): plants=%d",
+                        len(codes),
+                    )
             result.requested_plants = len(codes)
             if codes:
                 readings = await self._adapter.fetch_plant_kpis(codes)

@@ -550,3 +550,49 @@ async def test_retry_after_is_never_scaled_down_by_jitter(repository: InMemoryRe
     )
     result = await jittered.run_cycle()
     assert jittered.next_delay(result) == 750.0  # 1000 * 0.75
+
+
+async def test_restart_without_a_snapshot_polls_provisionally(repository: InMemoryRepository):
+    """A restart must not black out monitoring, and must say so.
+
+    With a persistent repository the scheduler starts with no confirmed
+    inventory. If the first station-list refresh is rate-limited, KPI
+    polling still runs against the persisted plants (an O&M blackout would
+    be far worse than briefly polling a retired station) and the cycle is
+    flagged provisional so its "missing" count is not read as a data fault.
+    """
+
+    class InventoryLimitedAdapter(FusionSolarAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+            )
+
+        async def list_plants(self) -> list[PlantInfo]:
+            raise AdapterRateLimitError("budget exhausted", retry_after_seconds=86_400.0)
+
+    await repository.upsert_plants(
+        [
+            PlantInfo(
+                vendor="fusionsolar",
+                vendor_plant_id=code,
+                name=code,
+                capacity_kwp=1000.0,
+                address=None,
+            )
+            for code in ("NE=MOCK001", "NE=MOCK002", "NE=MOCK003", "NE=RETIRED")
+        ]
+    )
+    scheduler = make_scheduler(InventoryLimitedAdapter(), repository)
+    result = await scheduler.run_cycle()
+
+    assert result.inventory_rate_limited and result.inventory_provisional
+    assert result.requested_plants == 4  # monitoring continues
+    assert result.readings_written == 3  # the retired station answers nothing
+
+    # A confirmed inventory clears the flag and the retired station with it.
+    scheduler._adapter = mock_adapter()
+    scheduler._inventory_not_before = None
+    result = await scheduler.run_cycle()
+    assert result.inventory_refreshed and not result.inventory_provisional
+    assert result.requested_plants == 3 and result.complete_success

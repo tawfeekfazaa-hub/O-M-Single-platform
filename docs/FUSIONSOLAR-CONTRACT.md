@@ -105,6 +105,15 @@ mask authentication/version errors).
   persistence has no delete, so a station the vendor drops keeps its
   repository row; polling it would mark every later cycle partial and
   waste KPI capacity on a station the vendor will never answer for.
+  **Restart gap (accepted, tracked for PR-2):** the inventory snapshot
+  lives in the process, so after a restart — before the first successful
+  station-list refresh — the persisted plants are polled *provisionally*
+  and the cycle is flagged `inventory_provisional`. Blocking KPI polling
+  until a snapshot exists was rejected: a station-list budget that is
+  already spent would then black out monitoring of every real plant for up
+  to a full window, which is far worse than briefly polling a retired one.
+  The set self-corrects at the first successful refresh; PR-2 persists the
+  snapshot and closes the gap for good.
 - A refresh rejected by the budget never aborts KPI polling, and defers
   itself by a **full window** rather than the limiter's next-slot hint:
   one freed slot is not enough for a paginated refresh, so retrying earlier
