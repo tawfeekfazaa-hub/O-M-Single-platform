@@ -185,6 +185,27 @@ def _is_success(payload: dict[str, Any]) -> bool:
     return payload.get("success") is True
 
 
+def _json_equal(left: Any, right: Any) -> bool:
+    """Equality that never confuses JSON ``true``/``false`` with ``1``/``0``.
+
+    Python says ``True == 1``, so a plain ``==`` reads a station row whose
+    capacity is the boolean ``true`` as identical to one reporting 1 MW.
+    Two rows that CONFLICT would then be silently de-duplicated: whichever
+    arrived first wins, so a boolean copy can displace a valid capacity —
+    which is counted invalid downstream and never written, leaving the
+    stored value stale while the envelope passes as a clean inventory.
+    """
+    if isinstance(left, bool) is not isinstance(right, bool):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_json_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _json_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return bool(left == right)
+
+
 class RealFusionSolarClient:
     """Talks to the FusionSolar Northbound API over HTTPS (real mode only).
 
@@ -612,7 +633,7 @@ class RealFusionSolarClient:
                     raise AdapterProtocolError("station list row lacks stationCode")
                 code = str(code)
                 if code in seen:
-                    if seen[code] == row:
+                    if _json_equal(seen[code], row):
                         duplicates_removed += 1
                         continue
                     raise AdapterProtocolError(

@@ -206,14 +206,15 @@ class IngestionScheduler:
             result.inventory_pages = diag.pages_retrieved
             result.inventory_invalid_capacity = getattr(diag, "invalid_capacity", 0)
             result.calls_consumed += diag.calls_consumed
-            # Budget SLOTS, not transport attempts. One logical page request
-            # reserves exactly one station-list slot; the retry after a
-            # failCode 305 deliberately reuses the slot its rejected attempt
-            # already paid for, so it raises calls_consumed (an HTTP counter,
-            # kept for diagnostics) without costing budget. Spacing derived
-            # from that counter would read a one-page refresh as a two-slot
-            # burst and stretch the next refresh from 6 h to 12 h.
-            slots = max(diag.pages_retrieved, 1)
+            # Budget slots, and EVERY request charges one — the retry after a
+            # failCode 305 included. Pacing from the logical page count
+            # undercounts such a refresh: a 2-page inventory that retried
+            # page 1 holds three slots, but a page-derived 12 h spacing
+            # leaves only one free when the next refresh starts, so it spends
+            # page 1, fails its remaining-page pre-flight, and leaves the
+            # inventory stale. The pages floor keeps the estimate honest if a
+            # counter ever reads low.
+            slots = max(diag.calls_consumed, diag.pages_retrieved, 1)
         if self._station_list_max_calls and self._station_list_window:
             self._record_inventory_burst(self._last_inventory_at, slots)
             # Pacing keeps the budget spread over the window; availability

@@ -689,3 +689,33 @@ async def test_distinct_pages_that_merely_look_alike_are_not_rejected():
     result = await client.list_stations()
     assert [s["stationCode"] for s in result.stations] == ["NE=1", "NE=2", "NE=3"]
     await client.close()
+
+
+async def test_a_boolean_capacity_is_not_the_same_row_as_a_numeric_one():
+    # Python says True == 1, so plain dict equality read a row whose capacity
+    # is the boolean `true` as identical to one reporting 1 MW. Two rows that
+    # CONFLICT were then silently de-duplicated: the boolean copy could
+    # displace the valid capacity, which is counted invalid downstream and
+    # never written, leaving the stored capacity stale while the envelope
+    # passed as a clean inventory.
+    numeric = station(1, capacity=1)
+    boolean = station(1, capacity=True)
+    for pair in ([numeric, boolean], [boolean, numeric]):
+        server = StationListServer([list(pair)])
+        server.total_override = 1
+        client = make_client(server)
+        with pytest.raises(AdapterProtocolError, match="conflicting duplicate"):
+            await client.list_stations()
+        await client.close()
+
+
+async def test_a_genuinely_identical_duplicate_row_is_still_removed():
+    # The type-sensitive comparison must not turn ordinary de-duplication
+    # into a protocol error: byte-identical rows are still one station.
+    server = StationListServer([[station(1), station(1)]])
+    server.total_override = 1
+    client = make_client(server)
+    result = await client.list_stations()
+    assert [s["stationCode"] for s in result.stations] == ["NE=1"]
+    assert result.duplicates_removed == 1
+    await client.close()

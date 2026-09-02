@@ -429,14 +429,14 @@ async def test_spacing_reserves_a_whole_burst_in_the_rolling_window(
     assert (await scheduler.run_cycle()).inventory_refreshed
 
 
-async def test_inventory_spacing_counts_budget_slots_not_transport_attempts(
+async def test_inventory_spacing_counts_every_request_the_refresh_charged(
     repository: InMemoryRepository,
 ):
-    # A station-list request rejected with failCode 305 retries after a
-    # re-login on the slot the rejected attempt already paid for. The extra
-    # HTTP attempt lands in calls_consumed but costs no budget, so pacing
-    # from that counter would read a one-page refresh as a two-slot burst
-    # and stretch the next refresh from 6 h to 12 h.
+    # EVERY request charges a station-list slot, the retry after a failCode
+    # 305 included, so a one-page refresh that retried holds TWO. Pacing from
+    # the logical page count would schedule the next refresh at 6 h with only
+    # two slots free of the four; a two-slot burst then spends page 1, fails
+    # its remaining-page pre-flight, and leaves the inventory stale.
     class RetriedOnceAdapter(FusionSolarAdapter):
         async def list_plants(self) -> list[PlantInfo]:
             plants = await super().list_plants()
@@ -454,9 +454,9 @@ async def test_inventory_spacing_counts_budget_slots_not_transport_attempts(
     )
     result = await scheduler.run_cycle()
     assert result.inventory_refreshed
-    assert result.inventory_pages == 1  # one logical page == one budget slot
-    assert result.calls_consumed >= 2  # transport attempts still diagnosed
-    assert scheduler._inventory_min_spacing == 21_600.0  # 4 bursts/day, not 2
+    assert result.inventory_pages == 1  # one LOGICAL page ...
+    assert result.calls_consumed >= 2  # ... but two charged requests
+    assert scheduler._inventory_min_spacing == 43_200.0  # paced for 2 slots, not 1
 
 
 def test_absurd_station_list_budget_derives_no_spacing(repository: InMemoryRepository):

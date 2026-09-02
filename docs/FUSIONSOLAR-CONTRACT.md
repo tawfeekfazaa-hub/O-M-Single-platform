@@ -98,7 +98,13 @@ mask authentication/version errors).
   reversed(A) yields three distinct signatures for the same stations.
   What a page CONTRIBUTED does not depend on how its rows are ordered; deterministic `stationCode` dedup (the
   unique count, not the row count, is what `total` is checked against);
-  conflicting duplicates rejected; malformed pages never skipped silently.
+  conflicting duplicates rejected — compared TYPE-SENSITIVELY, because
+  Python reads `True == 1` and a row whose capacity is the boolean `true`
+  is not the row reporting 1 MW: treating them as identical de-duplicates a
+  genuine conflict, and the boolean copy can displace the valid capacity,
+  which is then counted invalid, never written, and leaves the stored value
+  stale behind a clean-looking inventory; malformed pages never skipped
+  silently.
   An EMPTY page is coherent only for an empty fleet (`total = 0`) — an
   empty page anywhere in a non-empty inventory, terminal one included, is
   rejected: accepting it would certify a contradictory envelope, waste a
@@ -174,8 +180,12 @@ mask authentication/version errors).
   checks reject. A page the client refused is worth no more as an estimate
   than a page that never arrived — otherwise the retry walks into a budget that cannot carry
   it, wastes another call and extends the staleness it was meant to end.
-  `pages` here means BUDGET SLOTS. Every request charges one, the retry
-  after a failCode 305 included, so slots and HTTP attempts now agree.
+  `pages` here means BUDGET SLOTS, and every request charges one — the retry
+  after a failCode 305 included — so a burst is sized from the requests the
+  refresh CHARGED, never from its logical page count. A 2-page inventory
+  that retried page 1 holds three slots; pacing it as two would leave only
+  one free when the next refresh starts, which spends page 1 and then fails
+  its remaining-page pre-flight.
 - KPI polling covers the LAST SUCCESSFUL inventory only. Phase-1
   persistence has no delete, so a station the vendor drops keeps its
   repository row; polling it would mark every later cycle partial and
