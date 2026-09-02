@@ -105,7 +105,16 @@ def normalize_performance_ratio(value: Any, diagnostics: KpiDiagnostics) -> floa
 
 
 def _as_int(value: Any) -> int | None:
+    """Strict integer read: never TRUNCATES a fractional number.
+
+    ``int(3.7)`` would silently become the healthy code 3 and ``int(1.5)``
+    the disconnected code 1, turning an unreadable status into a confidently
+    mapped one. A non-integral number is not an integer code — it is
+    malformed input, and the caller counts it as such.
+    """
     if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
         return None
     try:
         number = int(value)

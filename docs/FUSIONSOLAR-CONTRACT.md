@@ -128,8 +128,11 @@ mask authentication/version errors).
 - `real_health_state`: 1 disconnected, 2 faulty, 3 healthy, else unknown.
   An ABSENT field and a numeric code outside 1/2/3 are both the documented
   "else unknown" case and are not counted as invalid; a value that is
-  present but unreadable (bool, text, NaN, ∞) IS counted, so a malformed
-  response can never be reported as a complete ingestion.
+  present but unreadable (bool, text, NaN, ∞, or a FRACTIONAL number —
+  never truncated, since `3.7` would read as healthy and `1.5` as
+  disconnected) IS counted, so a malformed response can never be reported
+  as a complete ingestion. An integral JSON number such as `3.0` is the
+  integer code 3 and stays valid.
 - **Station-level active power: NOT in the documented contract.** The
   real adapter stores `None` and never derives it from another field.
   (Device-level active power belongs to the device interfaces — later

@@ -152,6 +152,15 @@ async def test_unknown_health_state_maps_to_unknown():
     assert adapter.last_kpi_diagnostics.invalid_values == 0
 
 
+async def test_integral_float_health_state_is_accepted():
+    # 3.0 is the integer code 3 expressed as a JSON number — valid.
+    client = ScriptedClient([kpi_row("NE=1", day_power=1.0, real_health_state=3.0)])
+    adapter = real_adapter(client)
+    (reading,) = await adapter.fetch_plant_kpis(["NE=1"])
+    assert reading.status is PlantStatus.HEALTHY
+    assert adapter.last_kpi_diagnostics.complete
+
+
 async def test_absent_health_state_is_unknown_without_counting():
     client = ScriptedClient([kpi_row("NE=1", day_power=1.0)])
     adapter = real_adapter(client)
@@ -160,7 +169,21 @@ async def test_absent_health_state_is_unknown_without_counting():
     assert adapter.last_kpi_diagnostics.complete
 
 
-@pytest.mark.parametrize("bad", ["broken", True, float("nan"), float("inf"), [3]])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "broken",
+        True,
+        float("nan"),
+        float("inf"),
+        [3],
+        # Fractional numbers must never be truncated into a valid code:
+        # int(3.7) would read as HEALTHY and int(1.5) as DISCONNECTED.
+        3.7,
+        1.5,
+        "3.7",
+    ],
+)
 async def test_malformed_health_state_is_counted_as_invalid(bad: Any):
     # Present but unreadable is malformed data — otherwise the scheduler
     # would report the response as a complete success and persist the
