@@ -337,6 +337,41 @@ async def test_a_partial_copy_never_downgrades_a_clean_one():
     assert diag.invalid_values == 0  # the second copy was never parsed
 
 
+async def test_a_sparser_clean_copy_never_replaces_a_richer_partial_one():
+    # "Clean" is satisfied vacuously by a copy whose fields are simply
+    # ABSENT. Replacing on cleanliness alone let an empty dataItemMap
+    # overwrite a reading holding valid daily energy and a HEALTHY status
+    # with all-None and UNKNOWN — persisted as the plant's latest point and
+    # downgrading its status. A replacement may only ever ADD.
+    rows = [
+        kpi_row("NE=1", day_power=100.0, total_power="bad", real_health_state=3),
+        {"stationCode": "NE=1", "dataItemMap": {}},  # readable, and empty
+    ]
+    adapter = real_adapter(ScriptedClient(rows))
+    (reading,) = await adapter.fetch_plant_kpis(["NE=1"])
+
+    assert reading.daily_energy_kwh == 100.0  # the rich partial row stands
+    assert reading.status is PlantStatus.HEALTHY  # never downgraded
+    diag = adapter.last_kpi_diagnostics
+    assert diag.duplicates == 1  # the emptier copy was an extra
+    assert diag.invalid_values == 1  # the one bad field, counted once
+
+
+async def test_a_clean_copy_that_covers_the_partial_one_still_wins():
+    # The guard above must not block a genuine upgrade: a copy that reads
+    # cleanly AND carries everything the held one carries still replaces it.
+    rows = [
+        kpi_row("NE=1", day_power=100.0, total_power="bad", real_health_state=3),
+        kpi_row("NE=1", day_power=100.0, total_power=5000.0, real_health_state=3),
+    ]
+    adapter = real_adapter(ScriptedClient(rows))
+    (reading,) = await adapter.fetch_plant_kpis(["NE=1"])
+
+    assert (reading.daily_energy_kwh, reading.total_energy_kwh) == (100.0, 5000.0)
+    assert reading.status is PlantStatus.HEALTHY
+    assert adapter.last_kpi_diagnostics.duplicates == 0  # an upgrade, not an extra
+
+
 async def test_a_partial_reading_is_still_kept_when_no_better_copy_arrives():
     # One bad field must not cost the good fields beside it: the row is kept,
     # the bad value dropped and counted, and the station is NOT reported

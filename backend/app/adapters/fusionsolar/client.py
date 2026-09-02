@@ -297,7 +297,15 @@ class RealFusionSolarClient:
                 blocks_authentication=endpoint is Endpoint.LOGIN,
             )
         if status in _RETRYABLE_STATUS:
-            raise AdapterTransientError(f"FusionSolar HTTP {status} on {path}")
+            # A shedding server that names its own delay is telling us the
+            # only thing we could not otherwise know. Read here as well as
+            # on 429: RFC 9110 allows Retry-After on 503 (and on any status
+            # that carries it), and ignoring it lets the next cycle fire an
+            # hour early into a vendor that is still down.
+            raise AdapterTransientError(
+                f"FusionSolar HTTP {status} on {path}",
+                _parse_retry_after(response.headers.get("Retry-After")),
+            )
         if status in _UNAUTHORIZED_STATUS:
             # An expired session delivered as a STATUS rather than failCode
             # 305. Keeping the token would send the next call out with
@@ -398,20 +406,23 @@ class RealFusionSolarClient:
         """Authenticated envelope call: 407 -> rate limit; 305 -> at most one
         controlled re-login and one retry; anything malformed -> protocol error.
 
-        Budget accounting: one logical call reserves exactly ONE slot of its
-        endpoint's budget. The post-re-login retry after a failCode 305 reuses
-        the slot already paid for by the rejected attempt (the re-login itself
-        spends the login budget as usual) — otherwise a session expiry on a
-        fully-derived budget (e.g. KPI with <=100 plants) could never retry
-        and would drop the whole cycle. Worst case this sends one extra HTTP
-        request per session expiry (~30 min); whether Huawei counts rejected
-        requests against the quota is `unverified` (docs/FUSIONSOLAR-CONTRACT.md).
+        Budget accounting: EVERY request charges a slot of its endpoint's
+        budget, the post-re-login retry included. Reusing the rejected
+        attempt's slot would put two physical requests inside a one-call
+        window — and whether Huawei counts a rejected request against the
+        quota is `unverified` (docs/FUSIONSOLAR-CONTRACT.md), so the client
+        cannot assume the cheaper reading of its own hard limit. When no slot
+        is free the retry is DEFERRED instead: `acquire()` raises a rate-limit
+        error carrying the wait, the scheduler backs off, and the token the
+        re-login just obtained is kept for the next cycle, so the login is not
+        wasted. The cost is a delayed KPI batch on session expiry (~30 min);
+        the alternative risks the 407 throttle this client exists to avoid.
         """
         if self._token is None:
             await self.login()
 
         for attempt in (1, 2):
-            response = await self._post(endpoint, path, json, consume_budget=attempt == 1)
+            response = await self._post(endpoint, path, json)
             payload = self._payload_from(endpoint, path, response)
             if _is_success(payload):
                 return payload
@@ -499,14 +510,6 @@ class RealFusionSolarClient:
         # only estimate there is, and a page-1 timeout would otherwise
         # report one page for an inventory known to need four.
         seen: dict[str, dict[str, Any]] = {}
-        # EVERY non-empty page seen so far, not just the previous one: a
-        # vendor serving A, B, A passes an adjacent-pages check, the repeat
-        # is quietly dedup'd, and an envelope whose `total` happens to match
-        # the unique count is then certified complete — with pages_retrieved
-        # inflated to 3, which stretches the next refresh (12 h -> 24 h on
-        # the 4/day default). Signatures are built from the NORMALIZED codes
-        # collected below, so they are always hashable.
-        page_signatures: set[tuple[str, ...]] = set()
         duplicates_removed = 0
         variant: str | None = None
         page_no = 1
@@ -600,7 +603,7 @@ class RealFusionSolarClient:
             else:
                 raise AdapterProtocolError("station list data is neither a list nor an object")
 
-            page_codes: list[str] = []
+            new_on_this_page = 0
             for row in rows:
                 if not isinstance(row, dict):
                     raise AdapterProtocolError("station list row is not an object")
@@ -608,7 +611,6 @@ class RealFusionSolarClient:
                 if not code:
                     raise AdapterProtocolError("station list row lacks stationCode")
                 code = str(code)
-                page_codes.append(code)
                 if code in seen:
                     if seen[code] == row:
                         duplicates_removed += 1
@@ -618,12 +620,22 @@ class RealFusionSolarClient:
                     )
                 seen[code] = row
                 stations.append(row)
+                new_on_this_page += 1
 
-            if page_codes:
-                signature = tuple(page_codes)
-                if signature in page_signatures:
-                    raise AdapterProtocolError("station list repeated an identical page")
-                page_signatures.add(signature)
+            if rows and not new_on_this_page:
+                # A non-empty page that adds NOTHING is a page we already
+                # have. Comparing signatures instead — even across the whole
+                # run — is order-sensitive: A, B, reversed(A) produces three
+                # distinct tuples, the repeat is quietly de-duplicated, and
+                # an envelope whose `total` happens to equal the unique count
+                # is then certified complete with pages_retrieved inflated to
+                # 3, which stretches the next refresh (12 h -> 24 h on the
+                # 4/day default). Counting what the page CONTRIBUTED catches
+                # the repeat however its rows are ordered.
+                raise AdapterProtocolError(
+                    f"station list page {page_no} repeated stations already "
+                    "retrieved and contributed none of its own"
+                )
 
             if page_no == 1:
                 pages_needed = page_count or 0

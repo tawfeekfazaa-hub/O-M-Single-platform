@@ -79,7 +79,26 @@ class AdapterAuthError(AdapterError):
 
 class AdapterTransientError(AdapterError):
     """Timeout, connection failure, or retryable 5xx — safe to retry LATER
-    (after scheduler backoff), never immediately."""
+    (after scheduler backoff), never immediately.
+
+    ``retry_after_seconds`` carries the delay the SERVER asked for when it
+    sent one (``Retry-After`` on a 503, say). Discarding it left the
+    scheduler with only its own backoff, which can be far shorter than the
+    hour the vendor requested — so the next request goes out while the
+    vendor is still shedding load, exactly when it can least afford it.
+    Like the rate-limit hint, it is a lower bound the scheduler widens but
+    never shortens.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        retry_after_seconds: float | None = None,
+        *,
+        blocks_authentication: bool = False,
+    ) -> None:
+        super().__init__(message, blocks_authentication=blocks_authentication)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class AdapterProtocolError(AdapterError):

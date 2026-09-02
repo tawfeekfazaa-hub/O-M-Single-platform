@@ -465,6 +465,10 @@ class IngestionScheduler:
         except AdapterTransientError as exc:
             result.transient = True
             result.error = str(exc)
+            # A server that named its own delay (Retry-After on a 503) is
+            # asking for more than our backoff curve would give it.
+            # next_delay() takes the max, so this can only lengthen the wait.
+            result.retry_after_seconds = exc.retry_after_seconds
             logger.warning("ingestion transient failure: %s", exc)
         except AdapterError as exc:
             result.error = str(exc)

@@ -226,19 +226,72 @@ async def test_concurrent_logins_are_single_flight():
     await client.close()
 
 
-async def test_session_expiry_retry_reuses_the_reserved_budget_slot():
-    # With <=100 plants the KPI budget is exactly ONE call per window; the
-    # promised post-re-login retry must reuse the slot the rejected attempt
-    # already paid for instead of failing on an exhausted budget.
+async def test_the_post_305_retry_is_charged_to_the_endpoint_budget():
+    # EVERY request charges a slot, the post-re-login retry included. Reusing
+    # the rejected attempt's slot put two physical KPI requests inside a
+    # one-call window; whether Huawei counts a rejected request against the
+    # quota is unverified, so the client must not assume the cheaper reading
+    # of its own hard limit. With no slot free the retry DEFERS.
     fake = FakeFusionSolar()
     policy = FusionSolarRatePolicy(login_max_calls=100, station_list_max_calls=100)
     policy.set_kpi_plant_count(1)  # ceil(1/100) -> 1 call per window
     client = make_client(fake, policy)
     await client.login()
     fake.expire_session_times = 1
+
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    assert excinfo.value.retry_after_seconds is not None
+
+    paths = [p for p, _ in fake.requests]
+    assert paths.count("/getStationRealKpi") == 1  # the budget was never exceeded
+    assert paths.count("/login") == 2  # the re-login DID happen ...
+    assert client.is_logged_in()  # ... and its token is kept for the next cycle
+    await client.close()
+
+
+async def test_the_post_305_retry_proceeds_when_the_budget_has_room():
+    # Deferring is the answer to an exhausted budget, not to a session
+    # expiry: with a slot actually free the retry goes out immediately and
+    # the cycle completes.
+    fake = FakeFusionSolar()
+    policy = FusionSolarRatePolicy(login_max_calls=100, station_list_max_calls=100)
+    policy.set_kpi_plant_count(200)  # ceil(200/100) -> 2 calls per window
+    client = make_client(fake, policy)
+    await client.login()
+    fake.expire_session_times = 1
+
     result = await client.get_station_real_kpi(["NE=1"])
     assert [r["stationCode"] for r in result.rows] == ["NE=1"]
-    assert [p for p, _ in fake.requests].count("/login") == 2  # one re-login
+    paths = [p for p, _ in fake.requests]
+    assert paths.count("/getStationRealKpi") == 2  # rejected attempt + retry
+    assert paths.count("/login") == 2  # one re-login
+    await client.close()
+
+
+async def test_retry_after_is_honoured_on_a_retryable_server_error():
+    # A shedding server that names its own delay must be believed: without
+    # this the scheduler saw a bare transient error and could re-request an
+    # hour early, while the vendor was still down.
+    fake = FakeFusionSolar()
+    fake.http_status = 503
+    fake.retry_after = "3600"
+    client = make_client(fake)
+    with pytest.raises(AdapterTransientError) as excinfo:
+        await client.list_stations()
+    assert excinfo.value.retry_after_seconds == 3600.0
+    await client.close()
+
+
+async def test_a_retryable_server_error_without_the_header_has_no_delay():
+    # The delay is the SERVER's to name. Inventing one here would override
+    # the scheduler's own backoff curve with a number nobody asked for.
+    fake = FakeFusionSolar()
+    fake.http_status = 503
+    client = make_client(fake)
+    with pytest.raises(AdapterTransientError) as excinfo:
+        await client.list_stations()
+    assert excinfo.value.retry_after_seconds is None
     await client.close()
 
 

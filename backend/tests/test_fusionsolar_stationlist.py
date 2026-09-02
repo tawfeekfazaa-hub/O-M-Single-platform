@@ -661,7 +661,22 @@ async def test_a_page_repeated_non_adjacently_is_rejected():
     server = StationListServer([page_a, page_b, page_a])
     server.total_override = 101  # the number of UNIQUE stations
     client = make_client(server)
-    with pytest.raises(AdapterProtocolError, match="repeated an identical page"):
+    with pytest.raises(AdapterProtocolError, match="contributed none of its own"):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_a_page_repeated_in_a_different_row_ORDER_is_rejected():
+    # Signatures — even one per page, kept for the whole run — are
+    # order-sensitive: A, B, reversed(A) yields three distinct tuples, so the
+    # repeat was de-duplicated in silence and, with `total` equal to the
+    # unique count, certified complete with pages_retrieved inflated to 3.
+    # What a page CONTRIBUTED does not depend on how its rows are ordered.
+    page_a = [station(i) for i in range(100)]
+    server = StationListServer([page_a, [station(100)], list(reversed(page_a))])
+    server.total_override = 101
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError, match="contributed none of its own"):
         await client.list_stations()
     await client.close()
 

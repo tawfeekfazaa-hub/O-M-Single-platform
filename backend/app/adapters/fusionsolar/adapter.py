@@ -125,6 +125,28 @@ def normalize_performance_ratio(value: Any, diagnostics: KpiDiagnostics) -> floa
     return None
 
 
+def _populated_fields(reading: PlantKpiReading) -> frozenset[str]:
+    """Which of the PERSISTED fields this reading actually carries.
+
+    An UNKNOWN status counts as absent for the same reason a None does: it
+    is what gets written, and writing it over a HEALTHY plant is the silent
+    downgrade the health rule above exists to prevent.
+    """
+    populated = {
+        name
+        for name in (
+            "active_power_kw",
+            "daily_energy_kwh",
+            "total_energy_kwh",
+            "performance_ratio",
+        )
+        if getattr(reading, name) is not None
+    }
+    if reading.status is not PlantStatus.UNKNOWN:
+        populated.add("status")
+    return frozenset(populated)
+
+
 def _as_int(value: Any) -> int | None:
     """Strict integer read: never TRUNCATES a fractional number.
 
@@ -348,11 +370,18 @@ class FusionSolarAdapter(VendorAdapter):
                     # A partial reading is still worth keeping — one bad field
                     # must not cost the three good ones beside it — but it is
                     # NOT the final word: a later copy of the same station
-                    # whose every field reads REPLACES it, and only a clean
-                    # reading closes the station to further copies.
+                    # that reads cleanly AND carries everything the held one
+                    # carries REPLACES it. Both halves matter. "Clean" alone
+                    # is satisfied vacuously by a copy whose fields are simply
+                    # ABSENT, so replacing on it would let an empty
+                    # dataItemMap overwrite a reading holding valid daily
+                    # energy and a HEALTHY status with all-None and UNKNOWN —
+                    # persisted as the plant's latest point. A replacement may
+                    # only ever add.
                     clean = diagnostics.invalid_values == row_start
                     if code in held_at:
-                        if clean:
+                        held = readings[held_at[code]]
+                        if clean and _populated_fields(reading) >= _populated_fields(held):
                             readings[held_at[code]] = reading
                             accepted.add(code)
                         else:

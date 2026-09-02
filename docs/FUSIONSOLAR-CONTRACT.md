@@ -88,13 +88,15 @@ mask authentication/version errors).
   truncated inventory that passed as complete would retire live plants
   downstream.
 - Guards: every page retrieved; finite max-page bound; impossible-metadata
-  detection; repeated-page detection across the WHOLE run, not merely
-  between adjacent pages — a vendor serving A, B, A passes an adjacent
-  check, the repeat is quietly de-duplicated, and an envelope whose `total`
-  happens to equal the unique count is then certified complete with
-  `pages_retrieved` inflated to 3 (which stretches the next refresh from
-  12 h to 24 h on the 4/day default). Page signatures are built from the
-  NORMALIZED station codes; deterministic `stationCode` dedup (the
+  detection; **every non-empty page must contribute at least one station
+  not already retrieved.** A vendor serving A, B, A passes an
+  adjacent-pages check, the repeat is quietly de-duplicated, and an
+  envelope whose `total` happens to equal the unique count is then
+  certified complete with `pages_retrieved` inflated to 3 (which stretches
+  the next refresh from 12 h to 24 h on the 4/day default). Comparing page
+  signatures, even across the whole run, only moves the hole: A, B,
+  reversed(A) yields three distinct signatures for the same stations.
+  What a page CONTRIBUTED does not depend on how its rows are ordered; deterministic `stationCode` dedup (the
   unique count, not the row count, is what `total` is checked against);
   conflicting duplicates rejected; malformed pages never skipped silently.
   An EMPTY page is coherent only for an empty fleet (`total = 0`) — an
@@ -172,11 +174,8 @@ mask authentication/version errors).
   checks reject. A page the client refused is worth no more as an estimate
   than a page that never arrived — otherwise the retry walks into a budget that cannot carry
   it, wastes another call and extends the staleness it was meant to end.
-  `pages` here means BUDGET SLOTS, not HTTP attempts: the retry after a
-  failCode 305 reuses the slot its rejected attempt already paid for, so it
-  raises the transport counter (kept for diagnostics) without costing
-  budget. Pacing from the transport counter would read a one-page refresh
-  as a two-slot burst and stretch the next refresh from 6 h to 12 h.
+  `pages` here means BUDGET SLOTS. Every request charges one, the retry
+  after a failCode 305 included, so slots and HTTP attempts now agree.
 - KPI polling covers the LAST SUCCESSFUL inventory only. Phase-1
   persistence has no delete, so a station the vendor drops keeps its
   repository row; polling it would mark every later cycle partial and
@@ -237,10 +236,16 @@ mask authentication/version errors).
     not cost the good fields beside it, and the bad value is dropped and
     counted as always.
   - **accepted** — every field PRESENT in the row was readable. Only this
-    closes the station to further copies. A later copy that reads cleanly
-    REPLACES a partial one in place — never appended beside it, so a
-    station still yields exactly one reading. The replacement runs one way
-    only: a partial copy never displaces a clean one, it is an extra.
+    closes the station to further copies. A later copy REPLACES a partial
+    one in place — never appended beside it, so a station still yields
+    exactly one reading — but **only if it both reads cleanly AND carries
+    every field the held one carries.** Both halves are load-bearing:
+    "clean" is satisfied vacuously by a copy whose fields are simply
+    ABSENT, so replacing on it alone would let an empty `dataItemMap`
+    overwrite a reading holding valid daily energy and a HEALTHY status
+    with all-`None` and UNKNOWN — persisted as the plant's latest point. A
+    replacement may only ever ADD. An UNKNOWN status counts as absent for
+    this comparison, for the same reason the health rule below exists.
 - `real_health_state`: 1 disconnected, 2 faulty, 3 healthy, else unknown.
   An ABSENT field and a numeric code outside 1/2/3 are both the documented
   "else unknown" case and are not counted as invalid; a value that is
@@ -269,12 +274,19 @@ mask authentication/version errors).
 - `failCode 407` → rate-limit error with the endpoint window as a
   lower-bound retry delay; **never** an immediate retry, **never** a
   re-login (login budget is separate and precious).
-- `failCode 305` retry accounting: one logical call reserves exactly ONE
-  slot of its endpoint's budget; the single post-re-login retry reuses
-  the slot paid for by the rejected attempt (the re-login spends the
-  login budget as usual). Worst case this sends one extra HTTP request
-  per session expiry (≈30 min); *whether Huawei counts rejected requests
-  against the endpoint quota:* `unverified`.
+- `failCode 305` retry accounting: **every request charges a slot of its
+  endpoint's budget**, the single post-re-login retry included (the
+  re-login spends the login budget as usual). *Whether Huawei counts a
+  rejected request against the endpoint quota:* `unverified` — so the
+  client must not assume the cheaper reading of its own hard limit.
+  Reusing the rejected attempt's slot put TWO physical requests inside a
+  one-call window (KPI with ≤100 plants; N+1 station-list requests for an
+  N-page inventory), which is exactly the 407 throttle this client exists
+  to avoid. When no slot is free the retry is DEFERRED instead: the
+  acquire raises a rate-limit error carrying the wait, the scheduler backs
+  off, and the token the re-login just obtained is kept for the next
+  cycle, so the login is not wasted. The cost is a delayed KPI batch on
+  session expiry (≈30 min), which is the cheaper of the two risks.
 - HTTP `429` → rate-limit error; `Retry-After` parsed safely
   (delta-seconds or HTTP-date; a timezone-less date is read as GMT per
   RFC 9110). A hint is only accepted when it is FINITE and within a
@@ -289,6 +301,13 @@ mask authentication/version errors).
   outside the adapter error taxonomy and can never yield a delay that
   stalls the scheduler. *Whether your tenant sends Retry-After:*
   `unverified`.
+- Retryable server errors (**500/502/503/504**) → transient error, and
+  `Retry-After` is read there too, through the same safe parser. A server
+  shedding load names the one delay we could not otherwise know; discarding
+  it left the scheduler with only its own backoff curve, which can fire an
+  hour early into a vendor that is still down. The delay is a lower bound
+  the scheduler widens but never shortens, and it is NEVER invented: with
+  no header the scheduler's own backoff stands.
 - ANY failure while establishing the session blocks everything, not just
   the call that hit it: every other request needs that session. A
   station-list call answered with failCode 305 re-logins, and that login
