@@ -9,11 +9,12 @@ from typing import Any
 
 import pytest
 
-from app.adapters.base import PlantStatus
+from app.adapters.base import AdapterTransientError, PlantStatus
 from app.adapters.fusionsolar.adapter import (
     FusionSolarAdapter,
     KpiDiagnostics,
     _finite_float,
+    _health_status,
     normalize_performance_ratio,
 )
 from app.adapters.fusionsolar.client import ClientCallCounts, KpiBatchResult, StationListResult
@@ -361,3 +362,86 @@ async def test_an_unreadable_capacity_is_counted_and_not_written():
     plants = await adapter.list_plants()
     assert [p.capacity_kwp for p in plants] == [2500.0, None]
     assert adapter.last_inventory_diagnostics.invalid_capacity == 1
+
+
+async def test_a_capacity_that_overflows_the_unit_conversion_is_counted():
+    # 1e308 MW passes the first check and becomes infinity in kWp. An
+    # infinite capacity is not None, so it would be WRITTEN over a good
+    # stored value — what gets stored is what has to be validated.
+    class Client:
+        async def login(self) -> None: ...
+
+        def is_logged_in(self) -> bool:
+            return True
+
+        def set_kpi_plant_count(self, plant_count: int) -> None: ...
+
+        def call_counts(self) -> ClientCallCounts:
+            return ClientCallCounts()
+
+        async def list_stations(self) -> StationListResult:
+            return StationListResult(
+                stations=[{"stationCode": "NE=1", "stationName": "A", "capacity": 1e308}],
+                variant="paginated",
+                pages_retrieved=1,
+            )
+
+        async def get_station_real_kpi(self, station_codes: list[str]) -> KpiBatchResult:
+            raise AssertionError("not used")
+
+        async def close(self) -> None: ...
+
+    adapter = FusionSolarAdapter(Client())
+    (plant,) = await adapter.list_plants()
+    assert plant.capacity_kwp is None
+    assert adapter.last_inventory_diagnostics.invalid_capacity == 1
+
+
+@pytest.mark.parametrize("bad", ["3", "healthy", [3], {"code": 3}])
+def test_a_health_state_that_is_not_a_number_is_counted(bad: Any):
+    # int("3") would map a STRING to HEALTHY and count nothing — the
+    # confident-but-unearned reading the strict reader exists to prevent.
+    diag = KpiDiagnostics()
+    assert _health_status(bad, diag) is PlantStatus.UNKNOWN
+    assert diag.invalid_values == 1
+
+
+async def test_a_failed_batch_still_publishes_what_it_spent():
+    # A batch that raises has already spent its calls. Keeping the previous
+    # fetch's diagnostics would show the scheduler a complete result that
+    # never happened and hide KPI budget already consumed.
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def login(self) -> None: ...
+
+        def is_logged_in(self) -> bool:
+            return True
+
+        def set_kpi_plant_count(self, plant_count: int) -> None: ...
+
+        def call_counts(self) -> ClientCallCounts:
+            return ClientCallCounts(station_real_kpi=self.calls)
+
+        async def list_stations(self) -> StationListResult:
+            raise AssertionError("not used")
+
+        async def get_station_real_kpi(self, station_codes: list[str]) -> KpiBatchResult:
+            self.calls += 1
+            if self.calls >= 2:
+                raise AdapterTransientError("vendor failed the second batch")
+            return KpiBatchResult(
+                rows=[{"stationCode": c, "dataItemMap": {"day_power": 1.0}} for c in station_codes],
+                vendor_current_time_ms=VENDOR_MS,
+            )
+
+    adapter = FusionSolarAdapter(Client())
+    await adapter.fetch_plant_kpis([f"NE={i}" for i in range(100)])  # a clean fetch first
+    assert adapter.last_kpi_diagnostics.complete
+
+    with pytest.raises(AdapterTransientError):
+        await adapter.fetch_plant_kpis([f"NE={i}" for i in range(150)])
+    diag = adapter.last_kpi_diagnostics
+    assert diag.requested == 150 and diag.returned == 0  # the FAILED attempt
+    assert diag.calls_consumed == 1  # and the call it spent is visible

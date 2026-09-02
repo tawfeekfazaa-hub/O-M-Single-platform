@@ -269,7 +269,18 @@ mask authentication/version errors).
 - Numbers arrive as JSON, so they can be larger than a float: an oversized
   `failCode` (1e309 decodes to infinity) or capacity/KPI value is treated
   as unusable data — a code we do not act on, a counted invalid value —
-  never an `OverflowError` outside the taxonomy.
+  never an `OverflowError` outside the taxonomy. Validation follows the
+  value through any CONVERSION: 1e308 MW is finite but overflows to
+  infinity in kWp, and what gets stored is what has to be checked. Integer
+  codes must arrive as JSON numbers — `"3"` is text, not the healthy code.
+- Ambiguous XSRF-TOKEN cookies (several paths or domains) are an
+  authentication failure, not a choice to make: httpx raises
+  `CookieConflict`, which is not an `HTTPError`, and picking one could send
+  a token meant for another context.
+- Diagnostics are published on the FAILING path too. A KPI batch that
+  raises has already spent its calls; leaving the previous fetch's counts
+  in place would show a complete result that never happened and hide
+  budget already consumed.
 - HTTPS only; TLS verification enabled; redirects disabled; explicit
   connect/read/write/pool timeouts; the token goes only to the single
   configured origin. Nothing vendor-specific is ever logged.

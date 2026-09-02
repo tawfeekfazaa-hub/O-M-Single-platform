@@ -337,7 +337,19 @@ class RealFusionSolarClient:
                 raise AdapterAuthError(f"FusionSolar login failed (failCode={fail_code})")
             # Documented delivery is the XSRF-TOKEN response header; some
             # deployments deliver it as a cookie — accept both.
-            token = response.headers.get(XSRF_HEADER) or response.cookies.get(XSRF_HEADER)
+            token = response.headers.get(XSRF_HEADER)
+            if not token:
+                try:
+                    token = response.cookies.get(XSRF_HEADER)
+                except httpx.CookieConflict as exc:
+                    # Several XSRF-TOKEN cookies on different paths or
+                    # domains: httpx refuses to choose, and so do we —
+                    # picking one could send a token meant for another
+                    # context. CookieConflict is not an HTTPError, so
+                    # without this it would escape the taxonomy entirely.
+                    raise AdapterAuthError(
+                        "FusionSolar login returned ambiguous XSRF token cookies"
+                    ) from exc
             if not token:
                 raise AdapterAuthError("FusionSolar login succeeded but returned no XSRF token")
             self._token = token

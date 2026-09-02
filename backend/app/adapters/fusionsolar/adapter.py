@@ -131,6 +131,11 @@ def _as_int(value: Any) -> int | None:
     """
     if value is None or isinstance(value, bool):
         return None
+    if not isinstance(value, int | float):
+        # Text is not an integer code either: int("3") would map a string
+        # to HEALTHY and count nothing, exactly the confident-but-unearned
+        # reading this function exists to prevent.
+        return None
     if isinstance(value, float) and not value.is_integer():
         return None
     try:
@@ -194,13 +199,22 @@ class FusionSolarAdapter(VendorAdapter):
             if not code:
                 continue  # client already rejects these; belt and braces
             capacity_mw = _finite_float(station.get("capacity"), capacity_check)
+            # Validate what will actually be STORED: a large but finite
+            # capacity (1e308 MW) passes the first check and overflows to
+            # infinity on the unit conversion, and an infinite capacity is
+            # not None, so it would overwrite a good stored value.
+            capacity_kwp = (
+                _finite_float(capacity_mw * 1000.0, capacity_check)
+                if capacity_mw is not None
+                else None
+            )
             plants.append(
                 PlantInfo(
                     vendor=self.vendor,
                     vendor_plant_id=str(code),
                     name=str(station.get("stationName") or code),
                     # FusionSolar reports capacity in MW; we store kWp.
-                    capacity_kwp=capacity_mw * 1000.0 if capacity_mw is not None else None,
+                    capacity_kwp=capacity_kwp,
                     address=station.get("stationAddr"),
                 )
             )
@@ -229,71 +243,93 @@ class FusionSolarAdapter(VendorAdapter):
         # rejected by the 1-call constructor default.
         self._client.set_kpi_plant_count(len(vendor_plant_ids))
 
-        # Sequential batches of at most 100 codes — never concurrent.
-        for start in range(0, len(vendor_plant_ids), KPI_BATCH_SIZE):
-            batch = vendor_plant_ids[start : start + KPI_BATCH_SIZE]
-            # Membership is checked against THIS batch, not the whole
-            # request: a row for a station belonging to a later batch is
-            # misrouted data. Accepting it would let a stale value win and
-            # would make the station's real row look like a duplicate.
-            batch_codes = set(batch)
-            result = await self._client.get_station_real_kpi(batch)
-            diagnostics.batches += 1
-            received_at = datetime.now(UTC)
-            vendor_time = (
-                datetime.fromtimestamp(result.vendor_current_time_ms / 1000.0, tz=UTC)
-                if result.vendor_current_time_ms is not None
-                else None
-            )
-            for row in result.rows:
-                code = row.get("stationCode")
-                if not code:
-                    diagnostics.invalid_values += 1
-                    continue
-                code = str(code)
-                if code not in batch_codes:
-                    diagnostics.unexpected += 1
-                    continue
-                if code in seen:
-                    diagnostics.duplicates += 1
-                    continue
-                seen.add(code)
-                item = row.get("dataItemMap")
-                if not isinstance(item, dict):
-                    diagnostics.invalid_values += 1
-                    item = {}
-
-                if self._allow_synthetic_fields:
-                    # SYNTHETIC mock-only field; see mock_client docstring.
-                    active_power = _finite_float(item.get("real_power"), diagnostics)
-                else:
-                    # The documented station real-KPI contract exposes no
-                    # active-power field — never derived, stays None.
-                    active_power = None
-
-                readings.append(
-                    PlantKpiReading(
-                        vendor=self.vendor,
-                        vendor_plant_id=code,
-                        ts=received_at,
-                        active_power_kw=active_power,
-                        daily_energy_kwh=_finite_float(item.get("day_power"), diagnostics),
-                        total_energy_kwh=_finite_float(item.get("total_power"), diagnostics),
-                        performance_ratio=normalize_performance_ratio(
-                            item.get("performance_ratio"), diagnostics
-                        )
-                        if item.get("performance_ratio") is not None
-                        else None,
-                        status=_health_status(item.get("real_health_state"), diagnostics),
-                        vendor_server_time=vendor_time,
-                    )
+        try:
+            # Sequential batches of at most 100 codes — never concurrent.
+            for start in range(0, len(vendor_plant_ids), KPI_BATCH_SIZE):
+                batch = vendor_plant_ids[start : start + KPI_BATCH_SIZE]
+                # Membership is checked against THIS batch, not the whole
+                # request: a row for a station belonging to a later batch is
+                # misrouted data. Accepting it would let a stale value win and
+                # would make the station's real row look like a duplicate.
+                batch_codes = set(batch)
+                result = await self._client.get_station_real_kpi(batch)
+                diagnostics.batches += 1
+                received_at = datetime.now(UTC)
+                vendor_time = (
+                    datetime.fromtimestamp(result.vendor_current_time_ms / 1000.0, tz=UTC)
+                    if result.vendor_current_time_ms is not None
+                    else None
                 )
+                for row in result.rows:
+                    code = row.get("stationCode")
+                    if not code:
+                        diagnostics.invalid_values += 1
+                        continue
+                    code = str(code)
+                    if code not in batch_codes:
+                        diagnostics.unexpected += 1
+                        continue
+                    if code in seen:
+                        diagnostics.duplicates += 1
+                        continue
+                    seen.add(code)
+                    item = row.get("dataItemMap")
+                    if not isinstance(item, dict):
+                        diagnostics.invalid_values += 1
+                        item = {}
 
+                    if self._allow_synthetic_fields:
+                        # SYNTHETIC mock-only field; see mock_client docstring.
+                        active_power = _finite_float(item.get("real_power"), diagnostics)
+                    else:
+                        # The documented station real-KPI contract exposes no
+                        # active-power field — never derived, stays None.
+                        active_power = None
+
+                    readings.append(
+                        PlantKpiReading(
+                            vendor=self.vendor,
+                            vendor_plant_id=code,
+                            ts=received_at,
+                            active_power_kw=active_power,
+                            daily_energy_kwh=_finite_float(item.get("day_power"), diagnostics),
+                            total_energy_kwh=_finite_float(item.get("total_power"), diagnostics),
+                            performance_ratio=normalize_performance_ratio(
+                                item.get("performance_ratio"), diagnostics
+                            )
+                            if item.get("performance_ratio") is not None
+                            else None,
+                            status=_health_status(item.get("real_health_state"), diagnostics),
+                            vendor_server_time=vendor_time,
+                        )
+                    )
+
+        except AdapterError:
+            # The batches already sent SPENT their calls; publish what
+            # this attempt actually did before the error propagates.
+            self._publish_kpi_diagnostics(diagnostics, readings, requested, seen, before)
+            raise
+        self._publish_kpi_diagnostics(diagnostics, readings, requested, seen, before)
+        return readings
+
+    def _publish_kpi_diagnostics(
+        self,
+        diagnostics: KpiDiagnostics,
+        readings: list[PlantKpiReading],
+        requested: set[str],
+        seen: set[str],
+        before: int,
+    ) -> None:
+        """Finalize the counts, on the failing path as much as the clean one.
+
+        A batch that raises has still SPENT its calls. Leaving the previous
+        fetch's diagnostics in place would show the scheduler a complete
+        result that never happened and hide KPI budget already consumed.
+        """
         diagnostics.returned = len(readings)
         diagnostics.missing = len(requested - seen)
         diagnostics.calls_consumed = self._client.call_counts().station_real_kpi - before
         self.last_kpi_diagnostics = diagnostics
-        return readings
 
     async def health_check(self) -> bool:
         # Must not consume vendor rate budget: session presence only.

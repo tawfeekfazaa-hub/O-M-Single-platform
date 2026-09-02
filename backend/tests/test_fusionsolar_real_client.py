@@ -593,3 +593,31 @@ async def test_a_repeated_305_drops_the_token_and_blocks_the_session():
     assert excinfo.value.blocks_authentication is True
     assert client.is_logged_in() is False
     await client.close()
+
+
+async def test_ambiguous_token_cookies_are_an_adapter_error():
+    # Several XSRF-TOKEN cookies on different paths: httpx refuses to choose
+    # and raises CookieConflict, which is not an HTTPError — without its own
+    # clause it escapes the taxonomy and takes the scheduler task down.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"success": True, "failCode": 0},
+            headers=[
+                (b"set-cookie", b"XSRF-TOKEN=a; Path=/thirdData"),
+                (b"set-cookie", b"XSRF-TOKEN=b; Path=/other"),
+            ],
+        )
+
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username=USERNAME,
+        system_code=SYSTEM_CODE,
+        policy=generous_policy(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AdapterAuthError) as excinfo:
+        await client.login()
+    assert excinfo.value.blocks_authentication is True
+    assert client.is_logged_in() is False
+    await client.close()
