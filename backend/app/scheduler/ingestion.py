@@ -29,6 +29,7 @@ import asyncio
 import logging
 import random
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
@@ -146,6 +147,10 @@ class IngestionScheduler:
         self._station_list_max_calls = station_list_max_calls
         self._station_list_window = station_list_window_seconds
         self._inventory_min_spacing = 0.0
+        # (time, budget slots) of recent successful refreshes, pruned to the
+        # station-list window: what the vendor's rolling limiter still holds
+        # against us when the next refresh comes due.
+        self._inventory_bursts: deque[tuple[float, int]] = deque()
         self._inventory_not_before: float | None = None
         self._backoff_base = backoff_base_seconds
         self._backoff_max = backoff_max_seconds
@@ -204,7 +209,45 @@ class IngestionScheduler:
             # burst and stretch the next refresh from 6 h to 12 h.
             slots = max(diag.pages_retrieved, 1)
         if self._station_list_max_calls and self._station_list_window:
-            self._inventory_min_spacing = self._derive_inventory_spacing(slots)
+            self._record_inventory_burst(self._last_inventory_at, slots)
+            # Pacing keeps the budget spread over the window; availability
+            # keeps THIS burst from colliding with the calls still retained
+            # from earlier, differently sized ones. Neither implies the other.
+            self._inventory_min_spacing = max(
+                self._derive_inventory_spacing(slots),
+                self._earliest_burst_gap(self._last_inventory_at, slots),
+            )
+
+    def _record_inventory_burst(self, at: float, slots: int) -> None:
+        """Remember one refresh's budget slots; forget what has aged out."""
+        window = self._station_list_window or 0.0
+        self._inventory_bursts.append((at, slots))
+        cutoff = at - window
+        while self._inventory_bursts and self._inventory_bursts[0][0] <= cutoff:
+            self._inventory_bursts.popleft()
+
+    def _earliest_burst_gap(self, now: float, slots: int) -> float:
+        """Wait until ``slots`` are actually free in the rolling window.
+
+        The pacing formula assumes a STEADY sequence of equally sized
+        bursts. When an inventory grows a page, the calls from the smaller
+        refreshes are still occupying slots: on the 4/day default, a 1-page
+        refresh at hour 0 and a 2-page one at hour 6 leave only one free
+        slot at hour 18, so the paced 2-page burst gets page 1 and is
+        rate-limited on page 2 — the refresh fails and defers a full window.
+        Candidate times are the moments the retained calls expire; the last
+        of them empties the window entirely, so this always terminates.
+        """
+        window = self._station_list_window or 0.0
+        budget = self._station_list_max_calls or 0
+        for candidate in [now, *(at + window for at, _ in self._inventory_bursts)]:
+            cutoff = candidate - window
+            occupied = sum(count for at, count in self._inventory_bursts if at > cutoff)
+            if occupied + slots <= budget:
+                return max(candidate - now, 0.0)
+        # A burst larger than the whole budget: the page guard rejects that
+        # configuration, but never pace it faster than a full window here.
+        return window
 
     def _derive_inventory_spacing(self, slots: int) -> float:
         """Spacing that lets EVERY refresh spend all its pages at once.

@@ -117,6 +117,12 @@ mask authentication/version errors).
   drift into the window (a 5-call budget with 2-page refreshes would put
   bursts at 0 h, 9.6 h and 19.2 h, needing six slots in one window). On the
   4/day default: 1 page → 6 h, 2 pages → 12 h, 3–4 pages → 24 h.
+  The formula holds for a STEADY sequence of equally sized bursts; when an
+  inventory grows a page, the calls from the smaller refreshes are still
+  occupying slots, so the scheduler additionally waits until the pages it
+  needs are actually free (1 page at hour 0 then 2 at hour 6 leaves one
+  free slot at hour 18: the paced burst would be rate-limited on its
+  second page).
   `pages` here means BUDGET SLOTS, not HTTP attempts: the retry after a
   failCode 305 reuses the slot its rejected attempt already paid for, so it
   raises the transport counter (kept for diagnostics) without costing

@@ -141,6 +141,14 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:3000"
 
+    # --- removed in PR-1, kept only to fail the upgrade loudly ---
+    # A single global budget could not model Huawei's per-endpoint limits.
+    # extra="ignore" would drop these names silently, and the replacements
+    # default LOOSER than a tightened global cap, so an operator upgrading
+    # with them set would quietly lose the protection they configured.
+    fusionsolar_max_calls_per_window: int | None = None
+    fusionsolar_window_seconds: float | None = None
+
     @field_validator("fusionsolar_base_url")
     @classmethod
     def _validate_base_url(cls, value: str | None) -> str | None:
@@ -158,6 +166,30 @@ class Settings(BaseSettings):
                 "set with different values; remove FUSIONSOLAR_PASSWORD"
             )
         return self
+
+    # Per-FIELD validators on purpose: the reported loc is the field name,
+    # which IS the environment variable name, so every caller's error
+    # handler can name the offending variable without touching its value.
+    @field_validator("fusionsolar_max_calls_per_window")
+    @classmethod
+    def _reject_removed_global_budget(cls, value: int | None) -> int | None:
+        if value is not None:
+            raise ValueError(
+                "was replaced by per-endpoint budgets: set FUSIONSOLAR_LOGIN_MAX_CALLS "
+                "and FUSIONSOLAR_STATION_LIST_MAX_CALLS instead, then remove it"
+            )
+        return value
+
+    @field_validator("fusionsolar_window_seconds")
+    @classmethod
+    def _reject_removed_global_window(cls, value: float | None) -> float | None:
+        if value is not None:
+            raise ValueError(
+                "was replaced by per-endpoint budgets: set FUSIONSOLAR_LOGIN_WINDOW_SECONDS, "
+                "FUSIONSOLAR_STATION_LIST_WINDOW_SECONDS and FUSIONSOLAR_KPI_WINDOW_SECONDS "
+                "instead, then remove it"
+            )
+        return value
 
     @field_validator(*_FINITE_POSITIVE_SETTINGS)
     @classmethod

@@ -15,7 +15,7 @@ from app.adapters.fusionsolar.adapter import FusionSolarAdapter
 from app.adapters.fusionsolar.mock_client import MockFusionSolarClient
 from app.core.ratelimit import RollingWindowRateLimiter
 from app.repositories.memory import InMemoryRepository
-from app.scheduler.ingestion import IngestionScheduler
+from app.scheduler.ingestion import CycleResult, IngestionScheduler
 from tests.conftest import FIXED_NOON_UTC
 from tests.test_fusionsolar_stationlist import StationListServer
 from tests.test_fusionsolar_stationlist import make_client as make_station_list_client
@@ -463,6 +463,64 @@ def test_absurd_station_list_budget_derives_no_spacing(repository: InMemoryRepos
         station_list_window_seconds=86_400.0,
     )
     assert scheduler._derive_inventory_spacing(1) == 0.0
+
+
+async def test_a_growing_inventory_waits_for_the_earlier_bursts_to_expire(
+    repository: InMemoryRepository,
+):
+    # The pacing formula assumes equally sized bursts. On the 4/day default a
+    # 1-page refresh at hour 0 and a 2-page one at hour 6 leave only ONE free
+    # slot at hour 18, so the paced 2-page burst would take page 1 and be
+    # rate-limited on page 2 — the refresh fails and defers a full window
+    # while the inventory goes stale.
+    hour = 3600.0
+    clock = FakeClock()
+    server = StationListServer([[station_row(0)]])
+    client = make_station_list_client(server)
+    adapter = FusionSolarAdapter(client, allow_synthetic_fields=True)
+    scheduler = IngestionScheduler(
+        adapter,
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=24 * hour,
+        clock=clock,
+    )
+
+    await scheduler._refresh_inventory(CycleResult())
+    assert scheduler._inventory_min_spacing == 6 * hour  # 4 one-page bursts/day
+
+    # The fleet grows past one page.
+    clock.now = 6 * hour
+    server.pages = [[station_row(i) for i in range(100)], [station_row(100)]]
+    await scheduler._refresh_inventory(CycleResult())
+    # Pacing alone would say 12 h (hour 18), when the hour-0 call is still
+    # held: three of four slots are occupied and a 2-page burst cannot run.
+    assert scheduler._derive_inventory_spacing(2) == 12 * hour
+    assert scheduler._inventory_min_spacing == 18 * hour  # hour 24: hour 0 expired
+
+    clock.now = 18 * hour
+    assert not scheduler._inventory_due()
+    clock.now = 24 * hour
+    assert scheduler._inventory_due()
+
+    # Back to a steady sequence of equal bursts, the pacing rule takes over.
+    await scheduler._refresh_inventory(CycleResult())
+    assert scheduler._inventory_min_spacing == 12 * hour
+    await client.close()
+
+
+def test_burst_history_is_pruned_to_the_rolling_window(repository: InMemoryRepository):
+    # Only the calls the vendor's limiter still holds may constrain the next
+    # refresh; anything older has expired and must not grow without bound.
+    scheduler = IngestionScheduler(
+        mock_adapter(),
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=86_400.0,
+    )
+    for at in (0.0, 43_200.0, 86_400.0, 129_600.0):
+        scheduler._record_inventory_burst(at, 1)
+    assert list(scheduler._inventory_bursts) == [(86_400.0, 1), (129_600.0, 1)]
 
 
 def test_derived_spacing_counts_complete_bursts_per_window(

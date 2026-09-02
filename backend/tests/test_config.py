@@ -159,3 +159,40 @@ def test_the_application_entry_point_refuses_an_unusable_timing_setting(
     finally:
         get_settings.cache_clear()
     assert [error["loc"] for error in excinfo.value.errors()] == [(field,)]
+
+
+@pytest.mark.parametrize(
+    ("legacy", "replacement"),
+    [
+        ("FUSIONSOLAR_MAX_CALLS_PER_WINDOW", "FUSIONSOLAR_LOGIN_MAX_CALLS"),
+        ("FUSIONSOLAR_WINDOW_SECONDS", "FUSIONSOLAR_LOGIN_WINDOW_SECONDS"),
+    ],
+)
+def test_removed_global_budget_variables_fail_the_upgrade(
+    legacy: str, replacement: str, monkeypatch: pytest.MonkeyPatch
+):
+    # PR-1 replaced one global budget with per-endpoint budgets. extra="ignore"
+    # would drop the old names silently, and the replacements default LOOSER
+    # than a tightened global cap: an operator upgrading with a 1-call cap set
+    # would silently get 4 login and 4 station-list calls. The upgrade must
+    # fail loudly instead, naming the variable and its replacement.
+    from app.config import get_settings
+
+    monkeypatch.setenv(legacy, "1")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(ValidationError) as excinfo:
+            get_settings()
+    finally:
+        get_settings.cache_clear()
+    (error,) = excinfo.value.errors()
+    assert error["loc"] == (legacy.lower(),)  # the loc IS the variable name
+    assert replacement in error["msg"]
+    assert "1" not in error["msg"].replace("PR-1", "")  # names only, never values
+
+
+def test_the_removed_names_are_only_rejected_when_actually_set():
+    # The compatibility guard must not reject a clean configuration.
+    settings = make_settings()
+    assert settings.fusionsolar_max_calls_per_window is None
+    assert settings.fusionsolar_window_seconds is None
