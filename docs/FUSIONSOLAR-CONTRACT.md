@@ -95,13 +95,16 @@ mask authentication/version errors).
   client-side budget of **4 calls/day** and the **6-hour inventory
   cadence are SAFETY DEFAULTS**, both configurable.
 - Cadence vs pagination: each page spends one station-list call, and the
-  budget is a ROLLING window, so the scheduler derives the spacing between
-  inventory refreshes from the pages the last refresh consumed:
-  `pages × window / budget` while the budget still fits two bursts
-  (`budget >= 2 × pages`), otherwise a **full window**, after which the
-  previous burst has aged out. On the 4/day default: 1 page → 6 h,
-  2 pages → 12 h, 3–4 pages → 24 h. A refresh rejected by the budget
-  defers itself and never aborts KPI polling.
+  budget is a ROLLING window, so only a whole number of complete refreshes
+  fits it. The scheduler spaces refreshes by
+  `window / floor(budget / pages)` — never an average rate, which would
+  drift into the window (a 5-call budget with 2-page refreshes would put
+  bursts at 0 h, 9.6 h and 19.2 h, needing six slots in one window). On the
+  4/day default: 1 page → 6 h, 2 pages → 12 h, 3–4 pages → 24 h.
+- A refresh rejected by the budget never aborts KPI polling, and defers
+  itself by a **full window** rather than the limiter's next-slot hint:
+  one freed slot is not enough for a paginated refresh, so retrying earlier
+  would resend the same partial burst and fail on the same page forever.
 - **Pages per refresh may never exceed the budget.** A paginated refresh
   cannot be resumed across windows, so the effective page guard is
   `min(FUSIONSOLAR_STATION_LIST_MAX_PAGES, FUSIONSOLAR_STATION_LIST_MAX_CALLS)`.

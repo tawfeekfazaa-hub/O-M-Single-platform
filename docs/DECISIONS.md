@@ -36,8 +36,9 @@ Decisions (full contract: docs/FUSIONSOLAR-CONTRACT.md):
    so a truncated list can never pass as the complete fleet. Because a
    refresh cannot be resumed across rate-limit windows, the effective page
    guard is bounded by the station-list budget, and the refresh spacing is
-   derived from the pages consumed with rolling-window burst capacity in
-   mind (full window when the budget cannot hold two bursts).
+   `window / floor(budget / pages)` — the number of COMPLETE bursts the
+   rolling window can hold, never an average rate. A budget-rejected
+   refresh defers a full window so its own partial burst has expired.
 5. **Real-mode safety gate**: the app refuses FUSIONSOLAR_MODE=real +
    SCHEDULER_ENABLED=true until Raw/Quarantine storage (PR-2) exists.
    The diagnostic checker is offline/dry-run by default and its live path

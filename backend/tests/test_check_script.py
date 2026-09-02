@@ -211,3 +211,29 @@ def test_dry_run_states_the_cap_covers_authentication_recovery(
     check.main([], settings=make_settings())
     out = capsys.readouterr().out
     assert "transport level" in out and "305" in out
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_non_finite_windows_are_config_errors(bad: float, capsys: pytest.CaptureFixture):
+    # NaN/inf pass every "<= 0" test but break the limiter permanently: a
+    # NaN window never prunes its history, an infinite one never frees a slot.
+    code = check.main([], settings=make_settings(fusionsolar_kpi_window_seconds=bad))
+    assert code == check.EXIT_CONFIG
+    assert "FUSIONSOLAR_KPI_WINDOW_SECONDS" in capsys.readouterr().err
+
+
+def test_unparseable_settings_exit_config_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+):
+    # get_settings() raising ValidationError (e.g. an http:// base URL) must
+    # still produce the documented exit code, with variable NAMES only.
+    monkeypatch.setenv("FUSIONSOLAR_BASE_URL", "http://insecure.test")
+    from app.config import Settings as RealSettings
+
+    monkeypatch.setattr(check, "get_settings", lambda: RealSettings(_env_file=None))
+    code = check.main([])
+    captured = capsys.readouterr()
+    assert code == check.EXIT_CONFIG
+    assert "CONFIG ERROR" in captured.err
+    assert "FUSIONSOLAR_BASE_URL" in captured.err
+    assert "insecure.test" not in captured.err  # the value is never echoed

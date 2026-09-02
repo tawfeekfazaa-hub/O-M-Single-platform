@@ -18,7 +18,8 @@ default            offline configuration validation + dry-run call plan.
 
 Exit codes (deterministic)
 --------------------------
-0 success · 2 configuration error · 3 authentication failed ·
+0 success · 2 configuration error (including unparseable settings) ·
+3 authentication failed ·
 4 rate-limited · 5 vendor/transport error · 6 safety refusal ·
 7 protocol/contract violation
 
@@ -30,8 +31,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import sys
 from pathlib import Path
+
+from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -117,8 +121,12 @@ def validate_config(settings: Settings) -> list[str]:
     # catch them here so the dry run reports EXIT_CONFIG instead of the live
     # path dying with a traceback. Names only — never the values.
     for name, attribute in _POSITIVE_SETTINGS.items():
-        if getattr(settings, attribute) <= 0:
-            problems.append(f"{name} must be > 0")
+        value = getattr(settings, attribute)
+        # NaN/infinity pass every "<= 0" test but break the limiter for good:
+        # a NaN window never prunes its history and an infinite one never
+        # frees a slot, blocking the endpoint permanently.
+        if not math.isfinite(value) or value <= 0:
+            problems.append(f"{name} must be a finite value > 0")
     return problems
 
 
@@ -222,7 +230,23 @@ def main(argv: list[str] | None = None, settings: Settings | None = None) -> int
         help="required with --live: acknowledge the vendor rate budget cost",
     )
     args = parser.parse_args(argv)
-    settings = settings or get_settings()
+    if settings is None:
+        try:
+            settings = get_settings()
+        except ValidationError as exc:
+            # Unparseable configuration (e.g. an http:// base URL or a
+            # non-numeric budget) must still produce the documented exit
+            # code. Report the offending variable NAMES only — never the
+            # values, never a traceback.
+            names = sorted(
+                {str(location[0]).upper() for error in exc.errors() for location in [error["loc"]]}
+            )
+            print(
+                "CONFIG ERROR: settings could not be loaded; check "
+                + (", ".join(names) if names else "the FUSIONSOLAR_* variables"),
+                file=sys.stderr,
+            )
+            return EXIT_CONFIG
 
     print(f"FUSIONSOLAR_MODE = {settings.fusionsolar_mode}")
     print(f"FUSIONSOLAR_API_PROFILE = {settings.fusionsolar_api_profile}")

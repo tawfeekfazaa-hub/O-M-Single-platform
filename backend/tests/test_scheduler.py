@@ -12,6 +12,7 @@ from app.adapters.base import (
 )
 from app.adapters.fusionsolar.adapter import FusionSolarAdapter
 from app.adapters.fusionsolar.mock_client import MockFusionSolarClient
+from app.core.ratelimit import RollingWindowRateLimiter
 from app.repositories.memory import InMemoryRepository
 from app.scheduler.ingestion import IngestionScheduler
 from tests.conftest import FIXED_NOON_UTC
@@ -378,19 +379,104 @@ async def test_spacing_reserves_a_whole_burst_in_the_rolling_window(
     assert (await scheduler.run_cycle()).inventory_refreshed
 
 
-def test_derived_spacing_uses_the_average_rate_only_when_two_bursts_fit(
+def test_derived_spacing_counts_complete_bursts_per_window(
     repository: InMemoryRepository,
 ):
+    # window / floor(budget / pages): only whole refreshes fit a rolling
+    # window, so the spacing must never be an average rate.
     scheduler = IngestionScheduler(
         mock_adapter(),
         repository,
         station_list_max_calls=4,
         station_list_window_seconds=86_400.0,
     )
-    assert scheduler._derive_inventory_spacing(1) == 21_600.0  # 4 >= 2 -> average
-    assert scheduler._derive_inventory_spacing(2) == 43_200.0  # 4 >= 4 -> average
-    assert scheduler._derive_inventory_spacing(3) == 86_400.0  # 4 <  6 -> full window
+    assert scheduler._derive_inventory_spacing(1) == 21_600.0  # 4 bursts/day
+    assert scheduler._derive_inventory_spacing(2) == 43_200.0  # 2 bursts/day
+    assert scheduler._derive_inventory_spacing(3) == 86_400.0  # 1 burst/day
     assert scheduler._derive_inventory_spacing(4) == 86_400.0
+
+    # A budget that is not a multiple of the page count must round DOWN:
+    # 5 calls / 2 pages would drift to 9.6 h on an average-rate formula and
+    # need six slots inside one window.
+    uneven = IngestionScheduler(
+        mock_adapter(),
+        repository,
+        station_list_max_calls=5,
+        station_list_window_seconds=86_400.0,
+    )
+    assert uneven._derive_inventory_spacing(2) == 43_200.0  # floor(5/2) = 2
+
+
+async def test_uneven_budget_spacing_never_exhausts_the_rolling_window(
+    repository: InMemoryRepository,
+):
+    # Three consecutive 2-page refreshes on a 5-call/24 h budget must each
+    # get both of their slots.
+    client = MockFusionSolarClient(
+        now=lambda: FIXED_NOON_UTC, station_list_variant="paginated", page_size=2
+    )
+    clock = FakeClock()
+    scheduler = IngestionScheduler(
+        mock_adapter(client),
+        repository,
+        interval_seconds=300.0,
+        inventory_refresh_seconds=0.0,
+        station_list_max_calls=5,
+        station_list_window_seconds=86_400.0,
+        jitter=lambda: 0.5,
+        clock=clock,
+    )
+    limiter = RollingWindowRateLimiter(5, 86_400.0, clock=clock)
+    refreshes = 0
+    for tick in range(0, 90_000, 3_600):
+        clock.now = float(tick)
+        if scheduler._inventory_due():
+            for _ in range(2):  # the two station-list calls of this refresh
+                await limiter.acquire(wait=False)  # raises if the window is full
+            await scheduler.run_cycle()
+            refreshes += 1
+    assert refreshes == 3  # t=0, 43200, 86400 — each with both slots free
+
+
+async def test_rate_limited_refresh_defers_a_full_window(repository: InMemoryRepository):
+    """A partial burst must not be retried while its own calls still count.
+
+    The limiter's hint frees one slot; retrying then would resend the same
+    partial burst and fail on the same page forever.
+    """
+
+    class InventoryLimitedAdapter(FusionSolarAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+            )
+            self.list_calls = 0
+
+        async def list_plants(self) -> list[PlantInfo]:
+            self.list_calls += 1
+            raise AdapterRateLimitError("budget exhausted", retry_after_seconds=100.0)
+
+    await repository.upsert_plants(await mock_adapter().list_plants())
+    adapter = InventoryLimitedAdapter()
+    clock = FakeClock()
+    scheduler = IngestionScheduler(
+        adapter,
+        repository,
+        interval_seconds=300.0,
+        station_list_max_calls=4,
+        station_list_window_seconds=86_400.0,
+        jitter=lambda: 0.5,
+        clock=clock,
+    )
+    assert (await scheduler.run_cycle()).inventory_rate_limited
+
+    clock.now = 200.0  # past the limiter's own 100 s hint...
+    await scheduler.run_cycle()
+    assert adapter.list_calls == 1  # ...but the burst has not expired yet
+
+    clock.now = 86_401.0  # a full window later the whole burst has aged out
+    await scheduler.run_cycle()
+    assert adapter.list_calls == 2
 
 
 async def test_min_interval_floor_also_applies_to_failure_backoff(

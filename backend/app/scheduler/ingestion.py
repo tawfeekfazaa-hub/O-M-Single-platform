@@ -160,21 +160,26 @@ class IngestionScheduler:
             self._inventory_min_spacing = self._derive_inventory_spacing(calls)
 
     def _derive_inventory_spacing(self, calls: int) -> float:
-        """Spacing that lets the NEXT refresh spend all its pages at once.
+        """Spacing that lets EVERY refresh spend all its pages at once.
 
         The budget is a rolling window, not an average allowance: the
-        previous refresh's calls keep occupying slots until they age out.
-        Spending ``calls`` slots in one burst therefore needs
-        ``budget - calls >= calls`` free slots while the previous burst is
-        still counted; when the budget is too small for two bursts the only
-        safe spacing is a full window, after which the previous burst has
-        expired.
+        previous refreshes' calls keep occupying slots until they age out.
+        What fits is therefore a whole number of complete bursts —
+        ``floor(budget / calls)`` of them per window — so the spacing is
+        ``window / that count``. An average-rate formula
+        (``window * calls / budget``) looks safe for two bursts but drifts:
+        with a 5-call window and 2-page refreshes it would schedule bursts
+        at 0 h, 9.6 h and 19.2 h, needing six slots inside one window.
         """
         window = self._station_list_window or 0.0
         budget = self._station_list_max_calls or 1
-        if budget >= 2 * calls:
-            return window * calls / budget
-        return window
+        bursts_per_window = budget // max(calls, 1)
+        if bursts_per_window < 1:
+            # One refresh does not even fit the budget: the guard in the
+            # adapter factory rejects this, but never schedule faster than
+            # a full window here either.
+            return window
+        return window / bursts_per_window
 
     async def run_cycle(self) -> CycleResult:
         """One ingestion pass. Never raises — errors land in the result."""
@@ -191,14 +196,15 @@ class IngestionScheduler:
                     # budget: a rate-limited refresh defers itself and must
                     # never abort KPI polling for this cycle.
                     result.inventory_rate_limited = True
-                    fallback = (
-                        self._station_list_window / self._station_list_max_calls
-                        if self._station_list_max_calls and self._station_list_window
-                        else self._inventory_refresh
-                    )
-                    self._inventory_not_before = self._clock() + (
-                        exc.retry_after_seconds if exc.retry_after_seconds is not None else fallback
-                    )
+                    # The limiter's hint frees ONE slot, which is not enough
+                    # for a paginated refresh: retrying then would spend the
+                    # same partial burst again and fail on the same page,
+                    # forever. Wait a full window so every call of the failed
+                    # burst has expired before the next attempt.
+                    deferral = exc.retry_after_seconds or self._inventory_refresh
+                    if self._station_list_window:
+                        deferral = max(deferral, self._station_list_window)
+                    self._inventory_not_before = self._clock() + deferral
                     logger.warning(
                         "inventory refresh rate-limited, deferred; KPI polling continues"
                     )
