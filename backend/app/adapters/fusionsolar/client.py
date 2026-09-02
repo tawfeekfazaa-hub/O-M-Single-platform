@@ -448,6 +448,21 @@ class RealFusionSolarClient:
                     page_count = echoed_page_count
                     page_size = echoed_page_size
                     total = echoed_total
+                    # Page 1 is the first moment the burst size is known.
+                    # Starting a burst the budget cannot finish spends
+                    # calls on an inventory that is never retrieved, and
+                    # leaves nothing for the retry: a fleet that grew a
+                    # page since the last refresh would take the free
+                    # slots and be rejected on its last page. Stop here
+                    # instead, with the wait the scheduler needs.
+                    remaining = max((page_count or 0) - 1, 0)
+                    wait = self._policy.wait_for_slots(Endpoint.STATION_LIST, remaining)
+                    if wait > 0:
+                        raise AdapterRateLimitError(
+                            "station list needs more pages than the station-list "
+                            "budget has free; deferring the whole refresh",
+                            retry_after_seconds=wait,
+                        )
                 elif echoed_page_count != page_count:
                     # The FIRST page's metadata is authoritative: values that
                     # change mid-pagination could end the loop early.

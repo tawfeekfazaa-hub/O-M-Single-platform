@@ -509,6 +509,41 @@ async def test_a_growing_inventory_waits_for_the_earlier_bursts_to_expire(
     await client.close()
 
 
+async def test_a_failed_refresh_defers_until_the_calls_it_spent_expire(
+    repository: InMemoryRepository,
+):
+    # A refresh that dies on page 3 has already paid for three slots and the
+    # rolling limiter keeps holding them. Retrying on the plain 6 h cadence
+    # would spend another call into a budget that cannot carry the burst,
+    # be rejected, and leave the inventory stale even longer.
+    hour = 3600.0
+    clock = FakeClock()
+    server = StationListServer(
+        [[station_row(i) for i in range(100)], [station_row(100)], [station_row(101)]]
+    )
+    server.serve_kpi = True
+    server.page_size_per_page = {3: 50}  # contract violation, discovered on page 3
+
+    client = make_station_list_client(server)
+    scheduler = IngestionScheduler(
+        FusionSolarAdapter(client, allow_synthetic_fields=True),
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=24 * hour,
+        clock=clock,
+    )
+
+    result = await scheduler.run_cycle()
+    assert result.inventory_error is not None  # recorded, not raised
+    assert len(server.requests) == 3  # three slots spent before the violation
+
+    clock.now = 6 * hour  # the plain cadence would retry here
+    assert not scheduler._inventory_due()
+    clock.now = 24 * hour  # the three calls have now expired
+    assert scheduler._inventory_due()
+    await client.close()
+
+
 def test_burst_history_is_pruned_to_the_rolling_window(repository: InMemoryRepository):
     # Only the calls the vendor's limiter still holds may constrain the next
     # refresh; anything older has expired and must not grow without bound.

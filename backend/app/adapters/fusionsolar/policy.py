@@ -91,6 +91,10 @@ class FusionSolarRatePolicy:
         limiter = self._limiters[endpoint]
         return max(limiter.retry_after(), limiter.window_seconds)
 
+    def wait_for_slots(self, endpoint: Endpoint, count: int) -> float:
+        """Seconds until ``count`` slots of this endpoint are free at once."""
+        return self._limiters[endpoint].wait_for(count)
+
     async def acquire(self, endpoint: Endpoint) -> None:
         """Reserve one slot or raise AdapterRateLimitError (never waits)."""
         try:

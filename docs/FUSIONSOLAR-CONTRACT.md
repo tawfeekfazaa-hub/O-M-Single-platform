@@ -122,7 +122,14 @@ mask authentication/version errors).
   occupying slots, so the scheduler additionally waits until the pages it
   needs are actually free (1 page at hour 0 then 2 at hour 6 leaves one
   free slot at hour 18: the paced burst would be rate-limited on its
-  second page).
+  second page). Growth the scheduler could not predict is caught at the
+  other end: page 1 is the first moment the burst size is known, so the
+  client checks the remaining pages against the free budget THERE and
+  defers the whole refresh rather than spending calls on an inventory it
+  cannot finish. A refresh that fails part-way has still spent its calls,
+  so its slots are recorded like a successful burst's and the deferral
+  covers them — otherwise the retry walks into a budget that cannot carry
+  it, wastes another call and extends the staleness it was meant to end.
   `pages` here means BUDGET SLOTS, not HTTP attempts: the retry after a
   failCode 305 reuses the slot its rejected attempt already paid for, so it
   raises the transport counter (kept for diagnostics) without costing

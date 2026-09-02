@@ -10,9 +10,9 @@ from typing import Any
 import httpx
 import pytest
 
-from app.adapters.base import AdapterProtocolError
+from app.adapters.base import AdapterProtocolError, AdapterRateLimitError
 from app.adapters.fusionsolar.client import XSRF_HEADER, RealFusionSolarClient
-from app.adapters.fusionsolar.policy import FusionSolarRatePolicy
+from app.adapters.fusionsolar.policy import Endpoint, FusionSolarRatePolicy
 
 BASE_URL = "https://fake.fusionsolar.example/thirdData"
 TOKEN = "token-abc"
@@ -417,4 +417,53 @@ async def test_empty_page_is_still_accepted_for_a_genuinely_empty_fleet():
     client = make_client(server)
     result = await client.list_stations()
     assert result.stations == [] and result.pages_retrieved == 1
+    await client.close()
+
+
+async def test_a_burst_the_budget_cannot_finish_stops_after_page_one():
+    # Page 1 is the first moment the burst size is known. Taking the free
+    # slots and being rejected on the last page spends budget on an
+    # inventory that is never retrieved AND leaves nothing for the retry, so
+    # a fleet that grew a page since the last refresh must defer instead.
+    server = StationListServer(
+        [[station(i) for i in range(100)] for _ in range(2)] + [[station(200)]]
+    )
+    policy = FusionSolarRatePolicy(
+        login_max_calls=100, station_list_max_calls=4, station_list_window_seconds=86_400.0
+    )
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username="nb-user",
+        system_code="nb-system-code",
+        policy=policy,
+        transport=httpx.MockTransport(server.handler),
+    )
+    # Two slots are already held by the previous refresh of a 2-page fleet.
+    await policy.acquire(Endpoint.STATION_LIST)
+    await policy.acquire(Endpoint.STATION_LIST)
+
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.list_stations()
+    assert len(server.requests) == 1  # page 1 only, not a partial burst
+    assert excinfo.value.retry_after_seconds  # a wait the scheduler can act on
+    await client.close()
+
+
+async def test_a_burst_that_fits_the_remaining_budget_still_runs():
+    # The guard must not defer a refresh the budget can actually carry.
+    server = StationListServer([[station(i) for i in range(100)], [station(100)]])
+    policy = FusionSolarRatePolicy(
+        login_max_calls=100, station_list_max_calls=4, station_list_window_seconds=86_400.0
+    )
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username="nb-user",
+        system_code="nb-system-code",
+        policy=policy,
+        transport=httpx.MockTransport(server.handler),
+    )
+    await policy.acquire(Endpoint.STATION_LIST)  # one slot gone, two pages need two
+    result = await client.list_stations()
+    assert result.pages_retrieved == 2
+    assert len(result.stations) == 101
     await client.close()

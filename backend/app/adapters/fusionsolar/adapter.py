@@ -28,7 +28,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
-from app.adapters.base import PlantInfo, PlantKpiReading, PlantStatus, VendorAdapter
+from app.adapters.base import (
+    AdapterError,
+    PlantInfo,
+    PlantKpiReading,
+    PlantStatus,
+    VendorAdapter,
+)
 from app.adapters.fusionsolar.client import FusionSolarClient
 from app.adapters.fusionsolar.policy import KPI_BATCH_SIZE
 
@@ -48,6 +54,11 @@ class InventoryDiagnostics:
     variant: str = ""
     duplicates_removed: int = 0
     calls_consumed: int = 0
+    # A failed retrieval still SPENT its calls. The scheduler needs that to
+    # know when the budget can carry the next attempt; without it a refresh
+    # that died on page 3 is retried while its own three calls are still
+    # occupying slots.
+    failed: bool = False
 
 
 @dataclass(slots=True)
@@ -158,7 +169,18 @@ class FusionSolarAdapter(VendorAdapter):
 
     async def list_plants(self) -> list[PlantInfo]:
         before = self._client.call_counts().station_list
-        result = await self._client.list_stations()
+        try:
+            result = await self._client.list_stations()
+        except AdapterError:
+            # Transport attempts, which is an UPPER bound on the budget
+            # slots spent (the post-305 retry reuses its slot). Over-
+            # reserving delays the next attempt slightly; under-reserving
+            # would send it into a budget that cannot carry it.
+            self.last_inventory_diagnostics = InventoryDiagnostics(
+                calls_consumed=self._client.call_counts().station_list - before,
+                failed=True,
+            )
+            raise
         plants: list[PlantInfo] = []
         throwaway = KpiDiagnostics()  # numeric validation counter for capacity
         for station in result.stations:

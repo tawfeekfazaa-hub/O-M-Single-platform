@@ -218,6 +218,24 @@ class IngestionScheduler:
                 self._earliest_burst_gap(self._last_inventory_at, slots),
             )
 
+    def _failed_deferral(self, deferral: float) -> float:
+        """Extend a failed refresh's deferral to cover the calls it spent.
+
+        A refresh that dies on page 3 has already paid for three slots, and
+        the rolling limiter keeps holding them. Retrying on the plain
+        cadence would send the next attempt into a budget that cannot carry
+        it: it would spend another call, be rejected, and leave the
+        inventory stale for longer than simply waiting. The failed burst is
+        recorded like a successful one and the wait covers it.
+        """
+        if not (self._station_list_max_calls and self._station_list_window):
+            return deferral
+        diag = getattr(self._adapter, "last_inventory_diagnostics", None)
+        slots = max(getattr(diag, "calls_consumed", 0) or 0, 1)
+        now = self._clock()
+        self._record_inventory_burst(now, slots)
+        return max(deferral, self._earliest_burst_gap(now, slots))
+
     def _record_inventory_burst(self, at: float, slots: int) -> None:
         """Remember one refresh's budget slots; forget what has aged out."""
         window = self._station_list_window or 0.0
@@ -301,7 +319,7 @@ class IngestionScheduler:
                     deferral = exc.retry_after_seconds or self._inventory_refresh
                     if self._station_list_window:
                         deferral = max(deferral, self._station_list_window)
-                    self._inventory_not_before = self._clock() + deferral
+                    self._inventory_not_before = self._clock() + self._failed_deferral(deferral)
                     logger.warning(
                         "inventory refresh rate-limited, deferred; KPI polling continues"
                     )
@@ -313,8 +331,8 @@ class IngestionScheduler:
                     # and aborting the cycle would stop KPI monitoring too.
                     # Defer the refresh instead and keep polling.
                     self._stale_error = str(exc)
-                    self._inventory_not_before = self._clock() + max(
-                        self._inventory_refresh, self._inventory_min_spacing
+                    self._inventory_not_before = self._clock() + self._failed_deferral(
+                        max(self._inventory_refresh, self._inventory_min_spacing)
                     )
                     logger.warning(
                         "inventory refresh failed (%s), deferred; KPI polling continues",
