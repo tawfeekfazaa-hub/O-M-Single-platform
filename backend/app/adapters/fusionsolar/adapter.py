@@ -12,8 +12,11 @@ Mapping rules (docs/FUSIONSOLAR-CONTRACT.md):
   station-level active-power field, so the REAL adapter stores None. Only
   the mock adapter (allow_synthetic_fields=True) maps the synthetic
   ``real_power`` field so the MVP dashboard has data to render;
-- ``params.currentTime`` is preserved as the vendor SERVER time (never a
-  device measurement timestamp) next to the local received-at time.
+- ``params.currentTime`` is carried on the in-flight reading as the vendor
+  SERVER time (never a device measurement timestamp) next to the local
+  received-at time; the persisted KPI schema does not store it yet —
+  durable retention (with the full raw envelope) arrives with the PR-2
+  Raw/Quarantine layer.
 
 Diagnostics carry counts only — never station identifiers or values.
 """
@@ -162,6 +165,12 @@ class FusionSolarAdapter(VendorAdapter):
         seen: set[str] = set()
         readings: list[PlantKpiReading] = []
         before = self._client.call_counts().station_real_kpi
+
+        # The official KPI allowance is ceil(plants/100) per window, so the
+        # client's budget must be scaled from the FULL requested count BEFORE
+        # the first batch — otherwise every batch after the first would be
+        # rejected by the 1-call constructor default.
+        self._client.set_kpi_plant_count(len(vendor_plant_ids))
 
         # Sequential batches of at most 100 codes — never concurrent.
         for start in range(0, len(vendor_plant_ids), KPI_BATCH_SIZE):

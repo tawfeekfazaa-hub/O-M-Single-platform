@@ -104,6 +104,10 @@ class MockFusionSolarClient:
     def call_counts(self) -> ClientCallCounts:
         return self._counts
 
+    def set_kpi_plant_count(self, plant_count: int) -> None:
+        # The mock has no rate budget to scale — accepted and ignored.
+        return None
+
     async def login(self) -> None:
         self._counts.login += 1
 

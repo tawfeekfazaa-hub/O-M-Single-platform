@@ -72,13 +72,21 @@ mask authentication/version errors).
 - Guards: every page retrieved; finite max-page bound; repeated-page and
   impossible-metadata detection; deterministic `stationCode` dedup;
   conflicting duplicates rejected; malformed pages never skipped
-  silently; missing pagination metadata accepted only flagged.
+  silently; missing pagination metadata accepted only flagged. The FIRST
+  page's `pageCount` is authoritative: a `pageCount` that changes or
+  disappears on a later page would silently truncate the inventory and is
+  rejected as a protocol error.
 - Budget: Huawei documents a small daily-style allowance whose exact
   formula **varies by SmartPVMS version** (one published form:
   `roundup(plants/100) × 10 + 24` per day — treated as
   `documented version difference`, NOT a universal constant). Our
   client-side budget of **4 calls/day** and the **6-hour inventory
   cadence are SAFETY DEFAULTS**, both configurable.
+- Cadence vs pagination: each page spends one station-list call, so the
+  scheduler stretches the effective spacing between inventory refreshes
+  to `pages × window / budget` — the 6-hour default holds only for a
+  one-page inventory on the 4/day default (2 pages → 12 h). A refresh
+  rejected by the budget defers itself and never aborts KPI polling.
 
 ## Real-time KPIs — `/thirdData/getStationRealKpi`
 
@@ -99,15 +107,23 @@ mask authentication/version errors).
   (percent-style `89` → `0.89`; an already-normalized 0..1 value is an
   explicitly tested compatibility case; negative/NaN/∞/>100 rejected).
 - NaN/∞ are rejected for every numeric field.
-- Envelope `params.currentTime` (epoch ms) is preserved as **vendor
-  server time** — it is NOT a device measurement timestamp — next to the
-  local received-at time (`ts`).
+- Envelope `params.currentTime` (epoch ms) is carried on the in-flight
+  reading as **vendor server time** — it is NOT a device measurement
+  timestamp — next to the local received-at time (`ts`). The persisted
+  KPI schema does not store it yet: durable retention (with the full raw
+  envelope) arrives with the PR-2 Raw/Quarantine layer.
 
 ## Errors & transport
 
 - `failCode 407` → rate-limit error with the endpoint window as a
   lower-bound retry delay; **never** an immediate retry, **never** a
   re-login (login budget is separate and precious).
+- `failCode 305` retry accounting: one logical call reserves exactly ONE
+  slot of its endpoint's budget; the single post-re-login retry reuses
+  the slot paid for by the rejected attempt (the re-login spends the
+  login budget as usual). Worst case this sends one extra HTTP request
+  per session expiry (≈30 min); *whether Huawei counts rejected requests
+  against the endpoint quota:* `unverified`.
 - HTTP `429` → rate-limit error; `Retry-After` parsed safely
   (delta-seconds or HTTP-date; garbage → endpoint-window hint).
   *Whether your tenant sends Retry-After:* `unverified`.

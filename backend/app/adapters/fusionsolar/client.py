@@ -99,6 +99,16 @@ class FusionSolarClient(Protocol):
 
     async def get_station_real_kpi(self, station_codes: list[str]) -> KpiBatchResult: ...
 
+    def set_kpi_plant_count(self, plant_count: int) -> None:
+        """Tell the client how many plants the caller will request in total.
+
+        The official real-time KPI allowance is ceil(plants/100) calls per
+        window, so the batching caller MUST announce the full requested
+        count before its first batch — otherwise the real client's budget
+        stays at the 1-call constructor default and every batch after the
+        first is rejected client-side. A no-op for budget-less clients.
+        """
+
     def is_logged_in(self) -> bool: ...
 
     def call_counts(self) -> ClientCallCounts: ...
@@ -171,8 +181,19 @@ class RealFusionSolarClient:
     def call_counts(self) -> ClientCallCounts:
         return self._counts
 
-    async def _post(self, endpoint: Endpoint, path: str, json: dict[str, Any]) -> httpx.Response:
-        await self._policy.acquire(endpoint)
+    def set_kpi_plant_count(self, plant_count: int) -> None:
+        self._policy.set_kpi_plant_count(plant_count)
+
+    async def _post(
+        self,
+        endpoint: Endpoint,
+        path: str,
+        json: dict[str, Any],
+        *,
+        consume_budget: bool = True,
+    ) -> httpx.Response:
+        if consume_budget:
+            await self._policy.acquire(endpoint)
         if endpoint is Endpoint.LOGIN:
             self._counts.login += 1
         elif endpoint is Endpoint.STATION_LIST:
@@ -247,12 +268,22 @@ class RealFusionSolarClient:
 
     async def _call(self, endpoint: Endpoint, path: str, json: dict[str, Any]) -> dict[str, Any]:
         """Authenticated envelope call: 407 -> rate limit; 305 -> at most one
-        controlled re-login and one retry; anything malformed -> protocol error."""
+        controlled re-login and one retry; anything malformed -> protocol error.
+
+        Budget accounting: one logical call reserves exactly ONE slot of its
+        endpoint's budget. The post-re-login retry after a failCode 305 reuses
+        the slot already paid for by the rejected attempt (the re-login itself
+        spends the login budget as usual) — otherwise a session expiry on a
+        fully-derived budget (e.g. KPI with <=100 plants) could never retry
+        and would drop the whole cycle. Worst case this sends one extra HTTP
+        request per session expiry (~30 min); whether Huawei counts rejected
+        requests against the quota is `unverified` (docs/FUSIONSOLAR-CONTRACT.md).
+        """
         if self._token is None:
             await self.login()
 
         for attempt in (1, 2):
-            response = await self._post(endpoint, path, json)
+            response = await self._post(endpoint, path, json, consume_budget=attempt == 1)
             payload = self._payload_from(endpoint, path, response)
             if payload.get("success"):
                 return payload
@@ -276,6 +307,15 @@ class RealFusionSolarClient:
     # ------------------------------------------------------------------ #
     # station list (/thirdData/getStationList) — both documented variants #
     # ------------------------------------------------------------------ #
+
+    def _parse_page_count(self, raw: Any) -> int:
+        try:
+            count = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise AdapterProtocolError("paginated station list has non-numeric pageCount") from exc
+        if count < 0 or count > self._max_pages:
+            raise AdapterProtocolError(f"impossible station list pageCount={count}")
+        return count
 
     async def list_stations(self) -> StationListResult:
         stations: list[dict[str, Any]] = []
@@ -314,20 +354,21 @@ class RealFusionSolarClient:
                 if not isinstance(rows, list):
                     raise AdapterProtocolError("paginated station list has no 'list' array")
                 raw_page_count = data.get("pageCount")
-                if raw_page_count is None:
-                    metadata_missing = True
-                    page_count = page_no  # accept what we got, flagged
-                else:
-                    try:
-                        page_count = int(raw_page_count)
-                    except (TypeError, ValueError) as exc:
-                        raise AdapterProtocolError(
-                            "paginated station list has non-numeric pageCount"
-                        ) from exc
-                    if page_count < 0 or page_count > self._max_pages:
-                        raise AdapterProtocolError(
-                            f"impossible station list pageCount={page_count}"
-                        )
+                if page_no == 1:
+                    if raw_page_count is None:
+                        metadata_missing = True
+                        page_count = page_no  # accept what we got, flagged
+                    else:
+                        page_count = self._parse_page_count(raw_page_count)
+                elif raw_page_count is None:
+                    # The FIRST page's pageCount is authoritative: metadata
+                    # that disappears or changes mid-pagination would let the
+                    # loop end early and silently truncate the inventory.
+                    raise AdapterProtocolError(
+                        "station list pageCount disappeared during pagination"
+                    )
+                elif self._parse_page_count(raw_page_count) != page_count:
+                    raise AdapterProtocolError("station list pageCount changed during pagination")
                 if rows == [] and page_no < (page_count or 0):
                     raise AdapterProtocolError(
                         "station list returned an empty page before pageCount was reached"

@@ -113,6 +113,70 @@ async def test_inventory_refreshes_after_cadence_elapses(repository: InMemoryRep
     assert client.call_counts().station_list == 2
 
 
+async def test_paginated_inventory_stretches_refresh_spacing(repository: InMemoryRepository):
+    # 2 station-list calls per refresh on a 4/day budget -> refreshes must
+    # sit >= 2 * 86400 / 4 = 43200 s apart, whatever the configured cadence.
+    client = MockFusionSolarClient(
+        now=lambda: FIXED_NOON_UTC, station_list_variant="paginated", page_size=2
+    )
+    clock = FakeClock()
+    scheduler = IngestionScheduler(
+        mock_adapter(client),
+        repository,
+        interval_seconds=300.0,
+        inventory_refresh_seconds=21_600.0,
+        station_list_max_calls=4,
+        station_list_window_seconds=86_400.0,
+        jitter=lambda: 0.5,
+        clock=clock,
+    )
+    result = await scheduler.run_cycle()
+    assert result.inventory_refreshed and result.inventory_pages == 2
+    assert client.call_counts().station_list == 2
+    clock.now = 21_601.0  # past the configured 6 h cadence...
+    result = await scheduler.run_cycle()
+    assert not result.inventory_refreshed  # ...but inside the derived spacing
+    clock.now = 43_201.0
+    result = await scheduler.run_cycle()
+    assert result.inventory_refreshed
+    assert client.call_counts().station_list == 4
+
+
+async def test_inventory_rate_limit_defers_and_never_aborts_kpi_polling(
+    repository: InMemoryRepository,
+):
+    class InventoryLimitedAdapter(FusionSolarAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                MockFusionSolarClient(now=lambda: FIXED_NOON_UTC),
+                allow_synthetic_fields=True,
+            )
+            self.list_calls = 0
+
+        async def list_plants(self) -> list[PlantInfo]:
+            self.list_calls += 1
+            raise AdapterRateLimitError(
+                "client-side station_list budget exhausted", retry_after_seconds=43_200.0
+            )
+
+    # Seed the repository as an earlier successful refresh would have.
+    await repository.upsert_plants(await mock_adapter().list_plants())
+    adapter = InventoryLimitedAdapter()
+    clock = FakeClock()
+    scheduler = make_scheduler(adapter, repository, clock=clock)
+
+    result = await scheduler.run_cycle()
+    assert result.inventory_rate_limited and not result.inventory_refreshed
+    assert result.error is None  # the cycle itself did not fail
+    assert result.readings_written == 3  # KPI polling still ran
+    assert scheduler.next_delay(result) == 300.0  # normal interval, no backoff
+
+    # The refresh deferred itself: no second attempt inside the window.
+    clock.now = 300.0
+    await scheduler.run_cycle()
+    assert adapter.list_calls == 1
+
+
 async def test_min_interval_floor_is_enforced(repository: InMemoryRepository):
     scheduler = IngestionScheduler(
         mock_adapter(),

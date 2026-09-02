@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     scheduler_interval_seconds: float = 300.0
     # Station inventory is refreshed on its own conservative cadence and
     # must NOT be fetched on every KPI cycle. (safety default: 6 hours)
+    # This is a LOWER bound: a paginated inventory spends one station-list
+    # call per page, so the scheduler stretches the effective spacing to
+    # pages x window / budget (6 h holds only for a one-page inventory on
+    # the 4/day default; e.g. 2 pages -> 12 h between refreshes).
     fusionsolar_inventory_refresh_seconds: float = 21_600.0
 
     cors_origins: str = "http://localhost:3000"

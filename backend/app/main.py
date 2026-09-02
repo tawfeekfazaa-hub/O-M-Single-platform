@@ -81,6 +81,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 interval_seconds=settings.scheduler_interval_seconds,
                 min_interval_seconds=min_interval,
                 inventory_refresh_seconds=settings.fusionsolar_inventory_refresh_seconds,
+                # Lets the scheduler stretch the refresh spacing when a
+                # paginated inventory consumes several station-list calls.
+                station_list_max_calls=settings.fusionsolar_station_list_max_calls,
+                station_list_window_seconds=settings.fusionsolar_station_list_window_seconds,
             )
             app.state.scheduler = scheduler
             scheduler.start()

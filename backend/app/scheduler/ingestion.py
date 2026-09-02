@@ -4,7 +4,12 @@ The ONLY component allowed to call vendor adapters (CLAUDE.md rule 2).
 
 Two independent cadences (docs/FUSIONSOLAR-CONTRACT.md):
 - station INVENTORY refresh — conservative (default 6 h): the vendor's
-  station-list budget is tiny, so it must NOT be called on every cycle;
+  station-list budget is tiny, so it must NOT be called on every cycle.
+  A paginated inventory consumes one station-list call PER PAGE, so when
+  the daily budget is known the effective spacing between refreshes is
+  stretched to pages x window / budget (a 6 h cadence is only sustainable
+  for a one-page inventory on the 4/day safety default). A rate-limited
+  refresh defers itself and never aborts KPI polling for the cycle;
 - real-time KPI polling — every cycle, reading the plant list from the
   repository cache and fetching KPIs in sequential batches.
 
@@ -40,6 +45,7 @@ class CycleResult:
 
     inventory_refreshed: bool = False
     inventory_pages: int = 0
+    inventory_rate_limited: bool = False
     plants_upserted: int = 0
     requested_plants: int = 0
     readings_returned: int = 0
@@ -91,6 +97,8 @@ class IngestionScheduler:
         interval_seconds: float = 300.0,
         min_interval_seconds: float = 0.0,
         inventory_refresh_seconds: float = 21_600.0,
+        station_list_max_calls: int | None = None,
+        station_list_window_seconds: float | None = None,
         backoff_base_seconds: float = 60.0,
         backoff_max_seconds: float = 1800.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -102,6 +110,12 @@ class IngestionScheduler:
         # min_interval lets real-mode wiring enforce the KPI window+margin.
         self._interval = max(interval_seconds, min_interval_seconds)
         self._inventory_refresh = inventory_refresh_seconds
+        # Station-list budget (when wired) stretches the effective refresh
+        # spacing for paginated inventories; None -> no derived spacing.
+        self._station_list_max_calls = station_list_max_calls
+        self._station_list_window = station_list_window_seconds
+        self._inventory_min_spacing = 0.0
+        self._inventory_not_before: float | None = None
         self._backoff_base = backoff_base_seconds
         self._backoff_max = backoff_max_seconds
         self._sleep = sleep
@@ -117,20 +131,33 @@ class IngestionScheduler:
         return self._interval
 
     def _inventory_due(self) -> bool:
+        now = self._clock()
+        if self._inventory_not_before is not None and now < self._inventory_not_before:
+            return False
         if self._last_inventory_at is None:
             return True
-        return (self._clock() - self._last_inventory_at) >= self._inventory_refresh
+        spacing = max(self._inventory_refresh, self._inventory_min_spacing)
+        return (now - self._last_inventory_at) >= spacing
 
     async def _refresh_inventory(self, result: CycleResult) -> None:
         plants = await self._adapter.list_plants()
         await self._repository.upsert_plants(plants)
         self._last_inventory_at = self._clock()
+        self._inventory_not_before = None
         result.inventory_refreshed = True
         result.plants_upserted = len(plants)
+        calls = 1
         diag = getattr(self._adapter, "last_inventory_diagnostics", None)
         if diag is not None:
             result.inventory_pages = diag.pages_retrieved
             result.calls_consumed += diag.calls_consumed
+            calls = max(diag.calls_consumed, 1)
+        if self._station_list_max_calls and self._station_list_window:
+            # Each page spent one station-list call: keep calls/day within
+            # the budget by stretching the spacing between refreshes.
+            self._inventory_min_spacing = (
+                self._station_list_window * calls / self._station_list_max_calls
+            )
 
     async def run_cycle(self) -> CycleResult:
         """One ingestion pass. Never raises — errors land in the result."""
@@ -140,7 +167,24 @@ class IngestionScheduler:
 
             # Inventory on its own conservative cadence — never every cycle.
             if self._inventory_due():
-                await self._refresh_inventory(result)
+                try:
+                    await self._refresh_inventory(result)
+                except AdapterRateLimitError as exc:
+                    # The station-list budget is independent of the KPI
+                    # budget: a rate-limited refresh defers itself and must
+                    # never abort KPI polling for this cycle.
+                    result.inventory_rate_limited = True
+                    fallback = (
+                        self._station_list_window / self._station_list_max_calls
+                        if self._station_list_max_calls and self._station_list_window
+                        else self._inventory_refresh
+                    )
+                    self._inventory_not_before = self._clock() + (
+                        exc.retry_after_seconds if exc.retry_after_seconds is not None else fallback
+                    )
+                    logger.warning(
+                        "inventory refresh rate-limited, deferred; KPI polling continues"
+                    )
 
             # KPI polling uses the repository inventory, not a vendor call.
             plants = [

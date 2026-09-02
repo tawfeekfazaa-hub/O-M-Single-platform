@@ -42,7 +42,10 @@ from app.adapters.base import (  # noqa: E402
     AdapterRateLimitError,
     AdapterTransientError,
 )
-from app.adapters.fusionsolar import build_fusionsolar_adapter  # noqa: E402
+from app.adapters.fusionsolar import (  # noqa: E402
+    FusionSolarAdapter,
+    build_fusionsolar_adapter,
+)
 from app.config import Settings, get_settings  # noqa: E402
 
 EXIT_OK = 0
@@ -55,13 +58,32 @@ EXIT_PROTOCOL = 7
 
 # Hard cap on vendor calls a single live run may consume.
 LIVE_MAX_CALLS = 4  # 1 login + up to 2 station-list pages + 1 KPI batch
+# Pagination is capped BEFORE any call is made, so login + pages + the
+# reserved KPI batch can never exceed LIVE_MAX_CALLS regardless of tenant
+# size or the configured page guard. Inventories with more pages are
+# validated by the scheduler, not by this checker.
+LIVE_MAX_STATION_LIST_PAGES = LIVE_MAX_CALLS - 2  # minus login, minus KPI
+
+assert 1 + LIVE_MAX_STATION_LIST_PAGES + 1 <= LIVE_MAX_CALLS
+
+
+def live_capped_settings(settings: Settings) -> Settings:
+    """Settings for a live run: page guard clamped under the call cap."""
+    return settings.model_copy(
+        update={
+            "fusionsolar_station_list_max_pages": min(
+                settings.fusionsolar_station_list_max_pages, LIVE_MAX_STATION_LIST_PAGES
+            )
+        }
+    )
 
 
 def _plan_lines(settings: Settings) -> list[str]:
     return [
         f"planned maximum vendor calls for one live run (hard cap {LIVE_MAX_CALLS}):",
         "  - POST /login .............. 1 call  (login budget)",
-        "  - POST /getStationList ..... up to 2 pages (station-list budget)",
+        f"  - POST /getStationList ..... up to {LIVE_MAX_STATION_LIST_PAGES} pages, "
+        "hard-capped up front (station-list budget)",
         "  - POST /getStationRealKpi .. 1 batch, first <=100 plants (KPI budget)",
         f"profile={settings.fusionsolar_api_profile} mode={settings.fusionsolar_mode}",
     ]
@@ -95,9 +117,13 @@ def sanitize_error(exc: Exception) -> str:
     return "unexpected-error"
 
 
-async def run_live(settings: Settings) -> int:
-    """FUTURE live path — see the prohibition notice above."""
-    adapter = build_fusionsolar_adapter(settings)
+async def run_live(settings: Settings, adapter: FusionSolarAdapter | None = None) -> int:
+    """FUTURE live path — see the prohibition notice above.
+
+    ``adapter`` is injectable for offline tests only; the default builds
+    the real adapter from page-capped settings.
+    """
+    adapter = adapter or build_fusionsolar_adapter(live_capped_settings(settings))
     calls_used = 0
     try:
         await adapter.authenticate()
@@ -107,7 +133,9 @@ async def run_live(settings: Settings) -> int:
         plants = await adapter.list_plants()
         inv = adapter.last_inventory_diagnostics
         calls_used += inv.calls_consumed
-        if calls_used > LIVE_MAX_CALLS:
+        if calls_used >= LIVE_MAX_CALLS:
+            # The last budgeted slot is RESERVED for the KPI batch; landing
+            # on the cap here means pagination consumed it — stop.
             print("call cap reached — stopping before KPI fetch")
             return EXIT_OK
         print(

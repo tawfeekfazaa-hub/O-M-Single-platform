@@ -17,6 +17,7 @@ from app.adapters.base import (
     AdapterRateLimitError,
     AdapterTransientError,
 )
+from app.adapters.fusionsolar.adapter import FusionSolarAdapter
 from app.adapters.fusionsolar.client import XSRF_HEADER, RealFusionSolarClient
 from app.adapters.fusionsolar.policy import FusionSolarRatePolicy
 
@@ -216,6 +217,37 @@ async def test_concurrent_logins_are_single_flight():
     client = make_client(fake)
     await asyncio.gather(client.login(), client.login(), client.login())
     assert [p for p, _ in fake.requests].count("/login") == 1
+    await client.close()
+
+
+async def test_session_expiry_retry_reuses_the_reserved_budget_slot():
+    # With <=100 plants the KPI budget is exactly ONE call per window; the
+    # promised post-re-login retry must reuse the slot the rejected attempt
+    # already paid for instead of failing on an exhausted budget.
+    fake = FakeFusionSolar()
+    policy = FusionSolarRatePolicy(login_max_calls=100, station_list_max_calls=100)
+    policy.set_kpi_plant_count(1)  # ceil(1/100) -> 1 call per window
+    client = make_client(fake, policy)
+    await client.login()
+    fake.expire_session_times = 1
+    result = await client.get_station_real_kpi(["NE=1"])
+    assert [r["stationCode"] for r in result.rows] == ["NE=1"]
+    assert [p for p, _ in fake.requests].count("/login") == 2  # one re-login
+    await client.close()
+
+
+async def test_adapter_scales_kpi_budget_from_full_plant_count():
+    # The policy's KPI budget starts at the 1-call constructor default; the
+    # adapter must announce the FULL requested count before its first batch
+    # or every multi-batch tenant would be rejected client-side.
+    fake = FakeFusionSolar()
+    policy = FusionSolarRatePolicy(login_max_calls=100, station_list_max_calls=100)
+    client = make_client(fake, policy)
+    adapter = FusionSolarAdapter(client, allow_synthetic_fields=False)
+    codes = [f"NE={i}" for i in range(150)]
+    readings = await adapter.fetch_plant_kpis(codes)
+    assert len(readings) == 150
+    assert client.call_counts().station_real_kpi == 2  # two sequential batches
     await client.close()
 
 

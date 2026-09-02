@@ -33,12 +33,16 @@ class ScriptedClient:
         self._stations = stations or []
         self._counts = ClientCallCounts()
         self.kpi_batches: list[list[str]] = []
+        self.kpi_plant_counts: list[int] = []
 
     def is_logged_in(self) -> bool:
         return True
 
     def call_counts(self) -> ClientCallCounts:
         return self._counts
+
+    def set_kpi_plant_count(self, plant_count: int) -> None:
+        self.kpi_plant_counts.append(plant_count)
 
     async def login(self) -> None:
         self._counts.login += 1
@@ -186,6 +190,8 @@ async def test_batches_of_100_sequential():
     readings = await adapter.fetch_plant_kpis(codes)
     assert len(readings) == 250
     assert [len(b) for b in client.kpi_batches] == [100, 100, 50]
+    # The FULL count is announced before the first batch (budget scaling).
+    assert client.kpi_plant_counts == [250]
     diag = adapter.last_kpi_diagnostics
     assert diag.batches == 3 and diag.calls_consumed == 3 and diag.complete
 

@@ -36,7 +36,9 @@ class StationListServer:
         self.pages = pages
         self.direct = direct
         self.page_count_override: Any = "auto"
+        self.page_count_per_page: dict[int, Any] = {}
         self.omit_page_count = False
+        self.omit_page_count_on: set[int] = set()
         self.data_override: Any = None
         self.requests: list[dict[str, Any]] = []
 
@@ -64,10 +66,15 @@ class StationListServer:
                 "pageSize": int(body.get("pageSize", 100)),
                 "total": sum(len(p) for p in pages),
             }
-            if not self.omit_page_count:
-                data["pageCount"] = (
-                    len(pages) if self.page_count_override == "auto" else self.page_count_override
-                )
+            if not self.omit_page_count and page_no not in self.omit_page_count_on:
+                if page_no in self.page_count_per_page:
+                    data["pageCount"] = self.page_count_per_page[page_no]
+                else:
+                    data["pageCount"] = (
+                        len(pages)
+                        if self.page_count_override == "auto"
+                        else self.page_count_override
+                    )
         return httpx.Response(200, json={"success": True, "failCode": 0, "data": data})
 
 
@@ -194,6 +201,26 @@ async def test_missing_page_count_metadata_is_flagged_not_silent():
 async def test_impossible_page_count_is_protocol_error(bad_count: Any):
     server = StationListServer(pages=[[station(1)]])
     server.page_count_override = bad_count
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_page_count_change_mid_pagination_is_protocol_error():
+    # First page promises 3 pages; the second claims 2 — accepting the new
+    # value would silently drop the final page of the inventory.
+    server = StationListServer(pages=[[station(1)], [station(2)], [station(3)]])
+    server.page_count_per_page = {2: 2}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_page_count_disappearing_mid_pagination_is_protocol_error():
+    server = StationListServer(pages=[[station(1)], [station(2)], [station(3)]])
+    server.omit_page_count_on = {2}
     client = make_client(server)
     with pytest.raises(AdapterProtocolError):
         await client.list_stations()

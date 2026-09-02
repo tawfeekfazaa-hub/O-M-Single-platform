@@ -29,7 +29,7 @@ limits each endpoint class separately:
 | Endpoint | Official limit | Our client-side budget |
 |----------|----------------|------------------------|
 | `POST /login` | 5 / 10 min per user (also: 5 wrong passwords → 30-min lock) | 4 / 600 s (margin) |
-| `POST /getStationList` | small daily-style allowance; exact formula varies by SmartPVMS version | **safety default** 4 / day; inventory cadence 6 h |
+| `POST /getStationList` | small daily-style allowance; exact formula varies by SmartPVMS version | **safety default** 4 / day; inventory cadence 6 h, stretched to pages × window / budget for paginated inventories (2 pages → 12 h) |
 | `POST /getStationRealKpi` | ceil(plants/100) / 5 min, ≤100 codes per call | derived at runtime from plant count |
 
 `failCode 407` **or HTTP 429** = frequency exceeded → back off (jitter),
@@ -60,7 +60,7 @@ SERVER time (not a device measurement timestamp).
 | `dataItemMap.real_health_state` | plant status | 1 disconnected, 2 faulty, 3 healthy, else unknown |
 | `dataItemMap.performance_ratio` | `performance_ratio` | tenant-dependent; normalized to 0..1 (89 → 0.89) |
 | — | `active_power_kw` | **no documented station-level field → None in real mode** (mock's `real_power` is synthetic) |
-| `params.currentTime` | `vendor_server_time` | vendor server clock |
+| `params.currentTime` | `vendor_server_time` | vendor server clock — on the in-flight reading only; persisted from PR-2 (Raw/Quarantine) |
 
 Field availability differs by tenant/version — every field is optional
 and invalid values (NaN/∞/impossible) are rejected, not stored.

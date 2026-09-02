@@ -16,6 +16,7 @@ from app.adapters.base import (
     AdapterRateLimitError,
     AdapterTransientError,
 )
+from app.adapters.fusionsolar.adapter import InventoryDiagnostics, KpiDiagnostics
 from app.config import Settings
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_fusionsolar.py"
@@ -113,6 +114,49 @@ def test_error_sanitizer_yields_categories_only(exc: Exception, expected: str):
     message = check.sanitize_error(exc)
     assert expected in message
     assert "boom" not in message  # raw exception text never leaks
+
+
+def test_live_page_guard_is_capped_under_the_call_budget():
+    capped = check.live_capped_settings(make_settings(fusionsolar_station_list_max_pages=50))
+    assert capped.fusionsolar_station_list_max_pages == check.LIVE_MAX_STATION_LIST_PAGES
+    # An already-lower guard is never raised.
+    low = check.live_capped_settings(make_settings(fusionsolar_station_list_max_pages=1))
+    assert low.fusionsolar_station_list_max_pages == 1
+    # Arithmetic: login + capped pages + the reserved KPI batch fit the cap.
+    assert 1 + check.LIVE_MAX_STATION_LIST_PAGES + 1 <= check.LIVE_MAX_CALLS
+
+
+async def test_live_run_reserves_the_kpi_slot(capsys: pytest.CaptureFixture):
+    # If pagination lands exactly on the cap, the KPI batch must NOT run —
+    # the last budgeted slot is reserved for it, never added on top.
+    class CapAdapter:
+        def __init__(self) -> None:
+            self.kpi_called = False
+            self.closed = False
+            self.last_inventory_diagnostics = InventoryDiagnostics(
+                stations=250, pages_retrieved=3, variant="paginated", calls_consumed=3
+            )
+            self.last_kpi_diagnostics = KpiDiagnostics()
+
+        async def authenticate(self) -> None:
+            return None
+
+        async def list_plants(self) -> list:
+            return []
+
+        async def fetch_plant_kpis(self, vendor_plant_ids: list[str]) -> list:
+            self.kpi_called = True
+            return []
+
+        async def close(self) -> None:
+            self.closed = True
+
+    adapter = CapAdapter()
+    code = await check.run_live(make_settings(), adapter=adapter)
+    assert code == check.EXIT_OK
+    assert adapter.kpi_called is False
+    assert adapter.closed is True  # client closed on every path
+    assert "stopping before KPI fetch" in capsys.readouterr().out
 
 
 def test_exit_codes_are_deterministic_constants():

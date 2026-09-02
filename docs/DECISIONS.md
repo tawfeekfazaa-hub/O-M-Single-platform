@@ -21,7 +21,11 @@ Decisions (full contract: docs/FUSIONSOLAR-CONTRACT.md):
    another endpoint's budget.
 3. **Inventory and KPI schedules are separate**: station inventory
    refreshes on a conservative 6-hour default cadence; KPI cycles read
-   the repository cache and never call the station-list endpoint.
+   the repository cache and never call the station-list endpoint. Since a
+   paginated inventory spends one station-list call per page, the
+   scheduler stretches the effective refresh spacing to pages × window /
+   budget, and a budget-rejected refresh defers itself without aborting
+   KPI polling.
 4. **Station-list pagination** (pageNo/pageSize=100) with both documented
    response variants on the same path, finite page guards, repeated-page
    detection, deterministic dedup, and no silent skipping of malformed
@@ -33,8 +37,9 @@ Decisions (full contract: docs/FUSIONSOLAR-CONTRACT.md):
    policy decision.
 6. Real mapping never invents station active power (no documented field →
    None); the mock's synthetic fields are mock-only and documented as
-   such. Vendor `params.currentTime` is stored as server time, never as a
-   measurement timestamp.
+   such. Vendor `params.currentTime` is carried on the reading as server
+   time, never as a measurement timestamp; it is persisted (with the raw
+   envelope) only from PR-2 Raw/Quarantine onward.
 
 ## ADR-004 — 2026-09-01 — Repository layer with in-memory + Postgres backends
 
