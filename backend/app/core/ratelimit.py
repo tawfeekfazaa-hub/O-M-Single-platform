@@ -40,6 +40,16 @@ class RollingWindowRateLimiter:
         self._sleep = sleep
         self._calls: deque[float] = deque()
 
+    def set_max_calls(self, max_calls: int) -> None:
+        """Adjust the budget in place, preserving the call history.
+
+        Used for budgets that are derived at runtime (e.g. FusionSolar's
+        real-time KPI allowance scales with the number of plants).
+        """
+        if max_calls < 1:
+            raise ValueError("max_calls must be >= 1")
+        self.max_calls = max_calls
+
     def _prune(self, now: float) -> None:
         cutoff = now - self.window_seconds
         while self._calls and self._calls[0] <= cutoff:
