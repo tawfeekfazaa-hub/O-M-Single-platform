@@ -41,7 +41,7 @@ sequential. Exhausting one budget never spends another.
 | Endpoint | Purpose | Notes |
 |----------|---------|-------|
 | `POST /login` | obtain XSRF token | counts toward the login budget |
-| `POST /getStationList` | plant inventory | `pageNo`/`pageSize=100`; BOTH documented variants parsed on this path (direct list and `{list,pageNo,pageSize,pageCount,total}`); refreshed on the 6-h cadence, never every KPI cycle |
+| `POST /getStationList` | plant inventory | `pageNo`/`pageSize=100`; BOTH documented variants parsed on this path (direct list and `{list,pageNo,pageSize,pageCount,total}`); the paginated envelope is validated strictly (all four fields mandatory, stable across pages, final count == `total`) and a failed validation keeps the previous inventory; refreshed on the 6-h cadence, never every KPI cycle |
 | `POST /getStationRealKpi` | real-time station KPIs | ≤100 `stationCodes` per sequential batch |
 
 `/thirdData/stations` + OAuth are a documented FUTURE upgrade path

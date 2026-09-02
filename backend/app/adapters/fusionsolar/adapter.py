@@ -47,7 +47,6 @@ class InventoryDiagnostics:
     pages_retrieved: int = 0
     variant: str = ""
     duplicates_removed: int = 0
-    metadata_missing: bool = False
     calls_consumed: int = 0
 
 
@@ -154,7 +153,6 @@ class FusionSolarAdapter(VendorAdapter):
             pages_retrieved=result.pages_retrieved,
             variant=result.variant,
             duplicates_removed=result.duplicates_removed,
-            metadata_missing=result.metadata_missing,
             calls_consumed=self._client.call_counts().station_list - before,
         )
         return plants

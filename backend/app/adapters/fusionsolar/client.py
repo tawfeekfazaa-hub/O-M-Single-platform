@@ -62,7 +62,6 @@ class StationListResult:
     variant: str  # "direct_list" | "paginated"
     pages_retrieved: int
     duplicates_removed: int = 0
-    metadata_missing: bool = False
 
 
 @dataclass(slots=True)
@@ -308,12 +307,30 @@ class RealFusionSolarClient:
     # station list (/thirdData/getStationList) — both documented variants #
     # ------------------------------------------------------------------ #
 
-    def _parse_page_count(self, raw: Any) -> int:
+    @staticmethod
+    def _require_int(data: dict[str, Any], key: str) -> int:
+        """Read a MANDATORY non-negative integer field of the paginated envelope.
+
+        Missing or non-integral pagination metadata is a contract violation,
+        never something to guess a default for: a wrong assumption here can
+        turn a truncated inventory into an apparently complete one.
+        """
+        raw = data.get(key)
+        if raw is None:
+            raise AdapterProtocolError(f"paginated station list is missing {key}")
+        if isinstance(raw, bool) or isinstance(raw, float) and not raw.is_integer():
+            raise AdapterProtocolError(f"paginated station list has non-integer {key}")
         try:
-            count = int(raw)
+            value = int(raw)
         except (TypeError, ValueError) as exc:
-            raise AdapterProtocolError("paginated station list has non-numeric pageCount") from exc
-        if count < 0 or count > self._max_pages:
+            raise AdapterProtocolError(f"paginated station list has non-numeric {key}") from exc
+        if value < 0:
+            raise AdapterProtocolError(f"paginated station list has negative {key}")
+        return value
+
+    def _parse_page_count(self, data: dict[str, Any]) -> int:
+        count = self._require_int(data, "pageCount")
+        if count > self._max_pages:
             raise AdapterProtocolError(f"impossible station list pageCount={count}")
         return count
 
@@ -322,10 +339,11 @@ class RealFusionSolarClient:
         seen: dict[str, dict[str, Any]] = {}
         duplicates_removed = 0
         variant: str | None = None
-        metadata_missing = False
         previous_signature: tuple[Any, ...] | None = None
         page_no = 1
         page_count: int | None = None
+        page_size: int | None = None
+        total: int | None = None
 
         while True:
             if page_no > self._max_pages:
@@ -353,22 +371,35 @@ class RealFusionSolarClient:
                 rows = data.get("list")
                 if not isinstance(rows, list):
                     raise AdapterProtocolError("paginated station list has no 'list' array")
-                raw_page_count = data.get("pageCount")
-                if page_no == 1:
-                    if raw_page_count is None:
-                        metadata_missing = True
-                        page_count = page_no  # accept what we got, flagged
-                    else:
-                        page_count = self._parse_page_count(raw_page_count)
-                elif raw_page_count is None:
-                    # The FIRST page's pageCount is authoritative: metadata
-                    # that disappears or changes mid-pagination would let the
-                    # loop end early and silently truncate the inventory.
+                # Strict envelope contract: pageNo/pageSize/pageCount/total
+                # must all be present, well-formed and stable across pages.
+                # Incomplete or contradictory metadata is rejected instead of
+                # defaulted, because a truncated inventory that passes as
+                # complete would silently retire live plants downstream.
+                echoed_page_no = self._require_int(data, "pageNo")
+                if echoed_page_no != page_no:
                     raise AdapterProtocolError(
-                        "station list pageCount disappeared during pagination"
+                        f"station list echoed pageNo={echoed_page_no} for requested page {page_no}"
                     )
-                elif self._parse_page_count(raw_page_count) != page_count:
+                echoed_page_size = self._require_int(data, "pageSize")
+                if echoed_page_size < 1:
+                    raise AdapterProtocolError("station list pageSize must be >= 1")
+                if len(rows) > echoed_page_size:
+                    raise AdapterProtocolError("station list page holds more rows than pageSize")
+                echoed_page_count = self._parse_page_count(data)
+                echoed_total = self._require_int(data, "total")
+                if page_no == 1:
+                    page_count = echoed_page_count
+                    page_size = echoed_page_size
+                    total = echoed_total
+                elif echoed_page_count != page_count:
+                    # The FIRST page's metadata is authoritative: values that
+                    # change mid-pagination could end the loop early.
                     raise AdapterProtocolError("station list pageCount changed during pagination")
+                elif echoed_page_size != page_size:
+                    raise AdapterProtocolError("station list pageSize changed during pagination")
+                elif echoed_total != total:
+                    raise AdapterProtocolError("station list total changed during pagination")
                 if rows == [] and page_no < (page_count or 0):
                     raise AdapterProtocolError(
                         "station list returned an empty page before pageCount was reached"
@@ -402,12 +433,19 @@ class RealFusionSolarClient:
                 break
             page_no += 1
 
+        if total is not None and len(stations) != total:
+            # Counts only — never identifiers. A short (or long) inventory is
+            # a failed retrieval, not a smaller plant fleet.
+            raise AdapterProtocolError(
+                f"station list returned {len(stations)} unique stations "
+                f"but the envelope reported total={total}"
+            )
+
         return StationListResult(
             stations=stations,
             variant=variant or "direct_list",
             pages_retrieved=page_no,
             duplicates_removed=duplicates_removed,
-            metadata_missing=metadata_missing,
         )
 
     # ------------------------------------------------------------------ #

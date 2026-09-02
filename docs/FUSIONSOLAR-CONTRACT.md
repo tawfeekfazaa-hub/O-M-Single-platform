@@ -69,13 +69,25 @@ mask authentication/version errors).
 - Station fields used: `stationCode`, `stationName`, `stationAddr`,
   `capacity` (**MW**, stored as kWp ×1000 — unit `confirmed` for the
   legacy variant; for a paginated tenant: `requires-live-contract-validation`).
+- **Strict paginated-envelope contract.** `pageNo`, `pageSize`,
+  `pageCount` and `total` are all MANDATORY and validated on every page:
+  the echoed `pageNo` must equal the requested page; `pageSize` must be
+  >= 1 and never smaller than the rows delivered; the FIRST page's
+  `pageCount`/`pageSize`/`total` are authoritative and any change on a
+  later page is rejected; and at the end the number of unique stations
+  must equal `total`. Missing or contradictory metadata raises
+  `AdapterProtocolError` — nothing is defaulted or guessed, because a
+  truncated inventory that passed as complete would retire live plants
+  downstream.
 - Guards: every page retrieved; finite max-page bound; repeated-page and
-  impossible-metadata detection; deterministic `stationCode` dedup;
-  conflicting duplicates rejected; malformed pages never skipped
-  silently; missing pagination metadata accepted only flagged. The FIRST
-  page's `pageCount` is authoritative: a `pageCount` that changes or
-  disappears on a later page would silently truncate the inventory and is
-  rejected as a protocol error.
+  impossible-metadata detection; deterministic `stationCode` dedup (the
+  unique count, not the row count, is what `total` is checked against);
+  conflicting duplicates rejected; malformed pages never skipped silently.
+- A failed validation means **no inventory update at all**: the
+  repository keeps the previously stored plants and the cycle is reported
+  as failed, never as a successful refresh.
+- The legacy direct-list variant is unchanged: one call, complete by
+  definition, no pagination metadata expected.
 - Budget: Huawei documents a small daily-style allowance whose exact
   formula **varies by SmartPVMS version** (one published form:
   `roundup(plants/100) × 10 + 24` per day — treated as

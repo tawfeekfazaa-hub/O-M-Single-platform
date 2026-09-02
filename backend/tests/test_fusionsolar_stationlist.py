@@ -39,8 +39,18 @@ class StationListServer:
         self.page_count_per_page: dict[int, Any] = {}
         self.omit_page_count = False
         self.omit_page_count_on: set[int] = set()
+        # Per-page overrides for the rest of the paginated envelope, so the
+        # strict contract can be exercised field by field.
+        self.page_no_per_page: dict[int, Any] = {}
+        self.page_size_per_page: dict[int, Any] = {}
+        self.total_per_page: dict[int, Any] = {}
+        self.total_override: Any = None
+        self.omit_fields: set[str] = set()
         self.data_override: Any = None
         self.requests: list[dict[str, Any]] = []
+        # Opt-in only: the station-list tests keep the strict "no other
+        # endpoint is ever tried" assertion below.
+        self.serve_kpi = False
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path.removeprefix("/thirdData")
@@ -48,6 +58,17 @@ class StationListServer:
         if path == "/login":
             return httpx.Response(
                 200, json={"success": True, "failCode": 0}, headers={XSRF_HEADER: TOKEN}
+            )
+        if path == "/getStationRealKpi" and self.serve_kpi:
+            codes = [c for c in str(body.get("stationCodes", "")).split(",") if c]
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "failCode": 0,
+                    "data": [{"stationCode": c, "dataItemMap": {"day_power": 1.0}} for c in codes],
+                    "params": {"currentTime": 1_780_000_000_000},
+                },
             )
         assert path == "/getStationList", f"unexpected endpoint called: {path}"
         self.requests.append(body)
@@ -60,11 +81,14 @@ class StationListServer:
             page_no = int(body.get("pageNo", 1))
             pages = self.pages or [[]]
             rows = pages[page_no - 1] if 1 <= page_no <= len(pages) else []
+            total = (
+                sum(len(p) for p in pages) if self.total_override is None else self.total_override
+            )
             data = {
                 "list": rows,
-                "pageNo": page_no,
-                "pageSize": int(body.get("pageSize", 100)),
-                "total": sum(len(p) for p in pages),
+                "pageNo": self.page_no_per_page.get(page_no, page_no),
+                "pageSize": self.page_size_per_page.get(page_no, int(body.get("pageSize", 100))),
+                "total": self.total_per_page.get(page_no, total),
             }
             if not self.omit_page_count and page_no not in self.omit_page_count_on:
                 if page_no in self.page_count_per_page:
@@ -75,6 +99,8 @@ class StationListServer:
                         if self.page_count_override == "auto"
                         else self.page_count_override
                     )
+            for field in self.omit_fields:
+                data.pop(field, None)
         return httpx.Response(200, json={"success": True, "failCode": 0, "data": data})
 
 
@@ -160,16 +186,6 @@ async def test_multiple_pages_are_all_retrieved():
     await client.close()
 
 
-async def test_identical_duplicates_are_deduplicated_deterministically():
-    dup = station(1)
-    server = StationListServer(pages=[[dup, station(2)], [dict(dup), station(3)]])
-    client = make_client(server)
-    result = await client.list_stations()
-    assert [s["stationCode"] for s in result.stations] == ["NE=1", "NE=2", "NE=3"]
-    assert result.duplicates_removed == 1
-    await client.close()
-
-
 async def test_conflicting_duplicates_are_rejected():
     server = StationListServer(pages=[[station(1)], [station(1, stationName="Different Name")]])
     client = make_client(server)
@@ -187,13 +203,96 @@ async def test_repeated_identical_page_is_detected():
     await client.close()
 
 
-async def test_missing_page_count_metadata_is_flagged_not_silent():
+@pytest.mark.parametrize("field", ["pageCount", "pageNo", "pageSize", "total"])
+async def test_missing_pagination_metadata_is_rejected(field: str):
+    # A paginated envelope missing ANY contract field is never accepted as a
+    # complete inventory — a truncated list must not pass as the full fleet.
+    server = StationListServer(pages=[[station(1)]])
+    server.omit_fields = {field}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_missing_page_count_on_first_page_is_rejected():
     server = StationListServer(pages=[[station(1)]])
     server.omit_page_count = True
     client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+@pytest.mark.parametrize("echoed", [2, 0, "one", 1.5])
+async def test_echoed_page_no_must_match_the_requested_page(echoed: Any):
+    server = StationListServer(pages=[[station(1)], [station(2)]])
+    server.page_no_per_page = {1: echoed}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_page_size_change_mid_pagination_is_protocol_error():
+    server = StationListServer(pages=[[station(1)], [station(2)]])
+    server.page_size_per_page = {2: 50}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+@pytest.mark.parametrize("bad_size", [0, -5])
+async def test_impossible_page_size_is_protocol_error(bad_size: int):
+    server = StationListServer(pages=[[station(1)]])
+    server.page_size_per_page = {1: bad_size}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_page_with_more_rows_than_page_size_is_protocol_error():
+    server = StationListServer(pages=[[station(i) for i in range(5)]])
+    server.page_size_per_page = {1: 2}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_total_change_mid_pagination_is_protocol_error():
+    server = StationListServer(pages=[[station(1)], [station(2)]])
+    server.total_per_page = {2: 99}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+@pytest.mark.parametrize("claimed_total", [5, 1])
+async def test_final_station_count_must_match_total(claimed_total: int):
+    # Both directions are failures: fewer stations than promised (truncated)
+    # and more than promised (an inconsistent envelope).
+    server = StationListServer(pages=[[station(1)], [station(2)]])
+    server.total_override = claimed_total
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_deduplicated_inventory_counts_unique_stations_against_total():
+    # total counts stations, not rows: an identical duplicate across pages
+    # still leaves a complete, consistent inventory.
+    dup = station(1)
+    server = StationListServer(pages=[[dup, station(2)], [dict(dup), station(3)]])
+    server.total_override = 3
+    client = make_client(server)
     result = await client.list_stations()
-    assert result.metadata_missing is True
-    assert len(result.stations) == 1
+    assert [s["stationCode"] for s in result.stations] == ["NE=1", "NE=2", "NE=3"]
+    assert result.duplicates_removed == 1
     await client.close()
 
 

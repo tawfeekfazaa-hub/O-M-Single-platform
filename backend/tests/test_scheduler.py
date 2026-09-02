@@ -15,6 +15,9 @@ from app.adapters.fusionsolar.mock_client import MockFusionSolarClient
 from app.repositories.memory import InMemoryRepository
 from app.scheduler.ingestion import IngestionScheduler
 from tests.conftest import FIXED_NOON_UTC
+from tests.test_fusionsolar_stationlist import StationListServer
+from tests.test_fusionsolar_stationlist import make_client as make_station_list_client
+from tests.test_fusionsolar_stationlist import station as station_row
 
 
 class FakeClock:
@@ -284,3 +287,60 @@ async def test_diagnostics_expose_counts_only(repository: InMemoryRepository):
         "calls_consumed",
     ):
         assert isinstance(getattr(result, name), int)
+
+
+async def test_incomplete_pagination_never_replaces_the_stored_inventory(
+    repository: InMemoryRepository,
+):
+    """A truncated/contradictory station list must not become the inventory.
+
+    End-to-end through the real client (offline MockTransport): the vendor
+    claims 3 stations but the envelope is inconsistent, so the refresh fails
+    and the previously stored plants are kept rather than being replaced by
+    a possibly-truncated list (which would retire live plants downstream).
+    """
+    server = StationListServer(pages=[[station_row(1)], [station_row(2)]])
+    server.total_override = 3  # promises one more station than it ever serves
+    client = make_station_list_client(server)
+    adapter = FusionSolarAdapter(client, allow_synthetic_fields=False)
+
+    # A previous, healthy inventory is already stored.
+    await repository.upsert_plants(
+        [
+            PlantInfo(
+                vendor="fusionsolar",
+                vendor_plant_id=f"NE={i}",
+                name=f"Plant {i}",
+                capacity_kwp=1000.0,
+                address=None,
+            )
+            for i in (1, 2, 3)
+        ]
+    )
+    before = [(p.id, p.vendor_plant_id, p.name) for p in await repository.list_plants()]
+
+    scheduler = make_scheduler(adapter, repository)
+    result = await scheduler.run_cycle()
+
+    assert result.error is not None  # the cycle failed, loudly
+    assert not result.inventory_refreshed
+    assert result.plants_upserted == 0
+    # The stored fleet is untouched — no plant was dropped or rewritten.
+    assert [(p.id, p.vendor_plant_id, p.name) for p in await repository.list_plants()] == before
+    await client.close()
+
+
+async def test_valid_pagination_still_refreshes_the_inventory(repository: InMemoryRepository):
+    # Control case: a consistent paginated envelope updates the repository.
+    server = StationListServer(pages=[[station_row(1)], [station_row(2)]])
+    server.serve_kpi = True
+    client = make_station_list_client(server)
+    adapter = FusionSolarAdapter(client, allow_synthetic_fields=False)
+    scheduler = make_scheduler(adapter, repository)
+
+    result = await scheduler.run_cycle()
+
+    assert result.inventory_refreshed and result.plants_upserted == 2
+    assert result.inventory_pages == 2
+    assert {p.vendor_plant_id for p in await repository.list_plants()} == {"NE=1", "NE=2"}
+    await client.close()

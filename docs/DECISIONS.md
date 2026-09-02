@@ -29,7 +29,11 @@ Decisions (full contract: docs/FUSIONSOLAR-CONTRACT.md):
 4. **Station-list pagination** (pageNo/pageSize=100) with both documented
    response variants on the same path, finite page guards, repeated-page
    detection, deterministic dedup, and no silent skipping of malformed
-   pages.
+   pages. The paginated envelope is held to a STRICT contract —
+   pageNo/pageSize/pageCount/total mandatory, stable across pages, final
+   unique-station count reconciled against `total` — and a failed
+   validation aborts the refresh without touching the stored inventory,
+   so a truncated list can never pass as the complete fleet.
 5. **Real-mode safety gate**: the app refuses FUSIONSOLAR_MODE=real +
    SCHEDULER_ENABLED=true until Raw/Quarantine storage (PR-2) exists.
    The diagnostic checker is offline/dry-run by default and its live path
