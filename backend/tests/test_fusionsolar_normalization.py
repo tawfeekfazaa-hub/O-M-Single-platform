@@ -285,6 +285,37 @@ async def test_duplicate_rows_are_counted_once():
     assert not adapter.last_kpi_diagnostics.complete
 
 
+async def test_a_valid_duplicate_replaces_an_unreadable_first_copy():
+    # An unreadable row is a row the adapter does NOT have — it is counted
+    # invalid and never persisted. Marking the station "seen" before that
+    # verdict let the unreadable copy claim the slot, so a second, perfectly
+    # good copy hit the duplicate branch and was dropped: a usable reading
+    # lost and the stale stored value kept, for a station the vendor did
+    # report correctly.
+    rows = [
+        {"stationCode": "NE=1", "dataItemMap": "not-a-map"},
+        kpi_row("NE=1", day_power=7.5),
+    ]
+    adapter = real_adapter(ScriptedClient(rows))
+    readings = await adapter.fetch_plant_kpis(["NE=1"])
+
+    assert [(r.vendor_plant_id, r.daily_energy_kwh) for r in readings] == [("NE=1", 7.5)]
+    diag = adapter.last_kpi_diagnostics
+    assert diag.invalid_values == 1  # the unreadable copy is still counted
+    assert diag.duplicates == 0  # the good copy was the first one ACCEPTED
+    assert diag.missing == 0  # the station was answered, not absent
+
+
+async def test_a_duplicate_of_an_accepted_row_is_still_a_duplicate():
+    # The relaxation above must not swallow real duplicates: once a reading
+    # is in hand, a further copy is an extra, not a second chance.
+    rows = [kpi_row("NE=1", day_power=1.0), kpi_row("NE=1", day_power=2.0)]
+    adapter = real_adapter(ScriptedClient(rows))
+    readings = await adapter.fetch_plant_kpis(["NE=1"])
+    assert [r.daily_energy_kwh for r in readings] == [1.0]  # the first wins
+    assert adapter.last_kpi_diagnostics.duplicates == 1
+
+
 async def test_unexpected_rows_are_excluded_and_counted():
     client = ScriptedClient([kpi_row("NE=1", day_power=1.0), kpi_row("NE=999", day_power=9.0)])
     # ScriptedClient filters by requested codes; bypass to simulate a rogue row.

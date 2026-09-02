@@ -159,10 +159,12 @@ mask authentication/version errors).
   until the configuration changes, so it must wait a full window rather
   than spend page 1 every 6 h — and is kept until page 1 actually answers,
   since a page-1 timeout would otherwise erase the only estimate there is.
-  Only PAGE 1 updates it, and only once page 1's own envelope has held
-  together: a later page's differing count is rejected as inconsistent
-  moments later and must not leave its claim behind, and neither may a
-  page 1 that contradicts itself — otherwise the retry walks into a budget that cannot carry
+  Only PAGE 1 updates it, and only once page 1 has validated END TO END —
+  envelope AND rows: a later page's differing count is rejected as
+  inconsistent moments later and must not leave its claim behind, and
+  neither may a page 1 that contradicts its own metadata or that the row
+  checks reject. A page the client refused is worth no more as an estimate
+  than a page that never arrived — otherwise the retry walks into a budget that cannot carry
   it, wastes another call and extends the staleness it was meant to end.
   `pages` here means BUDGET SLOTS, not HTTP attempts: the retry after a
   failCode 305 reuses the slot its rejected attempt already paid for, so it
@@ -215,6 +217,16 @@ mask authentication/version errors).
 - Documented `dataItemMap` fields: `day_power`, `month_power`,
   `total_power`, `day_income`, `total_income`, `real_health_state`
   (`confirmed`). `day_power`/`total_power` are kWh and stay kWh.
+- **A duplicate is only a duplicate once a reading has been ACCEPTED.**
+  The vendor may repeat a requested station within one batch; the extra
+  copy is dropped and counted. But an unreadable row is a row the adapter
+  does NOT have, so it must not claim the station's slot: when the first
+  copy is unreadable and a later one is valid, the valid one is taken.
+  Keying the check on "was this code answered" instead discarded the good
+  copy and left the plant's stored KPI stale. The two questions are
+  tracked separately — answered (which is what `missing` is derived from,
+  so an unreadable row is counted invalid, never reported as absent) and
+  accepted (which is what makes a further copy a duplicate).
 - `real_health_state`: 1 disconnected, 2 faulty, 3 healthy, else unknown.
   An ABSENT field and a numeric code outside 1/2/3 are both the documented
   "else unknown" case and are not counted as invalid; a value that is

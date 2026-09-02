@@ -531,8 +531,7 @@ class RealFusionSolarClient:
                     )
                 variant = "direct_list"
                 rows = data
-                page_count = 1
-                self.last_advertised_pages = 1  # confirmed: one complete call
+                page_count = 1  # a direct list IS one complete call
             elif isinstance(data, dict):
                 variant = "paginated"
                 rows = data.get("list")
@@ -573,37 +572,6 @@ class RealFusionSolarClient:
                     page_count = echoed_page_count
                     page_size = echoed_page_size
                     total = echoed_total
-                    # Page 1 is the only page whose count we believe, and it
-                    # is believed only once page 1's whole envelope has held
-                    # together: a self-contradictory page must not leave its
-                    # claim behind as the estimate the retry is sized from.
-                    self.last_advertised_pages = page_count
-                    # Page 1 is the first moment the burst size is known.
-                    # Starting a burst the budget cannot finish spends
-                    # calls on an inventory that is never retrieved, and
-                    # leaves nothing for the retry: a fleet that grew a
-                    # page since the last refresh would take the free
-                    # slots and be rejected on its last page. Stop here
-                    # instead, with the wait the scheduler needs.
-                    pages_needed = page_count or 0
-                    remaining = max(pages_needed - 1, 0)
-                    if self._policy.wait_for_slots(Endpoint.STATION_LIST, remaining) > 0:
-                        # The wait is measured for the WHOLE next attempt,
-                        # which restarts at page 1 and therefore needs every
-                        # page again — page 1's own call included, since it
-                        # keeps occupying its slot until it expires. Asking
-                        # only for the pages still missing here would hand
-                        # back a delay that lets the retry spend the one slot
-                        # that just freed and stop at the same place, over
-                        # and over, never refreshing at all.
-                        raise AdapterRateLimitError(
-                            "station list needs more pages than the station-list "
-                            "budget has free; deferring the whole refresh",
-                            retry_after_seconds=self._policy.wait_for_slots(
-                                Endpoint.STATION_LIST, pages_needed
-                            ),
-                            retry_after_covers_whole_attempt=True,
-                        )
                 elif echoed_page_count != page_count:
                     # The FIRST page's metadata is authoritative: values that
                     # change mid-pagination could end the loop early.
@@ -650,6 +618,41 @@ class RealFusionSolarClient:
             if previous_signature is not None and signature == previous_signature and rows:
                 raise AdapterProtocolError("station list repeated an identical page")
             previous_signature = signature
+
+            if page_no == 1:
+                pages_needed = page_count or 0
+                # Page 1 has now held together END TO END — envelope AND
+                # rows. Only here does its count become the estimate the
+                # retry is sized from: a page the row checks just rejected
+                # leaves the previous estimate standing, exactly as a page-1
+                # timeout does. Believing it earlier let one broken row shrink
+                # a four-page estimate to one, and the retry then reserved a
+                # single slot for a refresh that needs four.
+                self.last_advertised_pages = pages_needed
+                # Page 1 is also the first moment the burst size is known.
+                # Starting a burst the budget cannot finish spends calls on
+                # an inventory that is never retrieved, and leaves nothing
+                # for the retry: a fleet that grew a page since the last
+                # refresh would take the free slots and be rejected on its
+                # last page. Stop here instead, with the wait the scheduler
+                # needs.
+                remaining = max(pages_needed - 1, 0)
+                if self._policy.wait_for_slots(Endpoint.STATION_LIST, remaining) > 0:
+                    # The wait is measured for the WHOLE next attempt, which
+                    # restarts at page 1 and therefore needs every page again
+                    # — page 1's own call included, since it keeps occupying
+                    # its slot until it expires. Asking only for the pages
+                    # still missing here would hand back a delay that lets
+                    # the retry spend the one slot that just freed and stop
+                    # at the same place, over and over, never refreshing.
+                    raise AdapterRateLimitError(
+                        "station list needs more pages than the station-list "
+                        "budget has free; deferring the whole refresh",
+                        retry_after_seconds=self._policy.wait_for_slots(
+                            Endpoint.STATION_LIST, pages_needed
+                        ),
+                        retry_after_covers_whole_attempt=True,
+                    )
 
             if page_count is None or page_no >= page_count:
                 break

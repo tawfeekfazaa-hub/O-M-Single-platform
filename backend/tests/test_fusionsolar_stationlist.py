@@ -629,3 +629,21 @@ async def test_a_page_count_larger_than_the_total_needs_is_not_a_fault_on_page_o
     result = await client.list_stations()
     assert len(result.stations) == 101
     await client.close()
+
+
+async def test_the_page_estimate_survives_a_page_one_rejected_by_its_rows():
+    # Coherent envelope, broken ROW: the count is believable right up to the
+    # moment the row checks reject the page. Recording it before that let one
+    # malformed row shrink a two-page estimate to one, and `_record_failed_burst`
+    # then reserves a single slot for a refresh that needs two — rejected on
+    # its last page, every cycle. Page 1 has to validate END TO END first.
+    server = StationListServer([[station(i) for i in range(100)], [station(100)]])
+    client = make_client(server)
+    await client.list_stations()
+    assert client.last_advertised_pages == 2
+
+    server.pages = [[{"stationName": "a row with no stationCode"}]]
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    assert client.last_advertised_pages == 2  # NOT shrunk to the rejected 1
+    await client.close()

@@ -239,7 +239,13 @@ class FusionSolarAdapter(VendorAdapter):
         # Global set — used ONLY for the final "missing" diagnostic; each
         # row is validated against its own batch (see the loop below).
         requested = set(vendor_plant_ids)
+        # `seen` answers "did the vendor say anything at all about this
+        # station" (it is what `missing` is derived from); `accepted` answers
+        # "do we actually hold a reading for it". They differ for a row that
+        # arrived but could not be read, and the difference is what lets a
+        # second, VALID copy still be taken.
         seen: set[str] = set()
+        accepted: set[str] = set()
         readings: list[PlantKpiReading] = []
         before = self._client.call_counts().station_real_kpi
 
@@ -275,9 +281,17 @@ class FusionSolarAdapter(VendorAdapter):
                     if code not in batch_codes:
                         diagnostics.unexpected += 1
                         continue
-                    if code in seen:
+                    if code in accepted:
+                        # A duplicate is only a duplicate once the reading is
+                        # in hand. Keying this on `seen` discarded a valid
+                        # second copy whenever the FIRST copy was unreadable,
+                        # so a row the adapter explicitly does not have beat
+                        # the row it does — the cycle then kept stale stored
+                        # data for a station the vendor had reported fine.
                         diagnostics.duplicates += 1
                         continue
+                    # Answered, whatever happens below: an unreadable row is
+                    # counted invalid, never reported as a missing station.
                     seen.add(code)
                     item = row.get("dataItemMap")
                     if not isinstance(item, dict):
@@ -327,6 +341,7 @@ class FusionSolarAdapter(VendorAdapter):
                             vendor_server_time=vendor_time,
                         )
                     )
+                    accepted.add(code)
 
         except AdapterError:
             # The batches already sent SPENT their calls; publish what
