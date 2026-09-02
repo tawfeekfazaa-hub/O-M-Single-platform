@@ -214,6 +214,43 @@ def test_dry_run_states_the_cap_covers_authentication_recovery(
     assert "transport level" in out and "305" in out
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+@pytest.mark.parametrize(
+    ("field", "name"),
+    [
+        ("fusionsolar_inventory_refresh_seconds", "FUSIONSOLAR_INVENTORY_REFRESH_SECONDS"),
+        ("scheduler_interval_seconds", "SCHEDULER_INTERVAL_SECONDS"),
+    ],
+)
+def test_non_finite_cadences_are_config_errors(
+    field: str, name: str, bad: float, capsys: pytest.CaptureFixture
+):
+    # A NaN inventory cadence makes the elapsed-time comparison never true:
+    # the inventory is refreshed once and never again, so new and retired
+    # stations go unnoticed while the dry run calls the config valid. A
+    # non-finite poll interval is slept on directly and stalls the loop.
+    code = check.main([], settings=make_settings(**{field: bad}))
+    assert code == check.EXIT_CONFIG
+    assert name in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_non_finite_kpi_margin_is_a_config_error(bad: float, capsys: pytest.CaptureFixture):
+    # The margin enforces the KPI-window floor in real mode; non-finite, it
+    # either drops that floor silently or freezes the loop.
+    code = check.main([], settings=make_settings(fusionsolar_kpi_margin_seconds=bad))
+    assert code == check.EXIT_CONFIG
+    assert "FUSIONSOLAR_KPI_MARGIN_SECONDS" in capsys.readouterr().err
+
+
+def test_zero_kpi_margin_is_accepted(capsys: pytest.CaptureFixture):
+    # Zero margin is a deliberate choice, not a misconfiguration.
+    assert (
+        check.main([], settings=make_settings(fusionsolar_kpi_margin_seconds=0.0)) == check.EXIT_OK
+    )
+    assert "FUSIONSOLAR_KPI_MARGIN_SECONDS" not in capsys.readouterr().err
+
+
 def test_absurdly_large_integer_budget_is_a_config_error(capsys: pytest.CaptureFixture):
     # A huge-but-parseable integer passes pydantic, but float() overflows on
     # it — and that conversion happens past main()'s ValidationError handler,

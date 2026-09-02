@@ -104,6 +104,18 @@ _POSITIVE_SETTINGS = {
     "FUSIONSOLAR_STATION_LIST_WINDOW_SECONDS": "fusionsolar_station_list_window_seconds",
     "FUSIONSOLAR_KPI_WINDOW_SECONDS": "fusionsolar_kpi_window_seconds",
     "FUSIONSOLAR_STATION_LIST_MAX_PAGES": "fusionsolar_station_list_max_pages",
+    # Cadences, not budgets, but the same arithmetic and the same failure:
+    # a NaN inventory cadence makes the elapsed-time comparison never true,
+    # so the inventory is refreshed once and never again (new and retired
+    # stations go unnoticed for good); a NaN or infinite poll interval is
+    # slept on directly and stalls the loop outright.
+    "FUSIONSOLAR_INVENTORY_REFRESH_SECONDS": "fusionsolar_inventory_refresh_seconds",
+    "SCHEDULER_INTERVAL_SECONDS": "scheduler_interval_seconds",
+}
+
+# Zero is legitimate here (no extra margin), so these are checked separately.
+_NON_NEGATIVE_SETTINGS = {
+    "FUSIONSOLAR_KPI_MARGIN_SECONDS": "fusionsolar_kpi_margin_seconds",
 }
 
 
@@ -124,10 +136,16 @@ def validate_config(settings: Settings) -> list[str]:
         value = getattr(settings, attribute)
         if not _usable_budget(value):
             problems.append(f"{name} must be a finite value > 0")
+    for name, attribute in _NON_NEGATIVE_SETTINGS.items():
+        # A non-finite margin silently drops the KPI-window floor it exists
+        # to enforce (or, infinite, freezes the loop): both defeat the
+        # protection against the vendor's own limiter.
+        if not _usable_budget(getattr(settings, attribute), allow_zero=True):
+            problems.append(f"{name} must be a finite value >= 0")
     return problems
 
 
-def _usable_budget(value: float) -> bool:
+def _usable_budget(value: float, *, allow_zero: bool = False) -> bool:
     """Finite, positive, and representable in the float math downstream.
 
     NaN/infinity pass every "<= 0" test but break the limiter for good: a
@@ -143,7 +161,7 @@ def _usable_budget(value: float) -> bool:
         as_float = float(value)
     except (OverflowError, TypeError, ValueError):
         return False
-    return math.isfinite(as_float) and as_float > 0
+    return math.isfinite(as_float) and (as_float >= 0 if allow_zero else as_float > 0)
 
 
 def sanitize_error(exc: Exception) -> str:
