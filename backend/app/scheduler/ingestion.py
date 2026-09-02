@@ -190,36 +190,50 @@ class IngestionScheduler:
         result.inventory_refreshed = True
         result.plants_upserted = len(plants)
         self._current_inventory = {p.vendor_plant_id for p in plants}
-        calls = 1
+        slots = 1
         diag = getattr(self._adapter, "last_inventory_diagnostics", None)
         if diag is not None:
             result.inventory_pages = diag.pages_retrieved
             result.calls_consumed += diag.calls_consumed
-            calls = max(diag.calls_consumed, 1)
+            # Budget SLOTS, not transport attempts. One logical page request
+            # reserves exactly one station-list slot; the retry after a
+            # failCode 305 deliberately reuses the slot its rejected attempt
+            # already paid for, so it raises calls_consumed (an HTTP counter,
+            # kept for diagnostics) without costing budget. Spacing derived
+            # from that counter would read a one-page refresh as a two-slot
+            # burst and stretch the next refresh from 6 h to 12 h.
+            slots = max(diag.pages_retrieved, 1)
         if self._station_list_max_calls and self._station_list_window:
-            self._inventory_min_spacing = self._derive_inventory_spacing(calls)
+            self._inventory_min_spacing = self._derive_inventory_spacing(slots)
 
-    def _derive_inventory_spacing(self, calls: int) -> float:
+    def _derive_inventory_spacing(self, slots: int) -> float:
         """Spacing that lets EVERY refresh spend all its pages at once.
 
         The budget is a rolling window, not an average allowance: the
         previous refreshes' calls keep occupying slots until they age out.
         What fits is therefore a whole number of complete bursts —
-        ``floor(budget / calls)`` of them per window — so the spacing is
+        ``floor(budget / slots)`` of them per window — so the spacing is
         ``window / that count``. An average-rate formula
-        (``window * calls / budget``) looks safe for two bursts but drifts:
+        (``window * slots / budget``) looks safe for two bursts but drifts:
         with a 5-call window and 2-page refreshes it would schedule bursts
         at 0 h, 9.6 h and 19.2 h, needing six slots inside one window.
         """
         window = self._station_list_window or 0.0
         budget = self._station_list_max_calls or 1
-        bursts_per_window = budget // max(calls, 1)
+        bursts_per_window = budget // max(slots, 1)
         if bursts_per_window < 1:
             # One refresh does not even fit the budget: the guard in the
             # adapter factory rejects this, but never schedule faster than
             # a full window here either.
             return window
-        return window / bursts_per_window
+        try:
+            return window / bursts_per_window
+        except OverflowError:
+            # A budget too large to convert to a float (a huge-integer env
+            # var; the pre-flight check reports it as a config error) paces
+            # nothing. Derive no spacing rather than killing the loop — the
+            # configured refresh cadence still applies.
+            return 0.0
 
     async def run_cycle(self) -> CycleResult:
         """One ingestion pass. Never raises — errors land in the result."""

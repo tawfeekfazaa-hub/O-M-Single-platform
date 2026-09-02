@@ -63,7 +63,12 @@ class FakeFusionSolar:
         if self.redirect_to is not None:
             return httpx.Response(302, headers={"Location": self.redirect_to})
         if self.http_status is not None:
-            headers = {"Retry-After": self.retry_after} if self.retry_after else {}
+            # Encoded on the wire: httpx rejects a non-ASCII header STRING,
+            # but obs-text bytes are exactly what a broken or hostile server
+            # can put on a Retry-After line, so send the raw octets.
+            headers = (
+                [(b"Retry-After", self.retry_after.encode("utf-8"))] if self.retry_after else []
+            )
             return httpx.Response(self.http_status, headers=headers, json={})
         if self.body_override is not None:
             return httpx.Response(200, content=self.body_override)
@@ -399,6 +404,31 @@ async def test_http_date_retry_after_never_raises(header: str):
         await client.get_station_real_kpi(["NE=1"])
     assert excinfo.value.retry_after_seconds is not None
     assert excinfo.value.retry_after_seconds >= 0.0
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "\u00b2",  # SUPERSCRIPT TWO: str.isdigit() is True, float() raises
+        "\u2082",  # SUBSCRIPT TWO: same trap
+        "\u0663",  # ARABIC-INDIC THREE: float() accepts it, RFC 9110 does not
+    ],
+)
+async def test_non_ascii_digit_retry_after_falls_back_to_the_budget_hint(header: str):
+    # RFC 9110 delta-seconds is ASCII digits only. str.isdigit() accepts more
+    # than float() does, so an obs-text digit used to raise ValueError out of
+    # the adapter taxonomy and could terminate run_forever().
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = header
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    delay = excinfo.value.retry_after_seconds
+    assert delay is not None and math.isfinite(delay)
+    assert delay >= 300.0  # the documented endpoint-window fallback
     await client.close()
 
 

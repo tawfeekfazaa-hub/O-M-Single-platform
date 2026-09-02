@@ -421,6 +421,50 @@ async def test_spacing_reserves_a_whole_burst_in_the_rolling_window(
     assert (await scheduler.run_cycle()).inventory_refreshed
 
 
+async def test_inventory_spacing_counts_budget_slots_not_transport_attempts(
+    repository: InMemoryRepository,
+):
+    # A station-list request rejected with failCode 305 retries after a
+    # re-login on the slot the rejected attempt already paid for. The extra
+    # HTTP attempt lands in calls_consumed but costs no budget, so pacing
+    # from that counter would read a one-page refresh as a two-slot burst
+    # and stretch the next refresh from 6 h to 12 h.
+    class RetriedOnceAdapter(FusionSolarAdapter):
+        async def list_plants(self) -> list[PlantInfo]:
+            plants = await super().list_plants()
+            self.last_inventory_diagnostics.calls_consumed += 1
+            return plants
+
+    adapter = RetriedOnceAdapter(
+        MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+    )
+    scheduler = IngestionScheduler(
+        adapter,
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=86_400.0,
+    )
+    result = await scheduler.run_cycle()
+    assert result.inventory_refreshed
+    assert result.inventory_pages == 1  # one logical page == one budget slot
+    assert result.calls_consumed >= 2  # transport attempts still diagnosed
+    assert scheduler._inventory_min_spacing == 21_600.0  # 4 bursts/day, not 2
+
+
+def test_absurd_station_list_budget_derives_no_spacing(repository: InMemoryRepository):
+    # A budget too large to convert to a float would raise OverflowError out
+    # of the division — and run_cycle only maps AdapterError, so it would
+    # escape into run_forever(). The pre-flight check reports such a value as
+    # a config error; here it simply derives no spacing.
+    scheduler = IngestionScheduler(
+        mock_adapter(),
+        repository,
+        station_list_max_calls=int("1" * 1000),
+        station_list_window_seconds=86_400.0,
+    )
+    assert scheduler._derive_inventory_spacing(1) == 0.0
+
+
 def test_derived_spacing_counts_complete_bursts_per_window(
     repository: InMemoryRepository,
 ):

@@ -122,12 +122,28 @@ def validate_config(settings: Settings) -> list[str]:
     # path dying with a traceback. Names only — never the values.
     for name, attribute in _POSITIVE_SETTINGS.items():
         value = getattr(settings, attribute)
-        # NaN/infinity pass every "<= 0" test but break the limiter for good:
-        # a NaN window never prunes its history and an infinite one never
-        # frees a slot, blocking the endpoint permanently.
-        if not math.isfinite(value) or value <= 0:
+        if not _usable_budget(value):
             problems.append(f"{name} must be a finite value > 0")
     return problems
+
+
+def _usable_budget(value: float) -> bool:
+    """Finite, positive, and representable in the float math downstream.
+
+    NaN/infinity pass every "<= 0" test but break the limiter for good: a
+    NaN window never prunes its history and an infinite one never frees a
+    slot, blocking the endpoint permanently. A huge-but-parseable INTEGER
+    (a 1000-digit FUSIONSOLAR_LOGIN_MAX_CALLS) is just as unusable — the
+    limiter and the scheduler's spacing arithmetic are float maths — and
+    converting it raises OverflowError, which happens past main()'s
+    ValidationError handler and would print a traceback instead of the
+    documented EXIT_CONFIG.
+    """
+    try:
+        as_float = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(as_float) and as_float > 0
 
 
 def sanitize_error(exc: Exception) -> str:

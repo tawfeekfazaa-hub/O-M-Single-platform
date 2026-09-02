@@ -144,7 +144,11 @@ def _parse_retry_after(value: str | None) -> float | None:
     if not value:
         return None
     text = value.strip()
-    if text.isdigit():
+    # RFC 9110 delta-seconds is ASCII digits only. str.isdigit() also accepts
+    # superscripts and other numeric obs-text (U+00B2, say), which float()
+    # then rejects with a ValueError that would escape the adapter taxonomy;
+    # those fall through to the date parser and become a budget hint instead.
+    if text.isascii() and text.isdigit():
         return _plausible_delay(float(text))
     try:
         when = email.utils.parsedate_to_datetime(text)

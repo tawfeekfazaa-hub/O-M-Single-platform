@@ -214,6 +214,19 @@ def test_dry_run_states_the_cap_covers_authentication_recovery(
     assert "transport level" in out and "305" in out
 
 
+def test_absurdly_large_integer_budget_is_a_config_error(capsys: pytest.CaptureFixture):
+    # A huge-but-parseable integer passes pydantic, but float() overflows on
+    # it — and that conversion happens past main()'s ValidationError handler,
+    # so it used to print a traceback instead of the documented exit code.
+    # The value is unusable anyway: the limiter and the scheduler's spacing
+    # arithmetic are float maths.
+    code = check.main([], settings=make_settings(fusionsolar_login_max_calls=int("1" * 1000)))
+    captured = capsys.readouterr()
+    assert code == check.EXIT_CONFIG
+    assert "FUSIONSOLAR_LOGIN_MAX_CALLS" in captured.err  # names only
+    assert "Traceback" not in captured.err
+
+
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
 def test_non_finite_windows_are_config_errors(bad: float, capsys: pytest.CaptureFixture):
     # NaN/inf pass every "<= 0" test but break the limiter permanently: a

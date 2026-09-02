@@ -107,6 +107,11 @@ mask authentication/version errors).
   drift into the window (a 5-call budget with 2-page refreshes would put
   bursts at 0 h, 9.6 h and 19.2 h, needing six slots in one window). On the
   4/day default: 1 page → 6 h, 2 pages → 12 h, 3–4 pages → 24 h.
+  `pages` here means BUDGET SLOTS, not HTTP attempts: the retry after a
+  failCode 305 reuses the slot its rejected attempt already paid for, so it
+  raises the transport counter (kept for diagnostics) without costing
+  budget. Pacing from the transport counter would read a one-page refresh
+  as a two-slot burst and stretch the next refresh from 6 h to 12 h.
 - KPI polling covers the LAST SUCCESSFUL inventory only. Phase-1
   persistence has no delete, so a station the vendor drops keeps its
   repository row; polling it would mark every later cycle partial and
@@ -195,7 +200,9 @@ mask authentication/version errors).
   or a merely absurd finite value such as 1e299, which Python does not
   overflow, or an HTTP-date whose year or offset overflows a C long and
   makes the stdlib parser raise OverflowError) falls back to the
-  endpoint-window hint. Parsing never raises
+  endpoint-window hint. delta-seconds is read as **ASCII digits only**, per
+  RFC 9110: Python's `str.isdigit()` also accepts obs-text digits such as
+  superscripts, which `float()` then rejects. Parsing never raises
   outside the adapter error taxonomy and can never yield a delay that
   stalls the scheduler. *Whether your tenant sends Retry-After:*
   `unverified`.
