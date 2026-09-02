@@ -278,6 +278,7 @@ class RealFusionSolarClient:
                 retry_after_seconds=retry_after
                 if retry_after is not None
                 else self._policy.retry_after_hint(endpoint),
+                blocks_authentication=endpoint is Endpoint.LOGIN,
             )
         if status in _RETRYABLE_STATUS:
             raise AdapterTransientError(f"FusionSolar HTTP {status} on {path}")
@@ -319,6 +320,7 @@ class RealFusionSolarClient:
                     raise AdapterRateLimitError(
                         "FusionSolar rate-limited the login call (failCode 407)",
                         retry_after_seconds=self._policy.retry_after_hint(Endpoint.LOGIN),
+                        blocks_authentication=True,
                     )
                 raise AdapterAuthError(f"FusionSolar login failed (failCode={fail_code})")
             # Documented delivery is the XSRF-TOKEN response header; some
@@ -354,6 +356,7 @@ class RealFusionSolarClient:
                 raise AdapterRateLimitError(
                     f"FusionSolar failCode 407 on {path} (access frequency too high)",
                     retry_after_seconds=self._policy.retry_after_hint(endpoint),
+                    blocks_authentication=endpoint is Endpoint.LOGIN,
                 )
             if fail_code == FAIL_CODE_NOT_LOGGED_IN and attempt == 1:
                 self._token = None

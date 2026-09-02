@@ -237,6 +237,13 @@ mask authentication/version errors).
   outside the adapter error taxonomy and can never yield a delay that
   stalls the scheduler. *Whether your tenant sends Retry-After:*
   `unverified`.
+- A rate limit on **login** blocks everything, not just the call that hit
+  it: every other request needs that session. A station-list call answered
+  with failCode 305 re-logins, and that login can come back 429 — treating
+  it as a station-list throttle would defer the inventory and carry on to
+  KPI polling, which finds no token and logs in AGAIN, inside the delay the
+  vendor just asked for. The error carries this, and the whole cycle backs
+  off on the vendor's own hint instead.
 - Timeouts, connection failures, 500/502/503/504 → transient error →
   scheduler backoff with jitter (no blind retries). Jitter (0.75x–1.25x)
   applies to the BACKOFF only: a vendor `Retry-After` and the configured

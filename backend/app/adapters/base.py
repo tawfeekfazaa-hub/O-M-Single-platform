@@ -89,6 +89,13 @@ class AdapterRateLimitError(AdapterError):
     measured when the ENTIRE next attempt can run — a pre-flight capacity
     check that knows how many calls it needs — the delay is already
     sufficient and widening it only adds staleness.
+
+    ``blocks_authentication`` marks a throttle on the endpoint that
+    establishes the session. Every other call needs that session, so no
+    further work is possible until the delay has passed: a caller that
+    treats it as a throttle of the operation it happened to be running
+    would move on to the next one, re-authenticate, and send another
+    request to the very endpoint the vendor just throttled.
     """
 
     def __init__(
@@ -97,10 +104,12 @@ class AdapterRateLimitError(AdapterError):
         retry_after_seconds: float | None = None,
         *,
         retry_after_covers_whole_attempt: bool = False,
+        blocks_authentication: bool = False,
     ) -> None:
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
         self.retry_after_covers_whole_attempt = retry_after_covers_whole_attempt
+        self.blocks_authentication = blocks_authentication
 
 
 class VendorAdapter(ABC):

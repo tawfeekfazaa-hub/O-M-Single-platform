@@ -228,13 +228,20 @@ class IngestionScheduler:
         inventory stale for longer than simply waiting. The failed burst is
         recorded like a successful one and the wait covers it.
         """
-        if not (self._station_list_max_calls and self._station_list_window):
+        slots = self._record_failed_burst()
+        if slots is None:
             return deferral
+        now = self._clock()
+        return max(deferral, self._earliest_burst_gap(now, slots))
+
+    def _record_failed_burst(self) -> int | None:
+        """Book the calls a failed refresh spent; None when not tracking."""
+        if not (self._station_list_max_calls and self._station_list_window):
+            return None
         diag = getattr(self._adapter, "last_inventory_diagnostics", None)
         slots = max(getattr(diag, "calls_consumed", 0) or 0, 1)
-        now = self._clock()
-        self._record_inventory_burst(now, slots)
-        return max(deferral, self._earliest_burst_gap(now, slots))
+        self._record_inventory_burst(self._clock(), slots)
+        return slots
 
     def _record_inventory_burst(self, at: float, slots: int) -> None:
         """Remember one refresh's budget slots; forget what has aged out."""
@@ -311,6 +318,15 @@ class IngestionScheduler:
                     # budget: a rate-limited refresh defers itself and must
                     # never abort KPI polling for this cycle.
                     self._stale_rate_limited = True
+                    if getattr(exc, "blocks_authentication", False):
+                        # Unless what was throttled is the session itself —
+                        # a re-login after failCode 305 can come back 429.
+                        # KPI polling would then re-authenticate and put
+                        # another request on the endpoint the vendor just
+                        # throttled. The whole cycle backs off instead, on
+                        # the vendor's own delay.
+                        self._record_failed_burst()
+                        raise
                     # A plain limiter hint frees ONE slot, which is not
                     # enough for a paginated refresh: retrying then would
                     # spend the same partial burst again and fail on the

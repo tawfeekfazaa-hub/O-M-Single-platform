@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import ClassVar
 
+import httpx
+
 from app.adapters.base import (
     AdapterError,
     AdapterProtocolError,
@@ -12,7 +14,9 @@ from app.adapters.base import (
     VendorAdapter,
 )
 from app.adapters.fusionsolar.adapter import FusionSolarAdapter
+from app.adapters.fusionsolar.client import XSRF_HEADER, RealFusionSolarClient
 from app.adapters.fusionsolar.mock_client import MockFusionSolarClient
+from app.adapters.fusionsolar.policy import FusionSolarRatePolicy
 from app.core.ratelimit import RollingWindowRateLimiter
 from app.repositories.memory import InMemoryRepository
 from app.scheduler.ingestion import CycleResult, IngestionScheduler
@@ -506,6 +510,86 @@ async def test_a_growing_inventory_waits_for_the_earlier_bursts_to_expire(
     # Back to a steady sequence of equal bursts, the pacing rule takes over.
     await scheduler._refresh_inventory(CycleResult())
     assert scheduler._inventory_min_spacing == 12 * hour
+    await client.close()
+
+
+async def test_a_throttled_relogin_aborts_the_cycle_instead_of_polling_on(
+    repository: InMemoryRepository,
+):
+    # A station-list call answered with failCode 305 re-logins, and that
+    # login can come back 429. Treating it as a station-list throttle would
+    # defer the inventory and carry on into KPI polling, which finds no
+    # token and logs in AGAIN — a third request to the endpoint the vendor
+    # had just throttled, inside its own Retry-After.
+    class Server:
+        def __init__(self) -> None:
+            self.paths: list[str] = []
+            self.logins = 0
+            self.expire_once = True
+
+        def handler(self, request: httpx.Request) -> httpx.Response:
+            path = request.url.path.removeprefix("/thirdData")
+            self.paths.append(path)
+            if path == "/login":
+                self.logins += 1
+                if self.logins >= 2:  # the vendor throttles the re-login
+                    return httpx.Response(429, headers={"Retry-After": "600"}, json={})
+                return httpx.Response(
+                    200, json={"success": True, "failCode": 0}, headers={XSRF_HEADER: "tok"}
+                )
+            if path == "/getStationList":
+                if self.expire_once:
+                    self.expire_once = False
+                    return httpx.Response(200, json={"success": False, "failCode": 305})
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "failCode": 0,
+                        "data": {
+                            "list": [station_row(1)],
+                            "pageNo": 1,
+                            "pageSize": 100,
+                            "pageCount": 1,
+                            "total": 1,
+                        },
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "failCode": 0,
+                    "data": [],
+                    "params": {"currentTime": 1_780_000_000_000},
+                },
+            )
+
+    server = Server()
+    client = RealFusionSolarClient(
+        base_url="https://fake.fusionsolar.example/thirdData",
+        username="nb-user",
+        system_code="nb-system-code",
+        policy=FusionSolarRatePolicy(
+            login_max_calls=10, station_list_max_calls=4, station_list_window_seconds=86_400.0
+        ),
+        transport=httpx.MockTransport(server.handler),
+    )
+    await repository.upsert_plants(
+        [PlantInfo(vendor="fusionsolar", vendor_plant_id="NE=1", name="x")]
+    )
+    scheduler = IngestionScheduler(
+        FusionSolarAdapter(client, allow_synthetic_fields=True),
+        repository,
+        station_list_max_calls=4,
+        station_list_window_seconds=86_400.0,
+    )
+
+    result = await scheduler.run_cycle()
+    assert server.logins == 2  # the throttled one, and no third
+    assert server.paths == ["/login", "/getStationList", "/login"]
+    assert result.error is not None  # the whole cycle backed off
+    assert result.retry_after_seconds == 600.0  # on the vendor's own delay
     await client.close()
 
 

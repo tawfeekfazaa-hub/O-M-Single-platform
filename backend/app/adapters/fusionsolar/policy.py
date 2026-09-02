@@ -103,4 +103,5 @@ class FusionSolarRatePolicy:
             raise AdapterRateLimitError(
                 f"client-side FusionSolar {endpoint.value} budget exhausted",
                 retry_after_seconds=exc.retry_after_seconds,
+                blocks_authentication=endpoint is Endpoint.LOGIN,
             ) from exc
