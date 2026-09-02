@@ -579,3 +579,17 @@ async def test_a_direct_list_reports_one_page_once_confirmed():
     await client.list_stations()
     assert client.last_advertised_pages == 1
     await client.close()
+
+
+async def test_only_page_one_updates_the_cached_page_count():
+    # A later page claiming a different count is rejected as inconsistent a
+    # moment later; it must not leave its claim behind as the estimate, or
+    # the caller reserves four pages for an inventory of two and turns an
+    # ordinary retry into a full-window wait.
+    server = StationListServer([[station(i) for i in range(100)], [station(100)]])
+    server.page_count_per_page = {2: 4}  # page 2 disagrees with page 1
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    assert client.last_advertised_pages == 2  # page 1 remains authoritative
+    await client.close()

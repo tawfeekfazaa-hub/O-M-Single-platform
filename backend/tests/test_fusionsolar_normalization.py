@@ -9,7 +9,12 @@ from typing import Any
 
 import pytest
 
-from app.adapters.base import AdapterTransientError, PlantStatus
+from app.adapters.base import (
+    AdapterTransientError,
+    PlantInfo,
+    PlantKpiReading,
+    PlantStatus,
+)
 from app.adapters.fusionsolar.adapter import (
     FusionSolarAdapter,
     KpiDiagnostics,
@@ -18,6 +23,7 @@ from app.adapters.fusionsolar.adapter import (
     normalize_performance_ratio,
 )
 from app.adapters.fusionsolar.client import ClientCallCounts, KpiBatchResult, StationListResult
+from app.repositories.memory import InMemoryRepository
 
 VENDOR_MS = 1_780_000_000_000
 
@@ -198,13 +204,14 @@ async def test_absent_health_state_is_unknown_without_counting():
     ],
 )
 async def test_malformed_health_state_is_counted_as_invalid(bad: Any):
-    # Present but unreadable is malformed data — otherwise the scheduler
-    # would report the response as a complete success and persist the
-    # bogus status.
+    # Present but unreadable is malformed data, and it is NOT persisted:
+    # writing UNKNOWN over the plant's stored status would downgrade a
+    # healthy plant on the strength of a field we could not read. An absent
+    # field, or a code we simply do not map, still yields a reading — see
+    # test_unknown_health_state_maps_to_unknown.
     client = ScriptedClient([kpi_row("NE=1", day_power=1.0, real_health_state=bad)])
     adapter = real_adapter(client)
-    (reading,) = await adapter.fetch_plant_kpis(["NE=1"])
-    assert reading.status is PlantStatus.UNKNOWN
+    assert await adapter.fetch_plant_kpis(["NE=1"]) == []
     diag = adapter.last_kpi_diagnostics
     assert diag.invalid_values == 1
     assert not diag.complete
@@ -486,3 +493,40 @@ async def test_an_unreadable_data_map_never_becomes_a_reading():
     # them, with something unusable. Either way invalid_values makes the
     # cycle incomplete, and requested=3 vs returned=1 shows the gap.
     assert (diag.requested, diag.returned, diag.missing) == (3, 1, 0)
+
+
+async def test_an_unreadable_health_state_never_downgrades_a_stored_status():
+    # The persistence side of the strict health reader: a plant whose stored
+    # status is HEALTHY must not become UNKNOWN because one field arrived as
+    # text. A code we simply do not map is different — see below.
+    repo = InMemoryRepository()
+    await repo.upsert_plants([PlantInfo(vendor="fusionsolar", vendor_plant_id="NE=1", name="P")])
+    await repo.record_kpis(
+        [
+            PlantKpiReading(
+                vendor="fusionsolar",
+                vendor_plant_id="NE=1",
+                ts=datetime.now(UTC),
+                status=PlantStatus.HEALTHY,
+            )
+        ]
+    )
+    assert (await repo.list_plants())[0].status is PlantStatus.HEALTHY
+
+    client = ScriptedClient([kpi_row("NE=1", day_power=1.0, real_health_state="3")])
+    adapter = real_adapter(client)
+    readings = await adapter.fetch_plant_kpis(["NE=1"])
+    await repo.record_kpis(readings)
+    assert (await repo.list_plants())[0].status is PlantStatus.HEALTHY
+    assert adapter.last_kpi_diagnostics.invalid_values == 1
+
+
+async def test_an_unmapped_health_code_still_yields_a_reading():
+    # "else unknown" is the documented mapping, not a malformed field: a
+    # code we do not map is read successfully and persisted as UNKNOWN.
+    client = ScriptedClient([kpi_row("NE=1", day_power=1.0, real_health_state=9)])
+    adapter = real_adapter(client)
+    (reading,) = await adapter.fetch_plant_kpis(["NE=1"])
+    assert reading.status is PlantStatus.UNKNOWN
+    assert reading.daily_energy_kwh == 1.0
+    assert adapter.last_kpi_diagnostics.invalid_values == 0

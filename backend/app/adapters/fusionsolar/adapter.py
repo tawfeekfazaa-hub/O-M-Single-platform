@@ -297,6 +297,19 @@ class FusionSolarAdapter(VendorAdapter):
                         # active-power field — never derived, stays None.
                         active_power = None
 
+                    invalid_before = diagnostics.invalid_values
+                    status = _health_status(item.get("real_health_state"), diagnostics)
+                    if diagnostics.invalid_values > invalid_before:
+                        # Present but UNREADABLE — the only case _health_status
+                        # counts. Persisting it would write UNKNOWN over the
+                        # plant's stored status: a healthy plant downgraded by
+                        # one malformed field, exactly like the unreadable
+                        # dataItemMap above. An absent field, or a documented
+                        # code we do not map, is NOT counted and still yields
+                        # UNKNOWN — the contract says "else unknown", and not
+                        # knowing is the truth in those cases.
+                        continue
+
                     readings.append(
                         PlantKpiReading(
                             vendor=self.vendor,
@@ -310,7 +323,7 @@ class FusionSolarAdapter(VendorAdapter):
                             )
                             if item.get("performance_ratio") is not None
                             else None,
-                            status=_health_status(item.get("real_health_state"), diagnostics),
+                            status=status,
                             vendor_server_time=vendor_time,
                         )
                     )

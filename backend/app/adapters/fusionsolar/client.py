@@ -474,13 +474,17 @@ class RealFusionSolarClient:
             raise AdapterProtocolError(f"paginated station list has negative {key}")
         return value
 
-    def _parse_page_count(self, data: dict[str, Any]) -> int:
+    def _parse_page_count(self, data: dict[str, Any], *, authoritative: bool = False) -> int:
         count = self._require_int(data, "pageCount")
-        # Remember it BEFORE the guard rejects it: an over-guard inventory
-        # cannot succeed until the configuration changes, and reporting one
-        # page would have the caller retry on the ordinary cadence, spending
-        # page 1 again every time.
-        self.last_advertised_pages = max(self.last_advertised_pages, count)
+        if authoritative:
+            # Page 1 is the only page whose count we believe — a later page
+            # claiming something else is rejected as inconsistent a moment
+            # later, and must not leave its claim behind as the estimate.
+            # Recorded BEFORE the guard rejects an over-guard count, since
+            # that inventory cannot succeed until the configuration changes
+            # and reporting one page would have the caller retry on the
+            # ordinary cadence, spending page 1 again every time.
+            self.last_advertised_pages = count
         if count > self._max_pages:
             # Fail on page 1 (one call) instead of burning the whole budget
             # and dying part-way. The guard is min(configured pages, the
@@ -549,7 +553,7 @@ class RealFusionSolarClient:
                     raise AdapterProtocolError("station list pageSize must be >= 1")
                 if len(rows) > echoed_page_size:
                     raise AdapterProtocolError("station list page holds more rows than pageSize")
-                echoed_page_count = self._parse_page_count(data)
+                echoed_page_count = self._parse_page_count(data, authoritative=page_no == 1)
                 echoed_total = self._require_int(data, "total")
                 if page_no == 1:
                     page_count = echoed_page_count
