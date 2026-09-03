@@ -33,7 +33,9 @@ message — a connection error's text carries the host and port.
    the forward file *and* of its `.down.sql` is stored on first apply and
    re-verified on every later run. Editing either refuses the whole run,
    including any pending migrations behind it. The checksum is taken over
-   newline-normalized content, so a CRLF checkout does not trip it.
+   newline-normalized content, so a CRLF checkout does not trip it — but only
+   the checksum is normalized. Migrations run exactly as written, so a CRLF
+   inside a string literal is stored as a CRLF.
 2. **What is executed is what was checksummed.** Each file is read once, at
    discovery; that exact text is both hashed and executed. A file replaced
    mid-run cannot record one hash and run different SQL.
@@ -175,6 +177,12 @@ connection was discarded instead, which ends its session and releases the
 session-scoped lock with it, so the next run is not blocked. It appears when the
 database became unreachable during the run; the refusal printed alongside it is
 the one to act on.
+
+**"cannot roll back to NNN_name.sql: it is not applied"**
+The target exists in the checkout but the database never reached it. Nothing was
+unwound, and the message says which migration the database is actually at.
+Rolling back to a target you are already behind is not a no-op — reporting it as
+success would tell automation it is at a revision it has never been at.
 
 **"cannot roll back — these migrations have no .down.sql"**
 Nothing was unwound. Write the missing down file first, then re-run. This check

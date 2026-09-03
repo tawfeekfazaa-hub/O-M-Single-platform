@@ -1103,3 +1103,47 @@ async def test_the_cli_reports_an_invalid_unrelated_setting_as_a_refusal(
         assert capsys.readouterr().err.startswith("migration refused: the run failed (")
     finally:
         cli.get_settings.cache_clear()
+
+
+async def test_rolling_back_to_a_migration_that_was_never_applied_is_refused(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # Filtering a target the database never reached produces an empty set, and
+    # "rolled back 0 migration(s)" with exit 0 tells automation it is now at a
+    # revision it has never been at.
+    write_pair(
+        migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", "DROP TABLE sprocket;"
+    )
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+    await downgrade_to(db_engine, migrations_dir, "001_first.sql", emit=lambda _: None)
+
+    with pytest.raises(MigrationError, match="003_third.sql: it is not applied"):
+        await downgrade_to(db_engine, migrations_dir, "003_third.sql", emit=lambda _: None)
+
+    # The refusal says where the database actually is, so the operator does not
+    # have to go and look.
+    with pytest.raises(MigrationError, match="database is at 001_first.sql"):
+        await downgrade_to(db_engine, migrations_dir, "002_second.sql", emit=lambda _: None)
+
+    assert await applied_names(db_engine) == ["001_first.sql"]  # nothing was unwound
+
+
+async def test_rolling_back_to_base_from_an_empty_database_is_still_fine(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # `base` is not a migration, so the new check must not catch it — unwinding
+    # nothing to reach base is a correct no-op, not a false revision claim.
+    assert await downgrade_to(db_engine, migrations_dir, "base", emit=lambda _: None) == 0
+
+
+async def test_a_crlf_migration_stores_what_it_says(db_engine: AsyncEngine, migrations_dir: Path):
+    # End to end, because the split between "normalize for the checksum" and
+    # "execute the file" only matters at the point the value lands in a column.
+    (migrations_dir / "003_third.sql").write_bytes(
+        b"CREATE TABLE note (body TEXT);\r\nINSERT INTO note VALUES ('first\r\nsecond');"
+    )
+    (migrations_dir / "003_third.down.sql").write_bytes(b"DROP TABLE IF EXISTS note;")
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+
+    async with db_engine.connect() as conn:
+        assert await conn.scalar(sa.text("SELECT body FROM note")) == "first\r\nsecond"

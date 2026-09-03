@@ -68,6 +68,10 @@ def write(tmp_path: Path, sql: str, *, down: str | None = None) -> Path:
         # PostgreSQL ends a line comment at a bare CR as well as a LF, so this
         # COMMIT is not commented out.
         "CREATE TABLE t (id int); -- note\rCOMMIT;",
+        # The two words in a routine's SIGNATURE — a parameter named `begin` of
+        # a type named `atomic` — with a quoted body. No SQL-standard body is
+        # opened, so the END that follows is a real commit.
+        "CREATE FUNCTION f(begin atomic) RETURNS int LANGUAGE SQL AS 'SELECT 1'; END;",
         # A non-ASCII character is an identifier character to PostgreSQL, so
         # these dollars belong to the table names, not to a quote.
         "CREATE TABLE aq\u0301$$ (id int); COMMIT; CREATE TABLE bq\u0301$$ (id int);",
@@ -233,6 +237,12 @@ def test_the_end_exemption_is_spent_by_the_body_that_earned_it(tmp_path: Path):
     assert "END" in str(excinfo.value)
 
 
+def words_of(sql: str) -> list[list[str]]:
+    from app.db.migrations import _statements
+
+    return [[t.word for t in statement] for statement in _statements(sql)]
+
+
 def test_an_identifier_is_read_as_one_token(tmp_path: Path):
     """The property the whole guard rests on, stated directly.
 
@@ -241,20 +251,34 @@ def test_an_identifier_is_read_as_one_token(tmp_path: Path):
     Every bypass found in review came from reading a delimiter, a string prefix
     or a keyword out of the middle of one.
     """
-    from app.db.migrations import _statements
-
-    assert _statements("SELECT foo$$ FROM bar$BEGIN") == [["SELECT", "FOO$$", "FROM", "BAR$BEGIN"]]
-    assert _statements("SELECT foo$E'x'") == [["SELECT", "FOO$E"]]
-    assert _statements("SELECT E'x'") == [["SELECT"]]  # a real escape-string prefix
+    assert words_of("SELECT foo$$ FROM bar$BEGIN") == [["SELECT", "FOO$$", "FROM", "BAR$BEGIN"]]
+    assert words_of("SELECT foo$E'x'") == [["SELECT", "FOO$E"]]
+    assert words_of("SELECT E'x'") == [["SELECT"]]  # a real escape-string prefix
 
 
 def test_words_inside_quotes_and_comments_are_not_tokens(tmp_path: Path):
-    from app.db.migrations import _statements
-
-    assert _statements("SELECT 'COMMIT'; -- COMMIT\n/* COMMIT */ SELECT $$COMMIT$$") == [
+    assert words_of("SELECT 'COMMIT'; -- COMMIT\n/* COMMIT */ SELECT $$COMMIT$$") == [
         ["SELECT"],
         ["SELECT"],
     ]
+
+
+def test_tokens_carry_their_parenthesis_depth(tmp_path: Path):
+    """What separates a routine's parameters from its body.
+
+    `CREATE FUNCTION f(begin atomic)` names a parameter and a type inside the
+    signature; a SQL-standard body sits outside it. Only the second opens a
+    body, and depth is what tells them apart without a grammar.
+    """
+    from app.db.migrations import _statements
+
+    (statement,) = _statements("CREATE FUNCTION f(begin atomic) RETURNS int LANGUAGE SQL")
+    depths = {t.word: t.depth for t in statement}
+    assert depths["BEGIN"] == 1 and depths["ATOMIC"] == 1
+    assert depths["CREATE"] == 0 and depths["RETURNS"] == 0
+
+    (body, *_) = _statements("CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1")
+    assert {t.word: t.depth for t in body}["BEGIN"] == 0
 
 
 def test_only_a_routine_definition_opens_a_body(tmp_path: Path):
@@ -274,7 +298,31 @@ def test_only_a_routine_definition_opens_a_body(tmp_path: Path):
 
 
 def test_a_bare_carriage_return_ends_a_line_comment(tmp_path: Path):
-    from app.db.migrations import _statements
-
     # Everything after the CR is live SQL, exactly as PostgreSQL reads it.
-    assert _statements("SELECT 1; -- note\rCOMMIT;") == [["SELECT"], ["COMMIT"], []]
+    assert words_of("SELECT 1; -- note\rCOMMIT;") == [["SELECT"], ["COMMIT"], []]
+
+
+def test_the_file_is_executed_exactly_as_written(tmp_path: Path):
+    """Newline normalization stops at the checksum.
+
+    A CRLF inside a string literal or a dollar-quoted body is part of the
+    VALUE. Folding it to keep checksums stable across checkouts would quietly
+    store different data than the migration says — measured before the split:
+    `'first\r\nsecond'` reached the column as `first\nsecond`.
+    """
+    path = tmp_path / "001_probe.sql"
+    payload = "INSERT INTO t VALUES ('first\r\nsecond');\r\n"
+    path.write_bytes(payload.encode())
+    assert read_migration(path).content == payload
+
+
+def test_the_checksum_does_not_change_with_the_checkout(tmp_path: Path):
+    # The reason normalization exists at all: a Windows checkout must not
+    # refuse every run afterwards.
+    lf = tmp_path / "001_probe.sql"
+    lf.write_bytes(b"CREATE TABLE t (id INT);\nCREATE TABLE u (id INT);\n")
+    unix = read_migration(lf).checksum
+
+    crlf = tmp_path / "002_probe.sql"
+    crlf.write_bytes(b"CREATE TABLE t (id INT);\r\nCREATE TABLE u (id INT);\r\n")
+    assert read_migration(crlf).checksum == unix

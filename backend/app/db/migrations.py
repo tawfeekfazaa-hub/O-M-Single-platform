@@ -7,9 +7,12 @@ Guarantees this runner provides, in the order they matter:
    applied and re-verified before they are used again. A rollback file is as
    destructive as the forward file is constructive, so it gets the same
    protection.
-2. **What is executed is what was checksummed.** Each file is read exactly once,
-   and that content is both hashed and executed — a file replaced mid-run
-   (a deploy updating a shared checkout) cannot record one hash and run another.
+2. **What is executed is what was checksummed.** Each file is read exactly once;
+   that text is executed, and its newline-normalized form is hashed. A file
+   replaced mid-run (a deploy updating a shared checkout) cannot record one hash
+   and run another. The normalization exists so a CRLF checkout does not refuse
+   every run, and it stops at the hash: the file is executed exactly as written,
+   because a CRLF inside a string literal is part of the value.
 3. **History is a prefix.** Applied migrations must be the first N of the
    discovered sequence. A migration numbered behind ones already applied is
    refused, because applying it would make the recorded order a lie and send
@@ -39,7 +42,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -79,17 +82,29 @@ class Emit(Protocol):
     def __call__(self, message: str) -> None: ...
 
 
-def _normalize(raw: bytes) -> str:
-    """Decode with newline normalization.
+def _decode(raw: bytes) -> str:
+    """The file's own text, unchanged. This is what gets executed."""
+    return raw.decode("utf-8")
+
+
+def _checksum(content: str) -> str:
+    """SHA-256 over newline-normalized content.
 
     A Windows checkout can rewrite LF to CRLF (the README documents a Windows
     workflow), which would change a byte-level hash without changing a single
     SQL statement and refuse every subsequent run. Normalizing makes the
-    checksum a property of the SQL rather than of the checkout — and because
-    the SAME normalized text is what gets executed, "checksummed" and
-    "executed" cannot drift apart.
+    checksum a property of the SQL rather than of the checkout.
+
+    The normalization stops here, at the hash. It deliberately does NOT touch
+    what is executed: a CRLF inside a string literal or a dollar-quoted body is
+    part of the VALUE, and folding it would quietly store different data than
+    the migration says. Measured before this split: ``'first\r\nsecond'``
+    reached the column as ``first\nsecond``.
+
+    "What was checksummed is what runs" still holds, because both come from the
+    same single read of the file — see :class:`Migration`.
     """
-    return raw.replace(b"\r\n", b"\n").decode("utf-8")
+    return _digest(content.replace("\r\n", "\n"))
 
 
 def _digest(content: str) -> str:
@@ -146,7 +161,15 @@ def _dollar_delimiter(sql: str, start: int) -> int:
     return i - start + 1 if i < n and sql[i] == "$" else 0
 
 
-def _statements(sql: str) -> list[list[str]]:
+class _Token(NamedTuple):
+    word: str
+    #: Parenthesis nesting where the token appears. A routine's parameters sit
+    #: at depth 1, its SQL-standard body at depth 0 — which is the difference
+    #: between `CREATE FUNCTION f(begin atomic)` and a real body opener.
+    depth: int
+
+
+def _statements(sql: str) -> list[list[_Token]]:
     """``sql`` split on ``;``, each statement as its upper-cased word tokens.
 
     A tokenizer rather than a search, because every bypass found in review came
@@ -159,14 +182,16 @@ def _statements(sql: str) -> list[list[str]]:
     Comments, string literals and quoted identifiers yield no tokens: they can
     contain any words at all without meaning them.
     """
-    statements: list[list[str]] = []
-    words: list[str] = []
+    statements: list[list[_Token]] = []
+    words: list[_Token] = []
+    depth = 0
     i, n = 0, len(sql)
     while i < n:
         ch = sql[i]
         if sql.startswith("--", i):
             # PostgreSQL ends a line comment at CR as well as LF, and a bare CR
-            # survives _normalize (which only rewrites CRLF). Measured: with
+            # is not folded anywhere (the checksum normalizes, the text does
+            # not). Measured: with
             # `-- note<CR>CREATE TABLE ...`, the server ran the statement after
             # the comment. Looking only for LF would read it as commented out.
             breaks = [p for p in (sql.find("\n", i), sql.find("\r", i)) if p != -1]
@@ -183,6 +208,7 @@ def _statements(sql: str) -> list[list[str]]:
         elif ch == ";":
             statements.append(words)
             words = []
+            depth = 0  # a new statement starts outside any parentheses
             i += 1
         elif ch in "'\"":
             # Plain literals never honour backslash escapes, because the runner
@@ -206,9 +232,13 @@ def _statements(sql: str) -> list[list[str]]:
                 # rather than the character before the quote.
                 i = _string_end(sql, end, "'", backslash_escapes=True)
             else:
-                words.append(word.upper())
+                words.append(_Token(word.upper(), depth))
                 i = end
         else:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
             i += 1  # numbers, operators, punctuation, $1 parameters
     statements.append(words)
     return statements
@@ -240,9 +270,10 @@ def _transaction_control(sql: str) -> list[str]:
     """
     found: list[str] = []
     open_bodies = 0
-    for words in _statements(sql):
-        if not words:
+    for tokens in _statements(sql):
+        if not tokens:
             continue
+        words = [t.word for t in tokens]
         first = words[0]
         second = words[1] if len(words) > 1 else ""
 
@@ -259,8 +290,13 @@ def _transaction_control(sql: str) -> list[str]:
             found.append(f"{first} {second}")
 
         if _defines_a_routine(words):
+            # Only at parenthesis depth 0. A routine's parameters are inside
+            # its signature, so `CREATE FUNCTION f(begin atomic) ... AS '...'`
+            # names a parameter and a type — it does not open a body, and
+            # counting it exempted the real END that followed.
             open_bodies += sum(
-                a == "BEGIN" and b == "ATOMIC" for a, b in zip(words, words[1:], strict=False)
+                a.word == "BEGIN" and b.word == "ATOMIC" and a.depth == 0
+                for a, b in zip(tokens, tokens[1:], strict=False)
             )
     return found
 
@@ -308,19 +344,22 @@ def _reject_transaction_control(content: str, filename: str) -> None:
 
 
 def read_migration(path: Path) -> Migration:
-    content = _normalize(path.read_bytes())
+    # Read once. That single text is executed, scanned, and — after newline
+    # normalization — hashed, so no two of those can be looking at different
+    # bytes.
+    content = _decode(path.read_bytes())
     _reject_transaction_control(content, path.name)
     down_path = path.with_name(path.name[: -len(".sql")] + DOWN_SUFFIX)
-    down_content = _normalize(down_path.read_bytes()) if down_path.is_file() else None
+    down_content = _decode(down_path.read_bytes()) if down_path.is_file() else None
     if down_content is not None:
         _reject_transaction_control(down_content, down_path.name)
     return Migration(
         filename=path.name,
         path=path,
         content=content,
-        checksum=_digest(content),
+        checksum=_checksum(content),
         down_content=down_content,
-        down_checksum=_digest(down_content) if down_content is not None else None,
+        down_checksum=_checksum(down_content) if down_content is not None else None,
     )
 
 
@@ -730,6 +769,16 @@ async def downgrade_to(
             await _verify(conn, applied, known, adopt_legacy=adopt_legacy, emit=emit)
             _require_prefix(migrations, applied)
             await conn.commit()
+
+            if target != BASE_TARGET and target not in applied:
+                # The file exists but the database never reached it. Filtering
+                # would quietly produce an empty set, and "rolled back 0
+                # migration(s)" with exit 0 tells automation it is now at a
+                # revision it never was.
+                raise MigrationError(
+                    f"cannot roll back to {target}: it is not applied. The database is at "
+                    + (max(applied) if applied else "base")
+                )
 
             # Reverse filename order, which _require_prefix has just proven is
             # also the reverse of the real application order.
