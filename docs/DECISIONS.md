@@ -151,6 +151,36 @@ that decides the next schema's shape.
    max_overflow=0` the second checkout blocked until `pool_timeout` and surfaced
    as a pool error saying nothing about why. The runner now refuses up front and
    says what it needs.
+4o. **A temporary table can never be the ledger.** PostgreSQL searches the
+   session's implicit `pg_temp` schema before `search_path` for relation names —
+   after `RESET search_path` too — and a temporary table has `relkind = 'r'` like
+   any other. So a temporary `schema_migrations` on the work connection was what
+   `to_regclass` answered with, and discovery accepted it. Measured on an engine
+   whose pooled connections carried one: an empty history, every migration
+   re-applied, a data migration's row inserted twice, exit 0 — and then the
+   session ends (4-11) and the "history" goes with it, leaving the schema
+   changes committed and unrecorded. Discovery now ignores temporary relations
+   and refuses when one is shadowing the ledger, rather than continuing past a
+   ledger-shaped table nobody put there on purpose.
+4p. **The ledger mutation must notice that another run got there first.** 4m
+   closes most of the window between confirming the lock and committing, not all
+   of it: the lock session can be closed inside it and a second runner take the
+   key while the first transaction is still uncommitted. Forward, `filename` is
+   the ledger's primary key, so the loser's `INSERT` conflicts — but the
+   `DELETE` in a rollback has no constraint to trip and matched nothing
+   silently. Measured: with the lock session closed just after the check passed,
+   the second runner read the row as still applied, executed the SAME down file
+   a second time, deleted nothing, and committed its duplicate reporting success
+   — `times the rollback SQL executed: 2`. Both mutations are now checked, and
+   because the duplicate work shares the transaction being refused, rolling back
+   discards it rather than merely reporting it.
+4q. **The lock session is left idle, not idle in transaction.** 4m's check runs
+   a query on the lock connection, which opens a transaction there; left open,
+   the session sat `idle in transaction` for the rest of the run. That is the
+   state operators kill hardest — `idle_in_transaction_session_timeout` is
+   commonly set where `idle_session_timeout` is not — so the check added to
+   survive an idle timeout had made its own connection a better target for one.
+   It ends its transaction now; a session-level advisory lock is unaffected.
 4j. **The ledger cannot be redirected by the migrations it records.** Migration
    SQL runs on the runner's connection and may legitimately `SET search_path`,
    which would resolve a later unqualified `schema_migrations` elsewhere.

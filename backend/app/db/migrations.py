@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import NamedTuple, Protocol
 
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 #: Forward migrations are ``NNN_name.sql``; their rollback is ``NNN_name.down.sql``.
@@ -473,7 +474,8 @@ async def _ledger_locations(conn: AsyncConnection) -> tuple[str | None, list[str
         await _ledger(
             conn,
             sa.text(
-                "SELECT c.oid, pg_catalog.format('%I.%I', n.nspname, c.relname) AS name "
+                "SELECT c.oid, pg_catalog.format('%I.%I', n.nspname, c.relname) AS name, "
+                "c.relpersistence OPERATOR(pg_catalog.=) 't' AS temporary "
                 "FROM pg_catalog.pg_class c "
                 "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
                 "WHERE c.relname = 'schema_migrations' "
@@ -488,8 +490,32 @@ async def _ledger_locations(conn: AsyncConnection) -> tuple[str | None, list[str
     await conn.execute(
         sa.text("SELECT pg_catalog.set_config('search_path', :p, true)"), {"p": entry_path}
     )
-    on_path = next((r.name for r in rows if oid is not None and r.oid == oid), None)
-    return on_path, sorted(r.name for r in rows if r.name != on_path)
+
+    # A TEMPORARY table is a real table with relkind 'r', and PostgreSQL searches
+    # the session's implicit pg_temp schema BEFORE search_path for relation
+    # names — after RESET too. So a temporary `schema_migrations` on this
+    # connection is what to_regclass answers with, and it would be accepted as
+    # the ledger. Measured on a session carrying one: an empty history, every
+    # migration re-applied, a data migration's row inserted twice, exit 0. Then
+    # _restore_session ends the session and the "history" goes with it, leaving
+    # the schema changes committed and unrecorded.
+    #
+    # Refused rather than skipped, the same way a ledger off the path is: the
+    # runner's own statements are all qualified and would have been safe, but
+    # something put a ledger-shaped table in front of the real one and that is
+    # not a state to continue through quietly.
+    shadow = next((r for r in rows if oid is not None and r.oid == oid and r.temporary), None)
+    if shadow is not None:
+        raise MigrationError(
+            f"a TEMPORARY table named schema_migrations ({shadow.name}) is shadowing the "
+            "ledger on this connection. PostgreSQL resolves relation names in the session's "
+            "temporary schema first, so it would be read as the history and every migration "
+            "re-applied. Nothing has been applied. Drop it, or run on a connection without it"
+        )
+
+    real = [r for r in rows if not r.temporary]
+    on_path = next((r.name for r in real if oid is not None and r.oid == oid), None)
+    return on_path, sorted(r.name for r in real if r.name != on_path)
 
 
 async def _ensure_bookkeeping(conn: AsyncConnection) -> str:
@@ -887,6 +913,14 @@ async def _confirm_lock(lock_conn: AsyncConnection) -> None:
             "the run lock is no longer held — its session was closed (an idle timeout or a "
             "proxy), so another run may already have started. Nothing further is applied"
         )
+    # End the transaction this check opened. Without it the lock session sits
+    # `idle in transaction` for the rest of the run instead of `idle`, which is
+    # the state operators kill hardest — idle_in_transaction_session_timeout is
+    # commonly set where idle_session_timeout is not. The check added to survive
+    # an idle timeout would have made the connection a better target for one.
+    # A session-level advisory lock is unaffected by the rollback.
+    with suppress(Exception):
+        await lock_conn.rollback()
 
 
 async def _restore_session(conn: AsyncConnection) -> None:
@@ -998,18 +1032,37 @@ async def apply_pending(
                 async with _atomic(conn):
                     await _run_sql(conn, migration.content, filename=migration.filename)
                     await _confirm_lock(lock_conn)
-                    await _ledger(
-                        conn,
-                        sa.text(
-                            f"INSERT INTO {ledger} (filename, checksum, down_checksum) "
-                            "VALUES (:f, :c, :d)"
-                        ),
-                        {
-                            "f": migration.filename,
-                            "c": migration.checksum,
-                            "d": migration.down_checksum,
-                        },
-                    )
+                    try:
+                        await _ledger(
+                            conn,
+                            sa.text(
+                                f"INSERT INTO {ledger} (filename, checksum, down_checksum) "
+                                "VALUES (:f, :c, :d)"
+                            ),
+                            {
+                                "f": migration.filename,
+                                "c": migration.checksum,
+                                "d": migration.down_checksum,
+                            },
+                        )
+                    except IntegrityError as exc:
+                        # The lock is confirmed just above, but the window
+                        # between that check and this transaction's COMMIT is
+                        # not zero: the lock session can be closed inside it and
+                        # another runner take the key while this work is still
+                        # uncommitted. `filename` is the ledger's primary key, so
+                        # a second runner that got there first turns this INSERT
+                        # into a conflict rather than a duplicate row — and
+                        # raising here discards THIS migration's SQL with it,
+                        # which is the point: the work was applied twice, and one
+                        # of the two must not survive.
+                        raise MigrationError(
+                            f"{migration.filename} was recorded by another run while this one "
+                            "was applying it, so two runs overlapped. This run's copy of the "
+                            "work has been rolled back and nothing further is applied; the "
+                            "other run's stands. Check that only one migration run is started "
+                            "per deploy, then re-run"
+                        ) from exc
                 emit(f"apply {migration.filename}")
                 applied_count += 1
         finally:
@@ -1111,11 +1164,33 @@ async def downgrade_to(
                     assert migration.down_content is not None  # checked above
                     await _run_sql(conn, migration.down_content, filename=migration.down_filename)
                     await _confirm_lock(lock_conn)
-                    await _ledger(
+                    removed = await _ledger(
                         conn,
                         sa.text(f"DELETE FROM {ledger} WHERE filename = :f"),
                         {"f": migration.filename},
                     )
+                    # The mirror of the INSERT conflict above, and the more
+                    # dangerous half: there is no unique constraint to trip, so
+                    # nothing here noticed. Measured — with the lock session
+                    # closed after _confirm_lock passed, a second runner read the
+                    # row as still applied (this transaction had not committed),
+                    # ran the SAME down file a second time, waited on this row,
+                    # deleted NOTHING, and committed its duplicate rollback
+                    # reporting success: `times 002's rollback SQL executed: 2`,
+                    # both runs "down 002_second.sql", exit 0.
+                    #
+                    # Rolling back on a zero count is what undoes it: the
+                    # duplicate down SQL is in this same transaction and goes
+                    # with it, so the destructive work is discarded rather than
+                    # merely reported.
+                    if removed.rowcount != 1:
+                        raise MigrationError(
+                            f"{migration.filename} was already removed from the history by "
+                            "another run, so two runs overlapped and this one has just "
+                            f"executed {migration.down_filename} a second time. That work has "
+                            "been rolled back and nothing further is unwound. Check that only "
+                            "one migration run is started per deploy, then re-run"
+                        )
                 if migration.filename in adopted:
                     # After the fact, because it says "executed": announcing it
                     # up front claimed execution for every unverifiable rollback

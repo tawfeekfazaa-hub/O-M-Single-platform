@@ -82,6 +82,16 @@ message — a connection error's text carries the host and port.
    registrations and temporary objects behind, and a caller sharing the engine
    would inherit all of it. Ending the session is the only reset that covers
    every kind at once. Cost: one reconnect per run.
+12. **A temporary table named `schema_migrations` is refused, not used.**
+   PostgreSQL resolves relation names in the session's temporary schema first,
+   so such a table would be read as the history — an empty one — and every
+   migration re-applied. See "a TEMPORARY table named schema_migrations is
+   shadowing the ledger" below.
+13. **Two overlapping runs cannot both succeed.** If a run's lock session is
+   closed after the lock was confirmed and another run takes the key, whichever
+   reaches the history second is refused and its copy of the work is rolled back
+   with it — forward and in rollback alike. See "was recorded by another run"
+   and "was already removed from the history by another run" below.
 
 ## Writing a migration
 
@@ -133,6 +143,33 @@ message — a connection error's text carries the host and port.
   migration.
 
 ## When something goes wrong
+
+**"a TEMPORARY table named schema_migrations is shadowing the ledger"**
+Something created a temporary `schema_migrations` on the connection the runner
+was given. PostgreSQL resolves relation names in the session's temporary schema
+before `search_path`, so it would have been read as the history — an empty one —
+and every migration re-applied. Nothing has been applied. Find what created it: a
+migration doing so is a bug in that migration (a temporary table is never the
+right way to stage migration work — use a real table and drop it in the same
+file). If a long-lived application connection carries one, run the migrations on
+their own engine. The runner's own connections cannot carry one into a later run,
+because the session ends with the run (guarantee 11).
+
+**"was recorded by another run while this one was applying it"**
+Two migration runs overlapped: this one's lock session was closed after the lock
+was confirmed, and the other took the key. This run's copy of the work was rolled
+back and the other run's stands, so the database is consistent — the history says
+what actually happened. Nothing needs repairing. Check the deploy: two runs
+starting per deploy is the underlying problem, and a `idle_in_transaction_session_timeout`
+or connection proxy short enough to close an idle lock session mid-run makes it
+likelier. Then re-run; it will apply whatever the other run did not reach.
+
+**"was already removed from the history by another run"**
+The same overlap, during a rollback, and the more serious direction: this run had
+just executed a down file that the other run had also executed. That duplicate
+execution was rolled back with the refusal, so it did not take effect — but check
+the down file for anything it does outside the transaction (it should do nothing
+outside it) before re-running. Then treat it as above: find why two runs started.
 
 **"these migrations were edited after being applied"**
 Someone changed a file that a database has already run. Do not force it. Either

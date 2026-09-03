@@ -1837,3 +1837,190 @@ async def test_an_engine_that_cannot_supply_two_connections_says_so(
             await apply_pending(engine, migrations_dir, emit=lambda _: None)
     finally:
         await engine.dispose()
+
+
+async def test_a_temporary_table_cannot_shadow_the_ledger(db_url: URL, migrations_dir: Path):
+    # PostgreSQL searches the session's implicit pg_temp schema before
+    # search_path for RELATION names -- after RESET too -- and a temporary table
+    # has relkind 'r' like any other. Measured before the fix, on an engine
+    # whose pooled connections carried one: an empty history, both migrations
+    # re-applied, the data migration's row inserted TWICE, exit 0.
+    write_pair(migrations_dir, "003_third", "INSERT INTO widget (id) VALUES (1);", None)
+    engine = create_async_engine(db_url, pool_size=2, max_overflow=0)
+    try:
+        assert await apply_pending(engine, migrations_dir, emit=lambda _: None) == 3
+
+        # BOTH pooled connections, because the pool decides which becomes the
+        # work connection and only that one matters. Planting it on one and
+        # trusting FIFO is how the first version of this passed while proving
+        # nothing -- the poisoned connection came back as the lock connection.
+        async with engine.connect() as first, engine.connect() as second:
+            for conn in (first, second):
+                await conn.execute(
+                    sa.text(
+                        "CREATE TEMP TABLE schema_migrations ("
+                        " filename TEXT PRIMARY KEY, checksum TEXT, down_checksum TEXT,"
+                        " applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+                    )
+                )
+                await conn.commit()
+
+        with pytest.raises(MigrationError, match="TEMPORARY table named schema_migrations"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    finally:
+        await engine.dispose()
+
+    verify = create_async_engine(db_url)
+    try:
+        # The real history is intact and the data migration ran exactly once.
+        assert await applied_names(verify) == ["001_first.sql", "002_second.sql", "003_third.sql"]
+        async with verify.connect() as conn:
+            assert await conn.scalar(sa.text("SELECT count(*) FROM widget")) == 1
+    finally:
+        await verify.dispose()
+
+
+async def test_a_migration_another_run_recorded_first_is_rolled_back(
+    db_url: URL, migrations_dir: Path
+):
+    # _confirm_lock closes most of the window, not all of it: the lock session
+    # can be closed between that check and this transaction's COMMIT, letting a
+    # second runner take the key while this work is still uncommitted. `filename`
+    # is the ledger's primary key, so the loser's INSERT conflicts -- and raising
+    # discards its copy of the migration SQL along with it.
+    write_pair(migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", None)
+    engine = create_async_engine(db_url)
+    interloper = create_async_engine(db_url, isolation_level="AUTOCOMMIT")
+    real_run = migrations_module._run_sql
+
+    async def record_it_from_elsewhere(conn, sql, *, filename):
+        await real_run(conn, sql, filename=filename)
+        if filename != "003_third.sql":
+            return
+        async with interloper.connect() as other:
+            await other.execute(
+                sa.text(
+                    "INSERT INTO schema_migrations (filename, checksum, down_checksum) "
+                    "VALUES (:f, 'other-run', 'other-run')"
+                ),
+                {"f": filename},
+            )
+
+    migrations_module._run_sql = record_it_from_elsewhere
+    try:
+        with pytest.raises(MigrationError, match="recorded by another run"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    finally:
+        migrations_module._run_sql = real_run
+        await interloper.dispose()
+        await engine.dispose()
+
+    verify = create_async_engine(db_url)
+    try:
+        # This run's copy of the work is gone; the other run's row stands.
+        assert not await table_exists(verify, "sprocket")
+        async with verify.connect() as conn:
+            stored = await conn.scalar(
+                sa.text("SELECT checksum FROM schema_migrations WHERE filename = :f"),
+                {"f": "003_third.sql"},
+            )
+            assert stored == "other-run"
+    finally:
+        await verify.dispose()
+
+
+async def test_a_rollback_another_run_already_recorded_is_undone(db_url: URL, migrations_dir: Path):
+    # The mirror of the INSERT conflict, and the dangerous half: a DELETE that
+    # matches nothing raises nothing. Measured before the fix -- with the lock
+    # session closed after _confirm_lock passed, a second runner read the row as
+    # still applied, ran the SAME down file again, deleted nothing and committed:
+    # `times the rollback SQL executed: 2`, both runs reporting success.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE TABLE rollback_log (n INT);\nINSERT INTO rollback_log (n) VALUES (0);",
+        "DROP TABLE IF EXISTS rollback_log;",
+    )
+    # Deliberately NOT idempotent, so a second execution is visible.
+    write_pair(
+        migrations_dir,
+        "004_fourth",
+        "CREATE TABLE cog (id INT);",
+        "UPDATE rollback_log SET n = n + 1;\nDROP TABLE IF EXISTS cog;",
+    )
+    engine = create_async_engine(db_url)
+    interloper = create_async_engine(db_url, isolation_level="AUTOCOMMIT")
+    await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    real_run = migrations_module._run_sql
+
+    async def unrecord_it_from_elsewhere(conn, sql, *, filename):
+        await real_run(conn, sql, filename=filename)
+        if filename != "004_fourth.down.sql":
+            return
+        async with interloper.connect() as other:
+            await other.execute(
+                sa.text("DELETE FROM schema_migrations WHERE filename = '004_fourth.sql'")
+            )
+
+    migrations_module._run_sql = unrecord_it_from_elsewhere
+    try:
+        with pytest.raises(MigrationError, match="already removed from the history"):
+            await downgrade_to(engine, migrations_dir, "003_third.sql", emit=lambda _: None)
+    finally:
+        migrations_module._run_sql = real_run
+        await interloper.dispose()
+        await engine.dispose()
+
+    verify = create_async_engine(db_url)
+    try:
+        async with verify.connect() as conn:
+            # The duplicate rollback shared the transaction that was refused, so
+            # it went with it: the counter never moved and the table it would
+            # have dropped is still here.
+            assert await conn.scalar(sa.text("SELECT n FROM rollback_log")) == 0
+        assert await table_exists(verify, "cog")
+    finally:
+        await verify.dispose()
+
+
+async def test_the_lock_session_is_not_parked_in_a_transaction(db_url: URL, migrations_dir: Path):
+    # _confirm_lock runs a query on the lock connection, which opens a
+    # transaction there. Left open, the session sits `idle in transaction` for
+    # the rest of the run rather than `idle` -- and
+    # idle_in_transaction_session_timeout is commonly set where
+    # idle_session_timeout is not, so the check added to survive an idle timeout
+    # would have made its own connection a better target for one.
+    engine = create_async_engine(db_url)
+    watcher = create_async_engine(db_url, isolation_level="AUTOCOMMIT")
+    states: list[list[str]] = []
+    real_confirm = migrations_module._confirm_lock
+
+    async def sample(lock_conn):
+        await real_confirm(lock_conn)
+        # The lock connection is never touched by this probe: an earlier version
+        # rolled it back to read its pid and so created what it was measuring.
+        async with watcher.connect() as w:
+            rows = (
+                await w.execute(
+                    sa.text(
+                        "SELECT state FROM pg_stat_activity "
+                        "WHERE datname = :n AND pid <> pg_backend_pid()"
+                    ),
+                    {"n": db_url.database},
+                )
+            ).all()
+        states.append(sorted(r.state for r in rows))
+
+    migrations_module._confirm_lock = sample
+    try:
+        await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    finally:
+        migrations_module._confirm_lock = real_confirm
+        await watcher.dispose()
+        await engine.dispose()
+
+    assert states, "the check never ran, so this asserts nothing"
+    for observed in states:
+        # Exactly one of each: the work connection is mid-migration and belongs
+        # in a transaction; the lock connection does not.
+        assert observed == ["idle", "idle in transaction"], observed
