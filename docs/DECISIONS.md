@@ -66,12 +66,25 @@ constraint on what it references. Verified against the pinned image in
 The claim is deliberately scoped to that. A foreign key to `id` alone is
 rejected by *plain* PostgreSQL too, with the same "no unique constraint matching
 given keys" message, so a test written that way would prove nothing about
-TimescaleDB; a guard test pins that distinction so it is not lost later. The
-only remaining way to reference a hypertable is its full composite key
-`(id, partitioning_column)`, and that case is probed separately: if it ever
-succeeds, PR-2A1 gains an option it does not have today — a composite hard
-reference, at the cost of carrying the partitioning column in every referencing
-row.
+TimescaleDB; a guard test pins that distinction so it is not lost later.
+
+The only remaining candidate is the full composite key
+`(id, partitioning_column)`, and TimescaleDB **does** accept a foreign key
+referencing it — measured, after a first attempt asserted the opposite and CI
+refuted it. So the choice for PR-2A1 is not "hard references are impossible" but
+a trade-off it must make deliberately:
+
+- a hard reference obliges every referencing row to carry the partitioning
+  column as well (`kpi_measurements` would need a `raw_received_at` beside every
+  `raw_payload_id`), and
+- it couples raw retention to referential integrity: dropping a chunk of raw
+  payloads that normalized rows still reference cannot leave those references
+  dangling, which is precisely what a differing retention period requires.
+
+The recommendation stands — soft references, and provenance pointing at a purged
+payload reported as such — but it now rests on the retention trade-off rather
+than on an impossibility. Whether `drop_chunks` is actually blocked by such a
+reference is the concrete question PR-2A1 should settle before choosing.
 
 Consequence: raw payloads stored in a hypertable (so retention is a chunk drop
 rather than a mass DELETE) can only be referenced SOFTLY — a plain `BIGINT` with

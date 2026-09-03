@@ -145,18 +145,22 @@ async def test_a_hypertable_cannot_be_keyed_without_its_partitioning_column(
     assert "received_at" in str(excinfo.value)
 
 
-async def test_a_regular_table_cannot_foreign_key_into_a_hypertable(migrated: AsyncEngine):
-    """The only remaining way to reference a hypertable: its full composite key.
+async def test_a_composite_foreign_key_into_a_hypertable_is_accepted(migrated: AsyncEngine):
+    """Measures the one reference form a hypertable can actually support.
 
-    Referencing ``id`` alone fails on PLAIN PostgreSQL too — "no unique
-    constraint matching given keys" — so that form measures nothing about
-    TimescaleDB. The composite primary key `(id, received_at)` does exist and
-    is unique, so this is the case that actually decides whether a HARD
-    reference into raw storage is possible at all.
+    A foreign key needs a unique constraint on what it references. The test
+    above proves ``id`` alone can never be unique on a hypertable, so the
+    composite primary key ``(id, received_at)`` is the only candidate left —
+    and TimescaleDB accepts it.
 
-    If this ever starts passing, PR-2A1 gains an option it does not have today:
-    a composite foreign key, at the cost of carrying ``received_at`` in every
-    referencing row. Until then, soft references stand.
+    That is NOT a green light for hard provenance references in PR-2A1. It
+    means a referencing row must carry the partitioning column too
+    (``kpi_measurements`` would need a ``raw_received_at`` beside every
+    ``raw_payload_id``), and it couples raw retention to referential
+    integrity: see the next test.
+
+    Asserted rather than assumed so a change in a future TimescaleDB release
+    is caught here instead of in a schema design that relies on it.
     """
     async with migrated.begin() as conn:
         await conn.execute(
@@ -168,21 +172,24 @@ async def test_a_regular_table_cannot_foreign_key_into_a_hypertable(migrated: As
             )
         )
         await conn.execute(sa.text("SELECT create_hypertable('probe_raw2', 'received_at')"))
-
-    with pytest.raises(DBAPIError) as excinfo:
-        async with migrated.begin() as conn:
-            await conn.execute(
-                sa.text(
-                    "CREATE TABLE probe_child ("
-                    "  raw_id BIGINT NOT NULL,"
-                    "  raw_received_at TIMESTAMPTZ NOT NULL,"
-                    "  FOREIGN KEY (raw_id, raw_received_at)"
-                    "    REFERENCES probe_raw2 (id, received_at))"
-                )
+        await conn.execute(
+            sa.text(
+                "CREATE TABLE probe_child ("
+                "  raw_id BIGINT NOT NULL,"
+                "  raw_received_at TIMESTAMPTZ NOT NULL,"
+                "  FOREIGN KEY (raw_id, raw_received_at)"
+                "    REFERENCES probe_raw2 (id, received_at))"
             )
-    # Not the generic "no unique constraint" error — that would mean the key was
-    # never found, and this key exists. The refusal has to be about hypertables.
-    assert "no unique constraint" not in str(excinfo.value).lower()
+        )
+
+    async with migrated.connect() as conn:
+        constraint = await conn.scalar(
+            sa.text(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = 'probe_child'::regclass AND contype = 'f'"
+            )
+        )
+    assert constraint is not None
 
 
 async def test_referencing_a_hypertable_by_id_alone_is_not_a_timescale_specific_result(
@@ -191,9 +198,10 @@ async def test_referencing_a_hypertable_by_id_alone_is_not_a_timescale_specific_
     """Guards the finding above against being restated in a form that proves nothing.
 
     Plain PostgreSQL rejects a foreign key to a non-unique column with exactly
-    the same error, so a test written that way would pass for a reason that has
-    nothing to do with TimescaleDB. Recording that here keeps the distinction
-    from being lost the next time these probes are edited.
+    the same "no unique constraint matching given keys" error, so a probe
+    written that way would pass for a reason that has nothing to do with
+    TimescaleDB. Recording that here keeps the distinction from being lost the
+    next time these tests are edited.
     """
     async with migrated.begin() as conn:
         await conn.execute(
