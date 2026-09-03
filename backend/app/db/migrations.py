@@ -82,6 +82,28 @@ class Emit(Protocol):
     def __call__(self, message: str) -> None: ...
 
 
+def _reporting(emit: Emit) -> Emit:
+    """Wrap a caller's ``emit`` so a failure to report cannot change the result.
+
+    ``emit`` is supplied by the caller: a closed stdout, a logging handler that
+    raises, a test callback. Every announcement in this module is made AFTER the
+    work it describes has committed, so letting the reporter's exception
+    propagate turned a completed run into ``migration refused`` and exit 2 —
+    telling automation to handle a failure that did not happen, for a state
+    change that did. Measured: a ``BrokenPipeError`` from ``emit`` left the
+    table created and its history row written, and the CLI reported a refusal.
+
+    Exceptions only. A cancellation passing through the reporter is still the
+    caller's to see.
+    """
+
+    def report(message: str) -> None:
+        with suppress(Exception):
+            emit(message)
+
+    return report
+
+
 def _decode(raw: bytes) -> str:
     """The file's own text, unchanged. This is what gets executed."""
     return raw.decode("utf-8")
@@ -309,11 +331,16 @@ def _transaction_control(sql: str) -> list[str]:
             found.append(f"{first} {second}")
 
         if _defines_a_routine(words):
-            # Only at parenthesis depth 0. A routine's parameters are inside
-            # its signature, so `CREATE FUNCTION f(begin atomic) ... AS '...'`
-            # names a parameter and a type — it does not open a body, and
-            # counting it exempted the real END that followed.
-            open_bodies += sum(
+            # AT MOST ONE, because one statement defines at most one routine and
+            # therefore has at most one body. Summing every matching pair counted
+            # the real opener AND a table/alias pair inside the body's first
+            # statement — `BEGIN ATOMIC SELECT x FROM begin atomic` — and then
+            # exempted two ENDs, the second of which commits the transaction.
+            #
+            # The first qualifying pair is the opener: a routine's options come
+            # before its body, and its parameters are inside parentheses, so
+            # nothing at depth 0 can precede it.
+            open_bodies += any(
                 a.word == "BEGIN" and b.word == "ATOMIC" and a.depth == 0 and b.adjacent
                 for a, b in zip(tokens, tokens[1:], strict=False)
             )
@@ -728,6 +755,7 @@ async def apply_pending(
     adopt_legacy: bool = False,
 ) -> int:
     """Apply every migration not yet recorded. Returns how many were applied."""
+    emit = _reporting(emit)
     migrations = discover(directory)
     known = {m.filename: m for m in migrations}
     applied_count = 0
@@ -787,6 +815,7 @@ async def downgrade_to(
     matches the checksum recorded when its migration was applied — a rollback
     file edited afterwards can drop far more than its own migration created.
     """
+    emit = _reporting(emit)
     migrations = discover(directory)
     known = {m.filename: m for m in migrations}
     if target != BASE_TARGET and target not in known:

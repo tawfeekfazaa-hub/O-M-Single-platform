@@ -155,15 +155,32 @@ async def test_deleting_an_applied_migration_refuses_the_whole_run(
         await apply_pending(db_engine, migrations_dir)
 
 
-async def test_whitespace_only_line_endings_do_not_trip_the_checksum(
+async def test_a_line_ending_change_to_an_applied_migration_is_drift(
     db_engine: AsyncEngine, migrations_dir: Path
 ):
-    # A Windows checkout can rewrite LF to CRLF without changing one SQL
-    # statement; a byte-level hash would refuse every run after that.
-    await apply_pending(db_engine, migrations_dir)
+    """Replaces a test that asserted the opposite, and proved nothing either way.
+
+    It rewrote LF to CRLF in a fixture that had no newline in it, so the
+    mutation changed zero bytes and the run passed because nothing had happened
+    — while its comment described the newline-normalized checksum, a policy
+    withdrawn when it turned out to let two files that insert different data
+    share a hash.
+
+    Under the exact-byte policy a line-ending change to an applied migration is
+    drift, and drift is refused. `.gitattributes` is what stops a checkout
+    producing one.
+    """
+    multiline = "CREATE TABLE widget (id INT PRIMARY KEY);\nCREATE TABLE extra (id INT);"
+    (migrations_dir / "001_first.sql").write_text(multiline)
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+
     path = migrations_dir / "001_first.sql"
-    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
-    assert await apply_pending(db_engine, migrations_dir) == 0
+    rewritten = path.read_bytes().replace(b"\n", b"\r\n")
+    assert rewritten != path.read_bytes()  # the mutation must actually mutate
+    path.write_bytes(rewritten)
+
+    with pytest.raises(MigrationChecksumError, match="001_first.sql"):
+        await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
 
 
 async def test_a_row_from_the_pre_checksum_runner_is_refused_by_default(
@@ -1231,3 +1248,52 @@ async def test_an_unverified_rollback_is_announced_only_once_it_has_run(
     # reported as executed.
     assert not any("003_third" in line and "adopt" in line for line in lines)
     assert await table_exists(db_engine, "sprocket")
+
+
+async def test_a_reporter_that_fails_does_not_turn_a_success_into_a_refusal(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # Every announcement is made after the work it describes has committed, so
+    # an exception from the caller's emit — a closed stdout, a logging handler
+    # that raises — used to reach the CLI's handler and print "migration
+    # refused" for a run that had already succeeded.
+    def broken(_line: str) -> None:
+        raise BrokenPipeError("stdout is closed")
+
+    assert await apply_pending(db_engine, migrations_dir, emit=broken) == 2
+    assert await table_exists(db_engine, "widget")
+    assert await applied_names(db_engine) == ["001_first.sql", "002_second.sql"]
+
+
+async def test_a_reporter_that_fails_is_not_allowed_to_hide_a_real_refusal(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # The other direction: swallowing the reporter's exception must not swallow
+    # the runner's own.
+    write_pair(
+        migrations_dir, "003_third", "CREATE TABLE sprocket (id INT NOT AN INT);", "SELECT 1;"
+    )
+
+    def broken(_line: str) -> None:
+        raise BrokenPipeError("stdout is closed")
+
+    with pytest.raises(MigrationError, match="003_third.sql failed to execute"):
+        await apply_pending(db_engine, migrations_dir, emit=broken)
+
+
+async def test_only_one_body_is_opened_per_routine_definition(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # End to end, because the point is that PostgreSQL uses the second END to
+    # commit: the guard must refuse the file before it can.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE TABLE begin (x int);\n"
+        "CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT x FROM begin atomic; "
+        "END;\nEND;",
+        "DROP TABLE IF EXISTS begin;",
+    )
+    with pytest.raises(MigrationError, match="manages its own transaction"):
+        await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+    assert not await table_exists(db_engine, "widget")  # the whole run is refused

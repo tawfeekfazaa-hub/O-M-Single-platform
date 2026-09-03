@@ -113,6 +113,13 @@ that decides the next schema's shape.
    other process blocks, so the leak is invisible from inside the process that
    caused it. Measured with cancellation delivered before `pg_advisory_unlock`:
    another engine could not take the lock.
+4i. **Reporting never changes the outcome it reports.** Every announcement is
+   made after the work it describes commits, so an exception from the caller's
+   `emit` — a closed stdout, a logging handler that raises — turned a completed
+   run into `migration refused` and exit 2. Measured: a `BrokenPipeError` from
+   `emit` left the table created and its history row written, and the CLI
+   reported a refusal. Reporting failures are now suppressed; the runner's own
+   are not.
 4f. **A database problem is a refusal, not a traceback.** The documented exit
    contract is 0/1/2, and the runner's taxonomy only covers what the runner
    itself recognises. Measured: with the server not running the CLI printed a
