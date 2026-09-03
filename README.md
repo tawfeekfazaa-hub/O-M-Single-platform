@@ -70,8 +70,24 @@ TEST_DATABASE_URL=postgresql+asyncpg://aq_om@127.0.0.1:5432/postgres \
 ```
 
 Each test creates and drops its own database, so the one in the URL is only used
-to connect. CI runs these in the `backend-db` job against the same pinned
-TimescaleDB image as `docker-compose.yml`.
+to connect. That is a connection point, **not** the extent of what the role
+needs: these tests are not runnable by an ordinary application role.
+
+- **`CREATEDB`** — every test creates and drops a database of its own, because
+  migrations are DDL and a shared schema would make one test's rollback another
+  test's missing table. Without it the fixtures fail before any test body runs.
+- **Permission to install TimescaleDB** — `001` runs `CREATE EXTENSION
+  timescaledb`, which needs a superuser or equivalent on most installations, and
+  the extension available on the server.
+
+So point `TEST_DATABASE_URL` at a **throwaway server** you have that much
+control over — the `docker-compose.yml` one does, and is the intended target —
+not at a shared or production cluster. The application's own runtime role needs
+none of this; see "Role provisioning is not a migration" in `docs/MIGRATIONS.md`
+for the split.
+
+CI runs these in the `backend-db` job against the same pinned TimescaleDB image
+as `docker-compose.yml`.
 
 ## Frontend quickstart
 

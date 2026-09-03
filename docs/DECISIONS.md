@@ -174,6 +174,20 @@ that decides the next schema's shape.
    — `times the rollback SQL executed: 2`. Both mutations are now checked, and
    because the duplicate work shares the transaction being refused, rolling back
    discards it rather than merely reporting it.
+4r. **The run lock is never taken on a session that already holds it.** Session
+   advisory locks are reentrant: taking one this session already holds succeeds
+   and raises the hold count, while the single release lowers it by one — so the
+   lock stays held on a connection returned to the pool, blocking every other
+   process, while this pool's next run takes it again reentrantly and never
+   notices. Measured: two acquires and one release leave it held. The runner
+   refuses on a session already holding the key, and — the structural half —
+   ends the lock session after releasing, exactly as the failure path already
+   did, so the runner can never be what leaked one.
+4s. **An empty migrations directory is a refusal, not a no-op.** A deployment
+   artifact that lost its migrations would create an empty ledger, print
+   `applied 0 migration(s)` and exit 0 with no schema installed. Every other
+   "nothing to do" in this runner is backed by a history saying so; this one was
+   backed by nothing.
 4q. **The lock session is left idle, not idle in transaction.** 4m's check runs
    a query on the lock connection, which opens a transaction there; left open,
    the session sat `idle in transaction` for the rest of the run. That is the

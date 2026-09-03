@@ -2024,3 +2024,102 @@ async def test_the_lock_session_is_not_parked_in_a_transaction(db_url: URL, migr
         # Exactly one of each: the work connection is mid-migration and belongs
         # in a transaction; the lock connection does not.
         assert observed == ["idle", "idle in transaction"], observed
+
+
+async def test_a_lock_already_held_by_the_pooled_session_is_refused(
+    db_url: URL, migrations_dir: Path
+):
+    # Session advisory locks are REENTRANT. A session that already holds the key
+    # lets pg_try_advisory_lock succeed and raises the hold count, while the one
+    # release at the end lowers it by one — so the lock stays held on a
+    # connection returned to the pool, blocking every other process while this
+    # pool's next run takes it again and never notices. Measured: two acquires
+    # and one release leave it held.
+    engine = create_async_engine(db_url, pool_size=2, max_overflow=0)
+    try:
+        # Exactly ONE connection is left in the pool, holding the key. That is
+        # what makes this deterministic rather than a bet on the pool's
+        # hand-back order: the run's first checkout can only be this one, and
+        # the first checkout is the lock connection. (Planting it on two is not
+        # an option either way — advisory locks are exclusive between sessions,
+        # so the second acquire simply returns false.)
+        async with engine.connect() as conn:
+            assert await conn.scalar(
+                sa.text("SELECT pg_catalog.pg_try_advisory_lock(:k)"),
+                {"k": migrations_module.ADVISORY_LOCK_KEY},
+            )
+            await conn.commit()
+
+        with pytest.raises(MigrationLockError, match="already holds the migration advisory lock"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    finally:
+        await engine.dispose()
+
+    verify = create_async_engine(db_url)
+    try:
+        assert not await table_exists(verify, "widget")  # refused before anything ran
+    finally:
+        await verify.dispose()
+
+
+async def test_the_lock_session_is_not_returned_to_the_pool_holding_anything(
+    db_url: URL, migrations_dir: Path
+):
+    # The structural half of the above: the runner must never be what leaks a
+    # level, so every exit path ENDS the lock session rather than releasing one
+    # level and pooling it. That is why the check above can treat a held lock as
+    # somebody else's problem rather than its own.
+    #
+    # Asserting "nothing holds the key afterwards" would NOT have tested this —
+    # the single pg_advisory_unlock already zeroes the count on every path the
+    # check allows, so that assertion passes with the discard removed. Measured;
+    # it is the assertion this test started with. What the fix actually does is
+    # end the session, so that is what is observed: the backend the lock ran on
+    # must be gone, not idle in the pool.
+    engine = create_async_engine(db_url, pool_size=2, max_overflow=0)
+    watcher = create_async_engine(db_url, isolation_level="AUTOCOMMIT")
+    lock_pids: list[int] = []
+    real_lock = migrations_module._lock
+
+    async def note_the_pid(conn):
+        await real_lock(conn)
+        lock_pids.append(await conn.scalar(sa.text("SELECT pg_catalog.pg_backend_pid()")))
+        await conn.commit()
+
+    migrations_module._lock = note_the_pid
+    try:
+        assert await apply_pending(engine, migrations_dir, emit=lambda _: None) == 2
+    finally:
+        migrations_module._lock = real_lock
+
+    try:
+        assert len(lock_pids) == 1, lock_pids  # or the spy never ran
+        async with watcher.connect() as w:
+            alive = await w.scalar(
+                sa.text("SELECT count(*) FROM pg_stat_activity WHERE pid = :p"),
+                {"p": lock_pids[0]},
+            )
+        assert alive == 0, "the lock session went back to the pool instead of ending"
+    finally:
+        await watcher.dispose()
+        await engine.dispose()
+
+
+async def test_a_migrations_directory_with_no_forward_files_is_refused(
+    db_engine: AsyncEngine, tmp_path: Path
+):
+    # An artifact that lost its migrations would create an empty ledger, print
+    # `applied 0 migration(s)` and exit 0 with no schema installed. Every other
+    # "nothing to do" in this runner is backed by a history saying so.
+    empty = tmp_path / "no_forward_files"
+    empty.mkdir()
+    with pytest.raises(MigrationError, match="no forward migrations found"):
+        await apply_pending(db_engine, empty, emit=lambda _: None)
+
+    # Orphaned rollback files are the same case, not a different one.
+    (empty / "001_first.down.sql").write_text("DROP TABLE IF EXISTS widget;")
+    with pytest.raises(MigrationError, match="no forward migrations found"):
+        await apply_pending(db_engine, empty, emit=lambda _: None)
+
+    # And it refused before creating the ledger it would have read as empty.
+    assert not await table_exists(db_engine, "schema_migrations")

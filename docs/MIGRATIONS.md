@@ -144,6 +144,20 @@ message — a connection error's text carries the host and port.
 
 ## When something goes wrong
 
+**"no forward migrations found in ..."**
+The directory exists but holds no `NNN_name.sql` file — usually a deployment
+artifact that did not include them, or a checkout with only `.down.sql` files
+left. Nothing has been applied, and that is the point: installing no schema and
+reporting success would leave the application pointed at an empty database. Fix
+the artifact so the migrations ship with it, then re-run.
+
+**"this connection's session already holds the migration advisory lock"**
+The engine handed the runner a pooled connection that was already holding the
+key. The runner ends its own lock session on every exit path, so it is not the
+source; something else in this process took the same advisory key on that
+engine. Find it — taking migration locks outside the runner is not supported —
+or give the runner an engine of its own.
+
 **"a TEMPORARY table named schema_migrations is shadowing the ledger"**
 Something created a temporary `schema_migrations` on the connection the runner
 was given. PostgreSQL resolves relation names in the session's temporary schema

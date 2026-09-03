@@ -441,6 +441,18 @@ def discover(directory: Path) -> list[Migration]:
                 f"{migration.filename} — renumber one to the end of the sequence"
             )
         seen[number] = migration.filename
+
+    if not migrations:
+        # A deploy whose artifact lost its migrations would otherwise create an
+        # empty ledger, print `applied 0 migration(s)` and exit 0 with no schema
+        # installed — reporting success for a database the application cannot
+        # use. Every other "nothing to do" here is backed by a history saying so;
+        # this one is backed by nothing at all.
+        raise MigrationError(
+            f"no forward migrations found in {directory} — the directory exists but holds "
+            "none (an incomplete deployment artifact, or only .down.sql files). Installing "
+            "no schema and reporting success is not a state this can report as a no-op"
+        )
     return migrations
 
 
@@ -832,7 +844,39 @@ async def _atomic(conn: AsyncConnection) -> AsyncIterator[None]:
         await tx.commit()
 
 
+# The advisory key as PostgreSQL stores it. A bigint key is split across
+# pg_locks.classid (high 32 bits) and pg_locks.objid (low 32), with objsubid 1.
+# Split here rather than reassembled in SQL: this key is negative, and
+# `classid::bigint * 4294967296 + objid` overflows bigint before it can match.
+_LOCK_CLASSID = (ADVISORY_LOCK_KEY & 0xFFFFFFFFFFFFFFFF) >> 32
+_LOCK_OBJID = ADVISORY_LOCK_KEY & 0xFFFFFFFF
+
+
 async def _lock(conn: AsyncConnection) -> None:
+    # Session advisory locks are REENTRANT: taking one this session already
+    # holds succeeds and raises the hold count, while the single release below
+    # lowers it by one — leaving the lock held on a connection that goes back to
+    # the pool, where every other process blocks on it forever and this pool's
+    # own next run takes it again reentrantly and never notices. Measured: two
+    # acquires and one release leave it held.
+    #
+    # The release path ends this session (see _unlock), so the runner cannot be
+    # what leaked it. Anything else holding this key on a checked-out session is
+    # a state to refuse rather than build on.
+    already = await conn.scalar(
+        sa.text(
+            "SELECT count(*) FROM pg_catalog.pg_locks WHERE locktype = 'advisory' "
+            "AND pid = pg_catalog.pg_backend_pid() AND objsubid = 1 "
+            "AND classid = :c AND objid = :o"
+        ),
+        {"c": _LOCK_CLASSID, "o": _LOCK_OBJID},
+    )
+    if already:
+        raise MigrationLockError(
+            "this connection's session already holds the migration advisory lock before the "
+            "run started. Taking it again would nest, and releasing once would leave it held "
+            "for every other process. Refusing on an engine whose pool is in that state"
+        )
     acquired = await conn.scalar(
         sa.text("SELECT pg_catalog.pg_try_advisory_lock(:k)"), {"k": ADVISORY_LOCK_KEY}
     )
@@ -975,6 +1019,14 @@ async def _unlock(conn: AsyncConnection, *, emit: Emit) -> None:
             sa.text("SELECT pg_catalog.pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY}
         )
         await conn.commit()
+        # Then end the session anyway, exactly as the failure path does. The
+        # release above lowers the hold count by one, which is right only if the
+        # count was one — and the check in _lock is what establishes that for
+        # THIS run, not for a session shared with anything else. Ending it
+        # leaves nothing behind to be reasoned about, at the cost of one
+        # reconnect on a connection used once per run; the work connection is
+        # already dropped for the same kind of reason.
+        await _discard(conn)
     except BaseException as exc:
         # BaseException, not Exception: asyncio.CancelledError inherits straight
         # from BaseException, so a caller cancelling mid-cleanup used to skip the
