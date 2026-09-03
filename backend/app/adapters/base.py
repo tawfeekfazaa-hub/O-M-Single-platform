@@ -36,24 +36,74 @@ class PlantInfo:
 
 @dataclass(frozen=True, slots=True)
 class PlantKpiReading:
-    """One normalized KPI sample for one plant (IEC 61724-1 subset)."""
+    """One normalized KPI sample for one plant (IEC 61724-1 subset).
+
+    Timestamp provenance:
+    - ``ts`` is the local RECEIVED-AT time (when our process ingested the
+      sample), timezone-aware UTC. It is what gets stored.
+    - ``vendor_server_time`` is the vendor's SERVER clock as reported in
+      the response envelope (FusionSolar ``params.currentTime``). It is
+      NOT a device measurement timestamp and must not be presented as one.
+    """
 
     vendor: str
     vendor_plant_id: str
-    ts: datetime  # timezone-aware UTC
+    ts: datetime  # timezone-aware UTC, local received-at time
     active_power_kw: float | None = None
     daily_energy_kwh: float | None = None
     total_energy_kwh: float | None = None
-    performance_ratio: float | None = None  # 0..1
+    performance_ratio: float | None = None  # normalized 0..1
     status: PlantStatus = PlantStatus.UNKNOWN
+    vendor_server_time: datetime | None = None  # vendor server clock, UTC
 
 
 class AdapterError(Exception):
-    """Base class for all vendor adapter failures."""
+    """Base class for all vendor adapter failures.
+
+    ``blocks_authentication`` marks a failure that happened while
+    ESTABLISHING the session, whatever its kind. Every other call needs
+    that session, so a caller that treats such a failure as belonging to
+    the operation it happened to be running would move on to the next one,
+    re-authenticate immediately, and spend another scarce login slot —
+    turning a vendor outage into a client-side login throttle.
+    """
+
+    def __init__(self, message: str, *, blocks_authentication: bool = False) -> None:
+        super().__init__(message)
+        self.blocks_authentication = blocks_authentication
 
 
 class AdapterAuthError(AdapterError):
     """Authentication failed or session expired and re-login failed."""
+
+
+class AdapterTransientError(AdapterError):
+    """Timeout, connection failure, or retryable 5xx — safe to retry LATER
+    (after scheduler backoff), never immediately.
+
+    ``retry_after_seconds`` carries the delay the SERVER asked for when it
+    sent one (``Retry-After`` on a 503, say). Discarding it left the
+    scheduler with only its own backoff, which can be far shorter than the
+    hour the vendor requested — so the next request goes out while the
+    vendor is still shedding load, exactly when it can least afford it.
+    Like the rate-limit hint, it is a lower bound the scheduler widens but
+    never shortens.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        retry_after_seconds: float | None = None,
+        *,
+        blocks_authentication: bool = False,
+    ) -> None:
+        super().__init__(message, blocks_authentication=blocks_authentication)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class AdapterProtocolError(AdapterError):
+    """The vendor answered with a malformed or contract-violating payload
+    (non-JSON, unexpected envelope shape, impossible pagination metadata)."""
 
 
 class AdapterRateLimitError(AdapterError):
@@ -61,11 +111,32 @@ class AdapterRateLimitError(AdapterError):
 
     ``retry_after_seconds`` is a hint for the scheduler's backoff; it is a
     lower bound, not a guarantee.
+
+    ``retry_after_covers_whole_attempt`` says what that delay actually
+    buys. A plain rate-limit hint frees ONE slot, which is not enough for a
+    multi-call operation: retrying then would spend the freed slot, fail
+    again at the same point and never make progress, so the scheduler
+    widens such a delay to a full window. When the adapter has instead
+    measured when the ENTIRE next attempt can run — a pre-flight capacity
+    check that knows how many calls it needs — the delay is already
+    sufficient and widening it only adds staleness.
+
+    ``blocks_authentication`` (inherited) additionally means the vendor
+    itself asked for the delay on the login endpoint, so the wait is not
+    just "no session" but "do not call login again yet".
     """
 
-    def __init__(self, message: str, retry_after_seconds: float | None = None) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        retry_after_seconds: float | None = None,
+        *,
+        retry_after_covers_whole_attempt: bool = False,
+        blocks_authentication: bool = False,
+    ) -> None:
+        super().__init__(message, blocks_authentication=blocks_authentication)
         self.retry_after_seconds = retry_after_seconds
+        self.retry_after_covers_whole_attempt = retry_after_covers_whole_attempt
 
 
 class VendorAdapter(ABC):

@@ -40,6 +40,16 @@ class RollingWindowRateLimiter:
         self._sleep = sleep
         self._calls: deque[float] = deque()
 
+    def set_max_calls(self, max_calls: int) -> None:
+        """Adjust the budget in place, preserving the call history.
+
+        Used for budgets that are derived at runtime (e.g. FusionSolar's
+        real-time KPI allowance scales with the number of plants).
+        """
+        if max_calls < 1:
+            raise ValueError("max_calls must be >= 1")
+        self.max_calls = max_calls
+
     def _prune(self, now: float) -> None:
         cutoff = now - self.window_seconds
         while self._calls and self._calls[0] <= cutoff:
@@ -52,6 +62,27 @@ class RollingWindowRateLimiter:
         if len(self._calls) < self.max_calls:
             return 0.0
         return self._calls[0] + self.window_seconds - now
+
+    def wait_for(self, count: int) -> float:
+        """Seconds until ``count`` slots are free AT ONCE. 0 if they are now.
+
+        A paginated burst needs its whole page count available before it
+        starts: taking the last free slot and being rejected on the next
+        page spends budget on an inventory that is never retrieved.
+        """
+        if count <= 0:
+            return 0.0
+        now = self._clock()
+        self._prune(now)
+        needed = count - (self.max_calls - len(self._calls))
+        if needed <= 0:
+            return 0.0
+        if needed > len(self._calls):
+            # More than the whole budget: no wait ever makes this fit. The
+            # caller's page guard rejects that configuration; never return
+            # an unbounded delay for a scheduler to sleep on.
+            return self.window_seconds
+        return self._calls[needed - 1] + self.window_seconds - now
 
     async def acquire(self, *, wait: bool = True) -> None:
         """Reserve one call slot.

@@ -1,25 +1,38 @@
-"""Real-client protocol tests against an in-process fake server (httpx
-MockTransport) — envelope handling, session, and rate-limit behaviour are
-exercised without any network or credentials."""
+"""Real-client protocol tests against an in-process fake server
+(httpx.MockTransport) — transport, auth, session, and error-mapping
+behaviour, all offline. No real credentials, no real plant data."""
 
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 import httpx
 import pytest
 
-from app.adapters.base import AdapterAuthError, AdapterRateLimitError
+from app.adapters.base import (
+    AdapterAuthError,
+    AdapterError,
+    AdapterProtocolError,
+    AdapterRateLimitError,
+    AdapterTransientError,
+)
+from app.adapters.fusionsolar.adapter import FusionSolarAdapter
 from app.adapters.fusionsolar.client import XSRF_HEADER, RealFusionSolarClient
-from app.core.ratelimit import RollingWindowRateLimiter
+from app.adapters.fusionsolar.policy import FusionSolarRatePolicy
 
 BASE_URL = "https://fake.fusionsolar.example/thirdData"
+ORIGIN_HOST = "fake.fusionsolar.example"
 USERNAME = "nb-user"
-PASSWORD = "nb-pass"
+SYSTEM_CODE = "nb-system-code"
 TOKEN = "token-abc"
 
 STATIONS = [{"stationCode": "NE=1", "stationName": "P1", "capacity": 1.0, "stationAddr": "X"}]
+
+
+def envelope(data: Any, *, success: bool = True, fail_code: int = 0, **extra: Any) -> dict:
+    return {"success": success, "failCode": fail_code, "data": data, **extra}
 
 
 class FakeFusionSolar:
@@ -27,108 +40,123 @@ class FakeFusionSolar:
 
     def __init__(self) -> None:
         self.requests: list[tuple[str, dict[str, Any]]] = []
+        self.hosts_seen: set[str] = set()
         self.fail_login = False
         self.rate_limit_all = False
-        self.expire_session_once = False
+        self.expire_session_times = 0  # how many calls answer failCode 305
+        self.http_status: int | None = None
+        self.retry_after: str | None = None
+        self.raise_transport: Exception | None = None
+        self.body_override: str | None = None
+        self.token_in_cookie = False
+        self.omit_token = False
+        self.redirect_to: str | None = None
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        self.hosts_seen.add(request.url.host)
         path = request.url.path.removeprefix("/thirdData")
         body = json.loads(request.content or b"{}")
         self.requests.append((path, body))
 
+        if self.raise_transport is not None:
+            raise self.raise_transport
+        if self.redirect_to is not None:
+            return httpx.Response(302, headers={"Location": self.redirect_to})
+        if self.http_status is not None:
+            # Encoded on the wire: httpx rejects a non-ASCII header STRING,
+            # but obs-text bytes are exactly what a broken or hostile server
+            # can put on a Retry-After line, so send the raw octets.
+            headers = (
+                [(b"Retry-After", self.retry_after.encode("utf-8"))] if self.retry_after else []
+            )
+            return httpx.Response(self.http_status, headers=headers, json={})
+        if self.body_override is not None:
+            return httpx.Response(200, content=self.body_override)
         if self.rate_limit_all:
-            return httpx.Response(200, json={"success": False, "failCode": 407})
+            return httpx.Response(200, json=envelope(None, success=False, fail_code=407))
 
         if path == "/login":
-            if self.fail_login or body.get("systemCode") != PASSWORD:
-                return httpx.Response(200, json={"success": False, "failCode": 20001})
-            return httpx.Response(
-                200, json={"success": True, "failCode": 0}, headers={XSRF_HEADER: TOKEN}
-            )
+            if self.fail_login or body.get("systemCode") != SYSTEM_CODE:
+                return httpx.Response(200, json=envelope(None, success=False, fail_code=20001))
+            headers: dict[str, str] = {}
+            if self.omit_token:
+                pass
+            elif self.token_in_cookie:
+                headers["Set-Cookie"] = f"{XSRF_HEADER}={TOKEN}; Path=/"
+            else:
+                headers[XSRF_HEADER] = TOKEN
+            return httpx.Response(200, json=envelope(None), headers=headers)
 
-        if request.headers.get(XSRF_HEADER) != TOKEN or self.expire_session_once:
-            self.expire_session_once = False
-            return httpx.Response(200, json={"success": False, "failCode": 305})
+        if request.headers.get(XSRF_HEADER) != TOKEN or self.expire_session_times > 0:
+            if self.expire_session_times > 0:
+                self.expire_session_times -= 1
+            return httpx.Response(200, json=envelope(None, success=False, fail_code=305))
 
         if path == "/getStationList":
-            return httpx.Response(200, json={"success": True, "failCode": 0, "data": STATIONS})
+            return httpx.Response(200, json=envelope(list(STATIONS)))
         if path == "/getStationRealKpi":
             codes = str(body.get("stationCodes", "")).split(",")
-            data = [
+            rows = [
                 {"stationCode": c, "dataItemMap": {"day_power": 5.0, "real_health_state": 3}}
                 for c in codes
                 if c
             ]
-            return httpx.Response(200, json={"success": True, "failCode": 0, "data": data})
+            return httpx.Response(
+                200, json=envelope(rows, params={"currentTime": 1_780_000_000_000})
+            )
         return httpx.Response(404)
 
 
-def make_client(fake: FakeFusionSolar, max_calls: int = 10) -> RealFusionSolarClient:
+def generous_policy() -> FusionSolarRatePolicy:
+    policy = FusionSolarRatePolicy(
+        login_max_calls=100,
+        station_list_max_calls=100,
+        station_list_window_seconds=86_400.0,
+    )
+    policy.set_kpi_plant_count(10_000)
+    return policy
+
+
+def make_client(fake: FakeFusionSolar, policy: FusionSolarRatePolicy | None = None):
     return RealFusionSolarClient(
         base_url=BASE_URL,
         username=USERNAME,
-        password=PASSWORD,
-        rate_limiter=RollingWindowRateLimiter(max_calls, 600.0),
+        system_code=SYSTEM_CODE,
+        policy=policy or generous_policy(),
         transport=httpx.MockTransport(fake.handler),
     )
 
 
-async def test_login_then_authenticated_call():
+# --------------------------------------------------------------------- #
+# authentication & token handling                                       #
+# --------------------------------------------------------------------- #
+
+
+async def test_login_token_from_response_header():
     fake = FakeFusionSolar()
     client = make_client(fake)
-    stations = await client.get_station_list()
-    assert stations == STATIONS
+    result = await client.list_stations()
+    assert [s["stationCode"] for s in result.stations] == ["NE=1"]
     assert [p for p, _ in fake.requests] == ["/login", "/getStationList"]
     assert client.is_logged_in()
     await client.close()
 
 
-async def test_station_kpi_batches_codes_comma_separated():
+async def test_login_token_from_cookie():
     fake = FakeFusionSolar()
+    fake.token_in_cookie = True
     client = make_client(fake)
-    rows = await client.get_station_real_kpi(["NE=1", "NE=2"])
-    assert {r["stationCode"] for r in rows} == {"NE=1", "NE=2"}
-    _, body = fake.requests[-1]
-    assert body == {"stationCodes": "NE=1,NE=2"}
+    result = await client.list_stations()
+    assert len(result.stations) == 1
     await client.close()
 
 
-async def test_server_407_raises_rate_limit_error():
+async def test_missing_token_is_auth_error():
     fake = FakeFusionSolar()
+    fake.omit_token = True
     client = make_client(fake)
-    await client.get_station_list()  # establish session first
-    fake.rate_limit_all = True
-    with pytest.raises(AdapterRateLimitError):
-        await client.get_station_list()
-    await client.close()
-
-
-async def test_session_expiry_triggers_single_relogin():
-    fake = FakeFusionSolar()
-    client = make_client(fake)
-    await client.get_station_list()
-    fake.expire_session_once = True
-    stations = await client.get_station_list()
-    assert stations == STATIONS
-    # 305 -> re-login -> retried call.
-    assert [p for p, _ in fake.requests] == [
-        "/login",
-        "/getStationList",
-        "/getStationList",
-        "/login",
-        "/getStationList",
-    ]
-    await client.close()
-
-
-async def test_client_side_budget_counts_login_calls():
-    fake = FakeFusionSolar()
-    client = make_client(fake, max_calls=1)
-    with pytest.raises(AdapterRateLimitError) as excinfo:
-        await client.get_station_list()  # login consumes the only slot
-    assert excinfo.value.retry_after_seconds is not None
-    # Only the login reached the "server".
-    assert [p for p, _ in fake.requests] == ["/login"]
+    with pytest.raises(AdapterAuthError):
+        await client.login()
     await client.close()
 
 
@@ -139,3 +167,569 @@ async def test_bad_credentials_raise_auth_error():
     with pytest.raises(AdapterAuthError):
         await client.login()
     await client.close()
+
+
+async def test_all_requests_stay_on_configured_origin():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    await client.get_station_real_kpi(["NE=1"])
+    assert fake.hosts_seen == {ORIGIN_HOST}
+    await client.close()
+
+
+async def test_redirects_are_not_followed():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.redirect_to = "https://evil.example/steal"
+    before = len(fake.requests)
+    with pytest.raises(AdapterError):
+        await client.get_station_real_kpi(["NE=1"])
+    # Exactly one request was made; the redirect target was never called.
+    assert len(fake.requests) == before + 1
+    assert fake.hosts_seen == {ORIGIN_HOST}
+    await client.close()
+
+
+async def test_session_expiry_triggers_single_relogin():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.expire_session_times = 1
+    result = await client.list_stations()
+    assert len(result.stations) == 1
+    # 305 -> exactly one re-login -> one retry.
+    assert [p for p, _ in fake.requests].count("/login") == 2
+
+
+async def test_repeated_305_does_not_loop():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.expire_session_times = 99
+    before_logins = [p for p, _ in fake.requests].count("/login")
+    with pytest.raises(AdapterAuthError):
+        await client.list_stations()
+    after_logins = [p for p, _ in fake.requests].count("/login")
+    assert after_logins - before_logins == 1  # one controlled re-login, no loop
+    await client.close()
+
+
+async def test_concurrent_logins_are_single_flight():
+    import asyncio
+
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await asyncio.gather(client.login(), client.login(), client.login())
+    assert [p for p, _ in fake.requests].count("/login") == 1
+    await client.close()
+
+
+async def test_the_post_305_retry_is_charged_to_the_endpoint_budget():
+    # EVERY request charges a slot, the post-re-login retry included. Reusing
+    # the rejected attempt's slot put two physical KPI requests inside a
+    # one-call window; whether Huawei counts a rejected request against the
+    # quota is unverified, so the client must not assume the cheaper reading
+    # of its own hard limit. With no slot free the retry DEFERS.
+    fake = FakeFusionSolar()
+    policy = FusionSolarRatePolicy(login_max_calls=100, station_list_max_calls=100)
+    policy.set_kpi_plant_count(1)  # ceil(1/100) -> 1 call per window
+    client = make_client(fake, policy)
+    await client.login()
+    fake.expire_session_times = 1
+
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    assert excinfo.value.retry_after_seconds is not None
+
+    paths = [p for p, _ in fake.requests]
+    assert paths.count("/getStationRealKpi") == 1  # the budget was never exceeded
+    assert paths.count("/login") == 2  # the re-login DID happen ...
+    assert client.is_logged_in()  # ... and its token is kept for the next cycle
+    await client.close()
+
+
+async def test_the_post_305_retry_proceeds_when_the_budget_has_room():
+    # Deferring is the answer to an exhausted budget, not to a session
+    # expiry: with a slot actually free the retry goes out immediately and
+    # the cycle completes.
+    fake = FakeFusionSolar()
+    policy = FusionSolarRatePolicy(login_max_calls=100, station_list_max_calls=100)
+    policy.set_kpi_plant_count(200)  # ceil(200/100) -> 2 calls per window
+    client = make_client(fake, policy)
+    await client.login()
+    fake.expire_session_times = 1
+
+    result = await client.get_station_real_kpi(["NE=1"])
+    assert [r["stationCode"] for r in result.rows] == ["NE=1"]
+    paths = [p for p, _ in fake.requests]
+    assert paths.count("/getStationRealKpi") == 2  # rejected attempt + retry
+    assert paths.count("/login") == 2  # one re-login
+    await client.close()
+
+
+async def test_retry_after_is_honoured_on_a_retryable_server_error():
+    # A shedding server that names its own delay must be believed: without
+    # this the scheduler saw a bare transient error and could re-request an
+    # hour early, while the vendor was still down.
+    fake = FakeFusionSolar()
+    fake.http_status = 503
+    fake.retry_after = "3600"
+    client = make_client(fake)
+    with pytest.raises(AdapterTransientError) as excinfo:
+        await client.list_stations()
+    assert excinfo.value.retry_after_seconds == 3600.0
+    await client.close()
+
+
+async def test_a_retryable_server_error_without_the_header_has_no_delay():
+    # The delay is the SERVER's to name. Inventing one here would override
+    # the scheduler's own backoff curve with a number nobody asked for.
+    fake = FakeFusionSolar()
+    fake.http_status = 503
+    client = make_client(fake)
+    with pytest.raises(AdapterTransientError) as excinfo:
+        await client.list_stations()
+    assert excinfo.value.retry_after_seconds is None
+    await client.close()
+
+
+async def test_adapter_scales_kpi_budget_from_full_plant_count():
+    # The policy's KPI budget starts at the 1-call constructor default; the
+    # adapter must announce the FULL requested count before its first batch
+    # or every multi-batch tenant would be rejected client-side.
+    fake = FakeFusionSolar()
+    policy = FusionSolarRatePolicy(login_max_calls=100, station_list_max_calls=100)
+    client = make_client(fake, policy)
+    adapter = FusionSolarAdapter(client, allow_synthetic_fields=False)
+    codes = [f"NE={i}" for i in range(150)]
+    readings = await adapter.fetch_plant_kpis(codes)
+    assert len(readings) == 150
+    assert client.call_counts().station_real_kpi == 2  # two sequential batches
+    await client.close()
+
+
+# --------------------------------------------------------------------- #
+# rate-limit and transient/protocol error mapping                       #
+# --------------------------------------------------------------------- #
+
+
+async def test_server_fail_code_407_maps_to_rate_limit_with_window_hint():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.rate_limit_all = True
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    assert excinfo.value.retry_after_seconds is not None
+    assert excinfo.value.retry_after_seconds >= 300.0  # KPI window lower bound
+    # No re-login was attempted in response to 407.
+    assert [p for p, _ in fake.requests].count("/login") == 1
+    await client.close()
+
+
+async def test_http_429_with_numeric_retry_after():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = "120"
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    assert excinfo.value.retry_after_seconds == pytest.approx(120.0)
+    await client.close()
+
+
+async def test_http_429_with_malformed_retry_after_uses_budget_hint():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = "not-a-delay"
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    assert excinfo.value.retry_after_seconds >= 300.0
+    await client.close()
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+async def test_retryable_5xx_is_transient(status: int):
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = status
+    with pytest.raises(AdapterTransientError):
+        await client.get_station_real_kpi(["NE=1"])
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    "exc", [httpx.ConnectTimeout("t"), httpx.ReadTimeout("t"), httpx.ConnectError("c")]
+)
+async def test_timeouts_and_connection_failures_are_transient(exc: Exception):
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.raise_transport = exc
+    with pytest.raises(AdapterTransientError):
+        await client.get_station_real_kpi(["NE=1"])
+    await client.close()
+
+
+async def test_non_json_body_is_protocol_error():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.body_override = "<html>maintenance</html>"
+    with pytest.raises(AdapterProtocolError):
+        await client.get_station_real_kpi(["NE=1"])
+    await client.close()
+
+
+async def test_non_object_envelope_is_protocol_error():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.body_override = json.dumps([1, 2, 3])
+    with pytest.raises(AdapterProtocolError):
+        await client.get_station_real_kpi(["NE=1"])
+    await client.close()
+
+
+# --------------------------------------------------------------------- #
+# real-time KPI call shape                                              #
+# --------------------------------------------------------------------- #
+
+
+async def test_kpi_batch_is_comma_separated_and_capped():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    result = await client.get_station_real_kpi(["NE=1", "NE=2"])
+    assert {r["stationCode"] for r in result.rows} == {"NE=1", "NE=2"}
+    _, body = fake.requests[-1]
+    assert body == {"stationCodes": "NE=1,NE=2"}
+    with pytest.raises(AdapterError):
+        await client.get_station_real_kpi([f"NE={i}" for i in range(101)])
+    await client.close()
+
+
+async def test_kpi_vendor_server_time_is_captured():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    result = await client.get_station_real_kpi(["NE=1"])
+    assert result.vendor_current_time_ms == 1_780_000_000_000
+    await client.close()
+
+
+async def test_kpi_malformed_data_is_protocol_error():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.body_override = json.dumps(envelope({"not": "a list"}))
+    with pytest.raises(AdapterProtocolError):
+        await client.get_station_real_kpi(["NE=1"])
+    await client.close()
+
+
+# --------------------------------------------------------------------- #
+# Retry-After parsing robustness                                        #
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Wed, 21 Oct 2015 07:28:00",  # no timezone -> naive datetime
+        "Wed, 21 Oct 2015 07:28:00 GMT",
+        "Thu, 01 Jan 2099 00:00:00 GMT",
+    ],
+)
+async def test_http_date_retry_after_never_raises(header: str):
+    # A timezone-less HTTP-date used to raise TypeError out of the adapter
+    # taxonomy, which could take the scheduler task down.
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = header
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    assert excinfo.value.retry_after_seconds is not None
+    assert excinfo.value.retry_after_seconds >= 0.0
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "\u00b2",  # SUPERSCRIPT TWO: str.isdigit() is True, float() raises
+        "\u2082",  # SUBSCRIPT TWO: same trap
+        "\u0663",  # ARABIC-INDIC THREE: float() accepts it, RFC 9110 does not
+    ],
+)
+async def test_non_ascii_digit_retry_after_falls_back_to_the_budget_hint(header: str):
+    # RFC 9110 delta-seconds is ASCII digits only. str.isdigit() accepts more
+    # than float() does, so an obs-text digit used to raise ValueError out of
+    # the adapter taxonomy and could terminate run_forever().
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = header
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    delay = excinfo.value.retry_after_seconds
+    assert delay is not None and math.isfinite(delay)
+    assert delay >= 300.0  # the documented endpoint-window fallback
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Sun, 06 Nov 999999999999999999999999 08:49:37 GMT",  # year overflows a C long
+        "Sun, 06 Nov 2994 08:49:37 -999999999999999999999 ",  # offset overflows too
+    ],
+)
+async def test_overflowing_http_date_falls_back_to_the_budget_hint(header: str):
+    # parsedate_to_datetime() raises OverflowError (not ValueError) on a date
+    # whose year does not fit a C long. That is just another malformed header:
+    # it must fall back to the endpoint-window hint, never escape the adapter
+    # taxonomy and terminate run_forever().
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = header
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    delay = excinfo.value.retry_after_seconds
+    assert delay is not None and math.isfinite(delay)
+    assert delay >= 300.0  # the documented endpoint-window fallback
+    await client.close()
+
+
+# --------------------------------------------------------------------- #
+# absolute transport-level call cap                                     #
+# --------------------------------------------------------------------- #
+
+
+async def test_max_total_calls_caps_every_request_including_relogin():
+    # The post-305 retry deliberately bypasses the endpoint budget, so only
+    # a transport-level ceiling can hold an advertised hard cap.
+    fake = FakeFusionSolar()
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username=USERNAME,
+        system_code=SYSTEM_CODE,
+        policy=generous_policy(),
+        transport=httpx.MockTransport(fake.handler),
+        max_total_calls=4,
+    )
+    await client.login()  # 1
+    await client.list_stations()  # 2
+    fake.expire_session_times = 1  # KPI (3) rejected -> re-login (4) -> retry (5)
+    with pytest.raises(AdapterError):
+        await client.get_station_real_kpi(["NE=1"])
+    assert client.call_counts().total() == 4  # the 5th request was never sent
+    await client.close()
+
+
+async def test_call_counts_total_sums_every_endpoint():
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    await client.get_station_real_kpi(["NE=1"])
+    counts = client.call_counts()
+    assert counts.total() == sum(counts.as_dict().values()) == 3
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "9" * 400,  # overflows to infinity
+        "1" * 500,
+        "1" * 300,  # stays FINITE (~1e299) and would freeze the loop just as well
+        "86401",  # one second past the plausibility ceiling
+    ],
+)
+async def test_unusable_retry_after_falls_back_to_the_budget_hint(header: str):
+    # An unusable delay must never become the scheduler's hard lower bound:
+    # infinity and ~1e299 stall KPI polling identically.
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = header
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    delay = excinfo.value.retry_after_seconds
+    assert delay is not None and math.isfinite(delay)
+    assert delay >= 300.0  # the documented endpoint-window fallback
+    await client.close()
+
+
+async def test_plausible_retry_after_is_still_honoured():
+    # The ceiling rejects absurd values only — a usable hint is respected.
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()
+    fake.http_status = 429
+    fake.retry_after = "86400"  # exactly the ceiling, still usable
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.get_station_real_kpi(["NE=1"])
+    assert excinfo.value.retry_after_seconds == pytest.approx(86_400.0)
+    await client.close()
+
+
+async def test_undecodable_body_is_a_protocol_error_not_an_escape():
+    # httpx raises DecodingError from post() when a declared content-encoding
+    # will not decode. It is a RequestError but NOT a TransportError, so the
+    # transient clause misses it and it used to escape run_forever().
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/login"):
+            return httpx.Response(
+                200, json={"success": True, "failCode": 0}, headers={XSRF_HEADER: TOKEN}
+            )
+        return httpx.Response(
+            200,
+            content=b"not-actually-gzip",
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        )
+
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username=USERNAME,
+        system_code=SYSTEM_CODE,
+        policy=generous_policy(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_non_finite_fail_code_is_not_an_escape():
+    # JSON 1e309 decodes to infinity, which int() refuses with OverflowError.
+    # An unusable failCode simply is not one of the codes we act on.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content='{"success": false, "failCode": 1e309}',
+            headers={"Content-Type": "application/json"},
+        )
+
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username=USERNAME,
+        system_code=SYSTEM_CODE,
+        policy=generous_policy(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AdapterError):  # inside the taxonomy, whatever the kind
+        await client.login()
+    await client.close()
+
+
+async def test_a_repeated_305_drops_the_token_and_blocks_the_session():
+    # The login endpoint answered, but the token it issued is rejected too.
+    # Keeping it would send the next call out with a token the vendor has
+    # already refused — spending a third login in the same cycle to learn
+    # that again — so the session is marked unusable and the token dropped.
+    fake = FakeFusionSolar()
+    fake.expire_session_times = 99  # every authenticated call answers 305
+    client = make_client(fake)
+    with pytest.raises(AdapterAuthError) as excinfo:
+        await client.list_stations()
+    assert excinfo.value.blocks_authentication is True
+    assert client.is_logged_in() is False
+    await client.close()
+
+
+async def test_ambiguous_token_cookies_are_an_adapter_error():
+    # Several XSRF-TOKEN cookies on different paths: httpx refuses to choose
+    # and raises CookieConflict, which is not an HTTPError — without its own
+    # clause it escapes the taxonomy and takes the scheduler task down.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"success": True, "failCode": 0},
+            headers=[
+                (b"set-cookie", b"XSRF-TOKEN=a; Path=/thirdData"),
+                (b"set-cookie", b"XSRF-TOKEN=b; Path=/other"),
+            ],
+        )
+
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username=USERNAME,
+        system_code=SYSTEM_CODE,
+        policy=generous_policy(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AdapterAuthError) as excinfo:
+        await client.login()
+    assert excinfo.value.blocks_authentication is True
+    assert client.is_logged_in() is False
+    await client.close()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_an_unauthorized_status_drops_the_session(status: int):
+    # An expired session can arrive as a STATUS rather than failCode 305.
+    # Keeping the token would send the next call out with credentials the
+    # vendor just rejected, and authenticate() would keep seeing a
+    # logged-in client on every later cycle too.
+    fake = FakeFusionSolar()
+    client = make_client(fake)
+    await client.list_stations()  # a healthy call first
+    assert client.is_logged_in()
+    fake.http_status = status
+    with pytest.raises(AdapterAuthError) as excinfo:
+        await client.list_stations()
+    assert excinfo.value.blocks_authentication is True
+    assert client.is_logged_in() is False
+    await client.close()
+
+
+@pytest.mark.parametrize("claim", ["false", "true", 1, 0, [], {}])
+async def test_a_non_boolean_success_claim_is_not_a_success(claim: object):
+    # Truthiness would read "success": "false" — a non-empty string — as a
+    # success and ingest the error envelope's data as plant data.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/login"):
+            return httpx.Response(
+                200, json={"success": True, "failCode": 0}, headers={XSRF_HEADER: TOKEN}
+            )
+        return httpx.Response(200, json={"success": claim, "failCode": 0, "data": []})
+
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username=USERNAME,
+        system_code=SYSTEM_CODE,
+        policy=generous_policy(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AdapterError):  # never a certified empty inventory
+        await client.list_stations()
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (305, 305),
+        (407, 407),
+        (305.0, 305),  # an integral float is still that code
+        (305.9, 0),  # truncation would buy a re-login the vendor never asked for
+        ("407", 0),  # text would defer ingestion on a code we never received
+        (True, 0),
+        (None, 0),
+    ],
+)
+def test_fail_codes_are_read_strictly(raw: object, expected: int):
+    # The failCode decides whether a scarce login is spent (305) or the
+    # scheduler stands down for a whole window (407).
+    assert RealFusionSolarClient._fail_code({"failCode": raw}) == expected

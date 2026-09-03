@@ -67,7 +67,10 @@ class PostgresRepository(Repository):
             constraint="uq_plants_vendor_key",
             set_={
                 "name": stmt.excluded.name,
-                "capacity_kwp": stmt.excluded.capacity_kwp,
+                # A missing capacity means "not reported" (absent, or a value
+                # that failed validation), never "the plant lost its
+                # capacity": keep the stored one rather than erasing it.
+                "capacity_kwp": sa.func.coalesce(stmt.excluded.capacity_kwp, plants.c.capacity_kwp),
                 "address": stmt.excluded.address,
                 "updated_at": stmt.excluded.updated_at,
             },

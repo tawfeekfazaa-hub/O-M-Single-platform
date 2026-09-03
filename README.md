@@ -79,15 +79,20 @@ All configuration via environment variables — see `.env.example`
   (`:3000`), and PostgreSQL (`127.0.0.1:5432` only) are development
   services: never bind them to a public interface or forward them to the
   internet.
-- **Real-mode ingestion is prohibited for now.** `FUSIONSOLAR_MODE=real`
-  stays off until follow-up PRs add vendor contract validation and
-  raw/quarantine storage. Development and CI run exclusively against the
-  mock adapter.
-- **`backend/scripts/check_fusionsolar.py` is NOT approved for live use
-  before PR-1.** It exists for future credential validation only; a green
-  mock run (or green tests) is no evidence that a real Huawei connection
-  works. Do not run it against real credentials, and do not print, log,
-  or commit real plant data anywhere.
+- **Real-mode ingestion is prohibited for now — and enforced.** The app
+  refuses to start `FUSIONSOLAR_MODE=real` + `SCHEDULER_ENABLED=true`
+  until Raw/Quarantine storage lands (PR-2). Development and CI run
+  exclusively against the mock adapter. Rollout: PR-1 validated the
+  connector contract offline; PR-2 adds Raw/Quarantine; only after PR-2
+  **plus** an approved staging host **plus** the company data-location
+  policy decision may a controlled live check run.
+- **`backend/scripts/check_fusionsolar.py` live mode stays PROHIBITED**
+  until those same three conditions hold. Its default run is an offline
+  dry-run; the hardened live path additionally demands `--live`,
+  `--i-understand-rate-budget`, real mode, full configuration and a
+  disabled scheduler — and prints counts only, never station identities,
+  values, tokens, or credentials. A green mock run (or green tests) is no
+  evidence that a real Huawei connection works.
 - CI enforces: ruff + pytest, `pip-audit` on the fully resolved production
   tree and on the complete installed environment (blocking on any finding),
   `npm audit` blocking on high/critical for production and for all

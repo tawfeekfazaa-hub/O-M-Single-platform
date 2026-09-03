@@ -1,0 +1,745 @@
+"""Station-list contract tests on /thirdData/getStationList: both
+documented response variants, full pagination, guards, de-duplication.
+All offline via httpx.MockTransport; no other endpoint is ever tried."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from typing import Any
+
+import httpx
+import pytest
+
+from app.adapters.base import AdapterProtocolError, AdapterRateLimitError
+from app.adapters.fusionsolar.client import XSRF_HEADER, RealFusionSolarClient
+from app.adapters.fusionsolar.policy import Endpoint, FusionSolarRatePolicy
+
+BASE_URL = "https://fake.fusionsolar.example/thirdData"
+TOKEN = "token-abc"
+
+
+def station(i: int, **overrides: Any) -> dict[str, Any]:
+    row = {
+        "stationCode": f"NE={i}",
+        "stationName": f"Plant {i}",
+        "capacity": 1.0,
+        "stationAddr": "addr",
+    }
+    row.update(overrides)
+    return row
+
+
+class StationListServer:
+    """Serves login plus a scriptable /getStationList."""
+
+    def __init__(self, pages: list[list[dict[str, Any]]] | None, direct: list | None = None):
+        self.pages = pages
+        self.direct = direct
+        self.page_count_override: Any = "auto"
+        self.page_count_per_page: dict[int, Any] = {}
+        self.omit_page_count = False
+        self.omit_page_count_on: set[int] = set()
+        # Per-page overrides for the rest of the paginated envelope, so the
+        # strict contract can be exercised field by field.
+        self.page_no_per_page: dict[int, Any] = {}
+        self.page_size_per_page: dict[int, Any] = {}
+        self.total_per_page: dict[int, Any] = {}
+        self.total_override: Any = None
+        self.omit_fields: set[str] = set()
+        self.data_override: Any = None
+        self.requests: list[dict[str, Any]] = []
+        # Opt-in only: the station-list tests keep the strict "no other
+        # endpoint is ever tried" assertion below.
+        self.serve_kpi = False
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path.removeprefix("/thirdData")
+        body = json.loads(request.content or b"{}")
+        if path == "/login":
+            return httpx.Response(
+                200, json={"success": True, "failCode": 0}, headers={XSRF_HEADER: TOKEN}
+            )
+        if path == "/getStationRealKpi" and self.serve_kpi:
+            codes = [c for c in str(body.get("stationCodes", "")).split(",") if c]
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "failCode": 0,
+                    "data": [{"stationCode": c, "dataItemMap": {"day_power": 1.0}} for c in codes],
+                    "params": {"currentTime": 1_780_000_000_000},
+                },
+            )
+        assert path == "/getStationList", f"unexpected endpoint called: {path}"
+        self.requests.append(body)
+
+        if self.data_override is not None:
+            data = self.data_override
+        elif self.direct is not None:
+            data = self.direct
+        else:
+            page_no = int(body.get("pageNo", 1))
+            pages = self.pages or [[]]
+            rows = pages[page_no - 1] if 1 <= page_no <= len(pages) else []
+            total = (
+                sum(len(p) for p in pages) if self.total_override is None else self.total_override
+            )
+            data = {
+                "list": rows,
+                "pageNo": self.page_no_per_page.get(page_no, page_no),
+                "pageSize": self.page_size_per_page.get(page_no, int(body.get("pageSize", 100))),
+                "total": self.total_per_page.get(page_no, total),
+            }
+            if not self.omit_page_count and page_no not in self.omit_page_count_on:
+                if page_no in self.page_count_per_page:
+                    data["pageCount"] = self.page_count_per_page[page_no]
+                else:
+                    data["pageCount"] = (
+                        len(pages)
+                        if self.page_count_override == "auto"
+                        else self.page_count_override
+                    )
+            for field in self.omit_fields:
+                data.pop(field, None)
+        return httpx.Response(200, json={"success": True, "failCode": 0, "data": data})
+
+
+def make_client(
+    server: StationListServer,
+    max_pages: int = 50,
+    *,
+    station_list_max_calls: int = 1000,
+    clock: Callable[[], float] | None = None,
+) -> RealFusionSolarClient:
+    # A generous default budget keeps the contract tests about the contract;
+    # a caller exercising budget behaviour passes its own budget and clock.
+    policy = FusionSolarRatePolicy(
+        login_max_calls=100,
+        station_list_max_calls=station_list_max_calls,
+        station_list_window_seconds=86_400.0,
+        **({"clock": clock} if clock is not None else {}),
+    )
+    return RealFusionSolarClient(
+        base_url=BASE_URL,
+        username="nb-user",
+        system_code="nb-system-code",
+        policy=policy,
+        transport=httpx.MockTransport(server.handler),
+        max_station_list_pages=max_pages,
+    )
+
+
+async def test_request_sends_page_no_from_one_and_page_size_100():
+    server = StationListServer(pages=[[station(1)]])
+    client = make_client(server)
+    await client.list_stations()
+    assert server.requests[0] == {"pageNo": 1, "pageSize": 100}
+    await client.close()
+
+
+async def test_legacy_direct_list_variant():
+    server = StationListServer(pages=None, direct=[station(1), station(2)])
+    client = make_client(server)
+    result = await client.list_stations()
+    assert result.variant == "direct_list"
+    assert result.pages_retrieved == 1
+    assert [s["stationCode"] for s in result.stations] == ["NE=1", "NE=2"]
+    assert len(server.requests) == 1  # a direct list is complete: no second call
+    await client.close()
+
+
+async def test_zero_plants_direct_list():
+    server = StationListServer(pages=None, direct=[])
+    client = make_client(server)
+    result = await client.list_stations()
+    assert result.stations == [] and result.variant == "direct_list"
+    await client.close()
+
+
+async def test_zero_plants_paginated():
+    server = StationListServer(pages=[[]])
+    client = make_client(server)
+    result = await client.list_stations()
+    assert result.stations == [] and result.variant == "paginated"
+    await client.close()
+
+
+async def test_single_paginated_page():
+    server = StationListServer(pages=[[station(i) for i in range(5)]])
+    client = make_client(server)
+    result = await client.list_stations()
+    assert result.variant == "paginated" and result.pages_retrieved == 1
+    assert len(result.stations) == 5
+    await client.close()
+
+
+async def test_exactly_100_on_one_page():
+    server = StationListServer(pages=[[station(i) for i in range(100)]])
+    client = make_client(server)
+    result = await client.list_stations()
+    assert len(result.stations) == 100 and result.pages_retrieved == 1
+    await client.close()
+
+
+async def test_multiple_pages_are_all_retrieved():
+    server = StationListServer(
+        pages=[
+            [station(i) for i in range(100)],
+            [station(i) for i in range(100, 200)],
+            [station(i) for i in range(200, 250)],
+        ]
+    )
+    client = make_client(server)
+    result = await client.list_stations()
+    assert result.pages_retrieved == 3
+    assert len(result.stations) == 250
+    assert [b["pageNo"] for b in server.requests] == [1, 2, 3]
+    await client.close()
+
+
+async def test_conflicting_duplicates_are_rejected():
+    server = StationListServer(pages=[[station(1)], [station(1, stationName="Different Name")]])
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_repeated_identical_page_is_detected():
+    page = [station(1), station(2)]
+    server = StationListServer(pages=[page, [dict(r) for r in page], [station(3)]])
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+@pytest.mark.parametrize("field", ["pageCount", "pageNo", "pageSize", "total"])
+async def test_missing_pagination_metadata_is_rejected(field: str):
+    # A paginated envelope missing ANY contract field is never accepted as a
+    # complete inventory — a truncated list must not pass as the full fleet.
+    server = StationListServer(pages=[[station(1)]])
+    server.omit_fields = {field}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_missing_page_count_on_first_page_is_rejected():
+    server = StationListServer(pages=[[station(1)]])
+    server.omit_page_count = True
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+@pytest.mark.parametrize("echoed", [2, 0, "one", 1.5])
+async def test_echoed_page_no_must_match_the_requested_page(echoed: Any):
+    server = StationListServer(pages=[[station(1)], [station(2)]])
+    server.page_no_per_page = {1: echoed}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_page_size_change_mid_pagination_is_protocol_error():
+    server = StationListServer(pages=[[station(1)], [station(2)]])
+    server.page_size_per_page = {2: 50}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+@pytest.mark.parametrize("bad_size", [0, -5])
+async def test_impossible_page_size_is_protocol_error(bad_size: int):
+    server = StationListServer(pages=[[station(1)]])
+    server.page_size_per_page = {1: bad_size}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_page_with_more_rows_than_page_size_is_protocol_error():
+    server = StationListServer(pages=[[station(i) for i in range(5)]])
+    server.page_size_per_page = {1: 2}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_total_change_mid_pagination_is_protocol_error():
+    server = StationListServer(pages=[[station(1)], [station(2)]])
+    server.total_per_page = {2: 99}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+@pytest.mark.parametrize("claimed_total", [5, 1])
+async def test_final_station_count_must_match_total(claimed_total: int):
+    # Both directions are failures: fewer stations than promised (truncated)
+    # and more than promised (an inconsistent envelope).
+    server = StationListServer(pages=[[station(1)], [station(2)]])
+    server.total_override = claimed_total
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_deduplicated_inventory_counts_unique_stations_against_total():
+    # total counts stations, not rows: an identical duplicate across pages
+    # still leaves a complete, consistent inventory.
+    dup = station(1)
+    server = StationListServer(pages=[[dup, station(2)], [dict(dup), station(3)]])
+    server.total_override = 3
+    client = make_client(server)
+    result = await client.list_stations()
+    assert [s["stationCode"] for s in result.stations] == ["NE=1", "NE=2", "NE=3"]
+    assert result.duplicates_removed == 1
+    await client.close()
+
+
+@pytest.mark.parametrize("bad_count", [-1, 10_000, "many"])
+async def test_impossible_page_count_is_protocol_error(bad_count: Any):
+    server = StationListServer(pages=[[station(1)]])
+    server.page_count_override = bad_count
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_page_count_change_mid_pagination_is_protocol_error():
+    # First page promises 3 pages; the second claims 2 — accepting the new
+    # value would silently drop the final page of the inventory.
+    server = StationListServer(pages=[[station(1)], [station(2)], [station(3)]])
+    server.page_count_per_page = {2: 2}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_page_count_disappearing_mid_pagination_is_protocol_error():
+    server = StationListServer(pages=[[station(1)], [station(2)], [station(3)]])
+    server.omit_page_count_on = {2}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_empty_page_before_page_count_is_protocol_error():
+    server = StationListServer(pages=[[station(1)], []])
+    server.page_count_override = 3
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_finite_max_page_guard():
+    # Server claims a within-guard pageCount but keeps yielding fresh rows;
+    # client must stop at pageCount — and a huge claimed count trips the guard.
+    server = StationListServer(pages=[[station(i)] for i in range(4)])
+    client = make_client(server, max_pages=3)
+    server.page_count_override = 4  # > max_pages guard
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_malformed_rows_are_not_silently_skipped():
+    server = StationListServer(pages=None, direct=[station(1), {"stationName": "no code"}])
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_data_neither_list_nor_object_is_protocol_error():
+    server = StationListServer(pages=[[station(1)]])
+    server.data_override = "strange"
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_zero_page_count_with_stations_is_protocol_error():
+    # pageCount=0 + one row + total=1 is internally contradictory: the loop
+    # would exit immediately and the unique count would still match total.
+    server = StationListServer(pages=[[station(1)]])
+    server.page_count_override = 0
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_zero_page_count_is_accepted_only_for_an_empty_fleet():
+    server = StationListServer(pages=[[]])
+    server.page_count_override = 0
+    client = make_client(server)
+    result = await client.list_stations()
+    assert result.stations == [] and result.variant == "paginated"
+    await client.close()
+
+
+async def test_inventory_larger_than_the_guard_fails_on_the_first_page():
+    # Fail fast with an actionable message instead of burning the whole
+    # station-list budget and dying part-way through pagination.
+    server = StationListServer(pages=[[station(i)] for i in range(6)])
+    client = make_client(server, max_pages=4)
+    with pytest.raises(AdapterProtocolError) as excinfo:
+        await client.list_stations()
+    assert "FUSIONSOLAR_STATION_LIST_MAX_CALLS" in str(excinfo.value)
+    assert len(server.requests) == 1  # only page 1 was ever requested
+    await client.close()
+
+
+async def test_empty_terminal_page_in_a_non_empty_inventory_is_rejected():
+    """pageCount=2 / total=1 with an empty page 2 is malformed, not complete.
+
+    Accepting it would certify a contradictory envelope, waste a
+    station-list call, and inflate pages_retrieved — which stretches the
+    next inventory refresh from 6 h to 12 h on the 4/day default.
+    """
+    server = StationListServer(pages=[[station(1)], []])
+    server.page_count_override = 2
+    server.total_override = 1
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_empty_page_is_still_accepted_for_a_genuinely_empty_fleet():
+    # total=0 with a single empty page stays the legitimate empty-fleet case.
+    server = StationListServer(pages=[[]])
+    client = make_client(server)
+    result = await client.list_stations()
+    assert result.stations == [] and result.pages_retrieved == 1
+    await client.close()
+
+
+async def test_a_burst_the_budget_cannot_finish_stops_after_page_one():
+    # Page 1 is the first moment the burst size is known. Taking the free
+    # slots and being rejected on the last page spends budget on an
+    # inventory that is never retrieved AND leaves nothing for the retry, so
+    # a fleet that grew a page since the last refresh must defer instead.
+    server = StationListServer(
+        [[station(i) for i in range(100)] for _ in range(2)] + [[station(200)]]
+    )
+    policy = FusionSolarRatePolicy(
+        login_max_calls=100, station_list_max_calls=4, station_list_window_seconds=86_400.0
+    )
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username="nb-user",
+        system_code="nb-system-code",
+        policy=policy,
+        transport=httpx.MockTransport(server.handler),
+    )
+    # Two slots are already held by the previous refresh of a 2-page fleet.
+    await policy.acquire(Endpoint.STATION_LIST)
+    await policy.acquire(Endpoint.STATION_LIST)
+
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.list_stations()
+    assert len(server.requests) == 1  # page 1 only, not a partial burst
+    assert excinfo.value.retry_after_seconds  # a wait the scheduler can act on
+    await client.close()
+
+
+async def test_a_burst_that_fits_the_remaining_budget_still_runs():
+    # The guard must not defer a refresh the budget can actually carry.
+    server = StationListServer([[station(i) for i in range(100)], [station(100)]])
+    policy = FusionSolarRatePolicy(
+        login_max_calls=100, station_list_max_calls=4, station_list_window_seconds=86_400.0
+    )
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username="nb-user",
+        system_code="nb-system-code",
+        policy=policy,
+        transport=httpx.MockTransport(server.handler),
+    )
+    await policy.acquire(Endpoint.STATION_LIST)  # one slot gone, two pages need two
+    result = await client.list_stations()
+    assert result.pages_retrieved == 2
+    assert len(result.stations) == 101
+    await client.close()
+
+
+async def test_the_deferral_hint_covers_every_page_the_retry_needs():
+    # The retry restarts at page 1, so the hint must count EVERY page — page
+    # 1's own call included, since it keeps its slot until it expires. Asking
+    # only for the pages still missing hands back a delay that lets the retry
+    # spend the one slot that just freed and stop at the same place, forever:
+    # with calls at hours 0 and 1 and a 3-page attempt at hour 12, the old
+    # hint walked 24 -> 25 -> 36 -> 48 -> ... and never refreshed.
+    hour = 3600.0
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+    server = StationListServer(
+        [
+            [station(i) for i in range(100)],
+            [station(i) for i in range(100, 200)],
+            [station(200)],
+        ]
+    )
+    policy = FusionSolarRatePolicy(
+        login_max_calls=100,
+        station_list_max_calls=4,
+        station_list_window_seconds=24 * hour,
+        clock=clock,
+    )
+    client = RealFusionSolarClient(
+        base_url=BASE_URL,
+        username="nb-user",
+        system_code="nb-system-code",
+        policy=policy,
+        transport=httpx.MockTransport(server.handler),
+    )
+    await policy.acquire(Endpoint.STATION_LIST)  # an earlier call at hour 0
+    clock.now = hour
+    await policy.acquire(Endpoint.STATION_LIST)  # and another at hour 1
+
+    clock.now = 12 * hour
+    with pytest.raises(AdapterRateLimitError) as excinfo:
+        await client.list_stations()
+    # Hour 25, when the hour-1 call expires and three slots are free at once
+    # beside the page-1 call just made — not hour 24, which frees only two.
+    assert clock.now + excinfo.value.retry_after_seconds == 25 * hour
+
+    clock.now = 25 * hour
+    result = await client.list_stations()
+    assert result.pages_retrieved == 3
+    await client.close()
+
+
+@pytest.mark.parametrize("field", ["pageCount", "total", "pageNo", "pageSize"])
+async def test_textual_pagination_metadata_is_a_protocol_error(field: str):
+    # int("2") would let a malformed envelope through the strict contract
+    # _require_int promises — and a truncated inventory pass as a complete
+    # one, which is the whole point of validating pagination.
+    server = StationListServer([[station(1)]])
+    if field == "pageCount":
+        server.page_count_per_page = {1: "1"}
+    elif field == "total":
+        server.total_override = "1"
+    elif field == "pageNo":
+        server.page_no_per_page = {1: "1"}
+    else:
+        server.page_size_per_page = {1: "100"}
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_a_page_one_failure_keeps_the_last_known_page_count():
+    # Until page 1 answers, the last known size is the only estimate there
+    # is: resetting it would report one page for an inventory known to need
+    # four, and the caller would under-reserve the retry.
+    pages = [[station(i) for i in range(100)], [station(100)]]
+    server = StationListServer(pages)
+    client = make_client(server)
+    await client.list_stations()
+    assert client.last_advertised_pages == 2
+
+    server.data_override = "not-an-envelope"  # page 1 comes back malformed
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    assert client.last_advertised_pages == 2  # preserved, not reset to 1
+    await client.close()
+
+
+async def test_a_direct_list_reports_one_page_once_confirmed():
+    # The legacy variant IS one complete call — but only once the response
+    # has been classified, not assumed before it arrives.
+    server = StationListServer(pages=None, direct=[station(1)])
+    client = make_client(server)
+    await client.list_stations()
+    assert client.last_advertised_pages == 1
+    await client.close()
+
+
+async def test_only_page_one_updates_the_cached_page_count():
+    # A later page claiming a different count is rejected as inconsistent a
+    # moment later; it must not leave its claim behind as the estimate, or
+    # the caller reserves four pages for an inventory of two and turns an
+    # ordinary retry into a full-window wait.
+    server = StationListServer([[station(i) for i in range(100)], [station(100)]])
+    server.page_count_per_page = {2: 4}  # page 2 disagrees with page 1
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    assert client.last_advertised_pages == 2  # page 1 remains authoritative
+    await client.close()
+
+
+async def test_page_one_metadata_that_cannot_hold_its_total_is_rejected_on_page_one():
+    # pageCount x pageSize is the capacity page 1 advertises; a larger total
+    # means the loop would stop before the inventory ends. Left to the
+    # closing total check, that truncation is only noticed after page 1 has
+    # already recorded ONE page for an inventory that needs two — and the
+    # retry is then reserved for a single call and rejected on its last page,
+    # refresh after refresh. Page 1 has to reject itself before it is
+    # believed, and the previous estimate has to survive intact.
+    server = StationListServer([[station(i) for i in range(100)], [station(100)]])
+    client = make_client(server)
+    await client.list_stations()
+    assert client.last_advertised_pages == 2
+
+    server.page_count_per_page = {1: 1}  # one page ...
+    server.total_override = 200  # ... for two pages' worth of plants
+    with pytest.raises(AdapterProtocolError) as excinfo:
+        await client.list_stations()
+    assert "cannot hold it" in str(excinfo.value)
+    assert len(server.requests) == 3  # 2 for the good pass, then page 1 only
+    assert client.last_advertised_pages == 2  # NOT overwritten by the bad 1
+    await client.close()
+
+
+async def test_a_page_count_larger_than_the_total_needs_is_not_a_fault_on_page_one():
+    # Only the SHORT direction truncates. An over-count walks into the
+    # empty-page check on the page that does not exist, so rejecting it here
+    # too would turn the ceil() rounding of a shrinking fleet into a failed
+    # refresh.
+    server = StationListServer([[station(i) for i in range(100)], [station(100)]])
+    server.page_count_per_page = {1: 2, 2: 2}
+    client = make_client(server)
+    result = await client.list_stations()
+    assert len(result.stations) == 101
+    await client.close()
+
+
+async def test_the_page_estimate_survives_a_page_one_rejected_by_its_rows():
+    # Coherent envelope, broken ROW: the count is believable right up to the
+    # moment the row checks reject the page. Recording it before that let one
+    # malformed row shrink a two-page estimate to one, and `_record_failed_burst`
+    # then reserves a single slot for a refresh that needs two — rejected on
+    # its last page, every cycle. Page 1 has to validate END TO END first.
+    server = StationListServer([[station(i) for i in range(100)], [station(100)]])
+    client = make_client(server)
+    await client.list_stations()
+    assert client.last_advertised_pages == 2
+
+    server.pages = [[{"stationName": "a row with no stationCode"}]]
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    assert client.last_advertised_pages == 2  # NOT shrunk to the rejected 1
+    await client.close()
+
+
+async def test_a_page_repeated_non_adjacently_is_rejected():
+    # Pages A, B, A. Comparing only ADJACENT pages let this through: the
+    # third page's rows were merely dedup'd away, and because `total` happens
+    # to equal the unique count the closing check passed too — a malformed
+    # envelope certified as complete, with pages_retrieved inflated to 3,
+    # which stretches the next station-list refresh (12 h -> 24 h on the
+    # 4/day default).
+    page_a = [station(i) for i in range(100)]
+    page_b = [station(100)]
+    server = StationListServer([page_a, page_b, page_a])
+    server.total_override = 101  # the number of UNIQUE stations
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError, match="contributed none of its own"):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_a_page_repeated_in_a_different_row_ORDER_is_rejected():
+    # Signatures — even one per page, kept for the whole run — are
+    # order-sensitive: A, B, reversed(A) yields three distinct tuples, so the
+    # repeat was de-duplicated in silence and, with `total` equal to the
+    # unique count, certified complete with pages_retrieved inflated to 3.
+    # What a page CONTRIBUTED does not depend on how its rows are ordered.
+    page_a = [station(i) for i in range(100)]
+    server = StationListServer([page_a, [station(100)], list(reversed(page_a))])
+    server.total_override = 101
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError, match="contributed none of its own"):
+        await client.list_stations()
+    await client.close()
+
+
+async def test_distinct_pages_that_merely_look_alike_are_not_rejected():
+    # The check must key on the page's stations, not on its size: two pages
+    # of one station each are perfectly legal as long as the stations differ.
+    server = StationListServer([[station(1)], [station(2)], [station(3)]])
+    client = make_client(server)
+    result = await client.list_stations()
+    assert [s["stationCode"] for s in result.stations] == ["NE=1", "NE=2", "NE=3"]
+    await client.close()
+
+
+async def test_a_boolean_capacity_is_not_the_same_row_as_a_numeric_one():
+    # Python says True == 1, so plain dict equality read a row whose capacity
+    # is the boolean `true` as identical to one reporting 1 MW. Two rows that
+    # CONFLICT were then silently de-duplicated: the boolean copy could
+    # displace the valid capacity, which is counted invalid downstream and
+    # never written, leaving the stored capacity stale while the envelope
+    # passed as a clean inventory.
+    numeric = station(1, capacity=1)
+    boolean = station(1, capacity=True)
+    for pair in ([numeric, boolean], [boolean, numeric]):
+        server = StationListServer([list(pair)])
+        server.total_override = 1
+        client = make_client(server)
+        with pytest.raises(AdapterProtocolError, match="conflicting duplicate"):
+            await client.list_stations()
+        await client.close()
+
+
+async def test_a_genuinely_identical_duplicate_row_is_still_removed():
+    # The type-sensitive comparison must not turn ordinary de-duplication
+    # into a protocol error: byte-identical rows are still one station.
+    server = StationListServer([[station(1), station(1)]])
+    server.total_override = 1
+    client = make_client(server)
+    result = await client.list_stations()
+    assert [s["stationCode"] for s in result.stations] == ["NE=1"]
+    assert result.duplicates_removed == 1
+    await client.close()
+
+
+async def test_a_terminal_page_one_is_reconciled_before_its_count_is_believed():
+    # A one-page response can pass every envelope and row check and still
+    # fail the closing unique-count reconciliation. Recording its count
+    # first overwrote a four-page estimate with one, so the retry reserved a
+    # single call for a refresh needing four. For a TERMINAL page 1 the
+    # reconciliation is the last check available, so it runs before the
+    # estimate is replaced.
+    pages = [[station(n * 100 + i) for i in range(100)] for n in range(4)]
+    server = StationListServer(pages)
+    server.page_count_per_page = {2: 3}  # page 2 disagrees: fails after page 1
+    client = make_client(server)
+    with pytest.raises(AdapterProtocolError):
+        await client.list_stations()
+    assert client.last_advertised_pages == 4
+
+    server.pages = [[station(1)]]
+    server.page_count_per_page = {1: 1}
+    server.total_override = 0  # contradicted by the one row it returns
+    with pytest.raises(AdapterProtocolError, match="but the envelope reported total=0"):
+        await client.list_stations()
+    assert client.last_advertised_pages == 4  # NOT shrunk to the rejected 1
+    await client.close()

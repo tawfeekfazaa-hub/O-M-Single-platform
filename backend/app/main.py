@@ -35,11 +35,33 @@ def _build_repository(settings: Settings) -> Repository:
     return InMemoryRepository()
 
 
+class RealIngestionBlockedError(RuntimeError):
+    """Raised when real scheduled ingestion is requested before it is allowed."""
+
+
+def enforce_pre_quarantine_gate(settings: Settings) -> None:
+    """Refuse real scheduled ingestion until Raw/Quarantine storage exists.
+
+    PR-2 will add Raw/Quarantine tables; until then no live Huawei data may
+    be ingested on a schedule (README security rules). Mock mode and a real
+    configuration WITHOUT the scheduler remain allowed.
+    """
+    if settings.scheduler_enabled and settings.fusionsolar_mode == "real":
+        raise RealIngestionBlockedError(
+            "Real scheduled ingestion is blocked until Raw/Quarantine storage "
+            "(PR-2) is implemented. Set FUSIONSOLAR_MODE=mock or "
+            "SCHEDULER_ENABLED=false."
+        )
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+    enforce_pre_quarantine_gate(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Defense in depth: the gate also guards direct lifespan execution.
+        enforce_pre_quarantine_gate(settings)
         repository = _build_repository(settings)
         app.state.settings = settings
         app.state.repository = repository
@@ -47,10 +69,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         adapter = None
         if settings.scheduler_enabled:
             adapter = build_fusionsolar_adapter(settings)
+            min_interval = 0.0
+            if settings.fusionsolar_mode == "real":  # pragma: no cover - gated
+                min_interval = (
+                    settings.fusionsolar_kpi_window_seconds
+                    + settings.fusionsolar_kpi_margin_seconds
+                )
             scheduler = IngestionScheduler(
                 adapter,
                 repository,
                 interval_seconds=settings.scheduler_interval_seconds,
+                min_interval_seconds=min_interval,
+                inventory_refresh_seconds=settings.fusionsolar_inventory_refresh_seconds,
+                # Lets the scheduler stretch the refresh spacing when a
+                # paginated inventory consumes several station-list calls.
+                station_list_max_calls=settings.fusionsolar_station_list_max_calls,
+                station_list_window_seconds=settings.fusionsolar_station_list_window_seconds,
             )
             app.state.scheduler = scheduler
             scheduler.start()

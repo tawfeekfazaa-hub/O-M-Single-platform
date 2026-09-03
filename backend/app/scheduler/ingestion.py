@@ -1,10 +1,26 @@
 """Central ingestion scheduler.
 
 The ONLY component allowed to call vendor adapters (CLAUDE.md rule 2).
-One periodic cycle: list plants -> upsert -> fetch KPIs -> store. On
-rate-limit or transient vendor errors it backs off exponentially with
-jitter instead of hammering the API. Clock/sleep/jitter are injectable so
-tests run instantly.
+
+Two independent cadences (docs/FUSIONSOLAR-CONTRACT.md):
+- station INVENTORY refresh — conservative (default 6 h): the vendor's
+  station-list budget is tiny, so it must NOT be called on every cycle.
+  A paginated inventory consumes one station-list call PER PAGE, so when
+  the daily budget is known the effective spacing between refreshes is
+  stretched to pages x window / budget (a 6 h cadence is only sustainable
+  for a one-page inventory on the 4/day safety default). A rate-limited
+  refresh defers itself and never aborts KPI polling for the cycle;
+- real-time KPI polling — every cycle, reading the plant list from the
+  repository cache and fetching KPIs in sequential batches. Only the
+  stations of the last SUCCESSFUL inventory are polled; before the first
+  successful refresh of a process the persisted plants are polled
+  provisionally (flagged on the cycle) so a restart never blacks out
+  monitoring.
+
+On rate-limit or transient vendor errors the scheduler backs off
+exponentially with jitter instead of hammering the API. Clock/sleep/
+jitter are injectable so tests run instantly. Cycle diagnostics carry
+counts only — never plant identifiers, names, or KPI values.
 """
 
 from __future__ import annotations
@@ -12,10 +28,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
+from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from app.adapters.base import AdapterError, AdapterRateLimitError, VendorAdapter
+from app.adapters.base import (
+    AdapterError,
+    AdapterRateLimitError,
+    AdapterTransientError,
+    VendorAdapter,
+)
 from app.repositories.base import Repository
 
 logger = logging.getLogger(__name__)
@@ -23,19 +46,79 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class CycleResult:
+    """Counts-only outcome of one scheduler cycle."""
+
+    inventory_refreshed: bool = False
+    inventory_pages: int = 0
+    # These two describe the CURRENT inventory, not just this cycle's
+    # attempt: they stay set for the whole deferral window, because a cycle
+    # that skipped the refresh is running on exactly the same stale list as
+    # the cycle whose refresh failed.
+    inventory_rate_limited: bool = False
+    # True when KPI polling ran against the repository WITHOUT a confirmed
+    # inventory from this process (restart before the first successful
+    # station-list refresh). Such a cycle may still poll stations the vendor
+    # has retired, so its "missing" count is not necessarily a data problem.
+    inventory_provisional: bool = False
+    # Sanitized reason the last inventory refresh failed (protocol/contract
+    # or vendor error). The cycle is NOT a complete success while set, but
+    # KPI polling still runs and the refresh is deferred, never hammered.
+    inventory_error: str | None = None
     plants_upserted: int = 0
+    # Stations whose capacity was present but unreadable. Their stored
+    # capacity is KEPT (a failed validation never replaces good data), so
+    # this is the only trace that the vendor sent something unusable.
+    inventory_invalid_capacity: int = 0
+    requested_plants: int = 0
+    readings_returned: int = 0
     readings_written: int = 0
-    error: str | None = None
+    readings_missing: int = 0
+    readings_duplicate: int = 0
+    readings_unexpected: int = 0
+    invalid_values: int = 0
+    batches: int = 0
+    calls_consumed: int = 0
     rate_limited: bool = False
     retry_after_seconds: float | None = None
+    transient: bool = False
+    error: str | None = None
+
+    @property
+    def partial(self) -> bool:
+        """True when the vendor answered but the data set was not whole."""
+        return (
+            self.readings_missing > 0
+            or self.readings_duplicate > 0
+            or self.readings_unexpected > 0
+            or self.invalid_values > 0
+            or self.inventory_invalid_capacity > 0
+        )
+
+    @property
+    def inventory_stale(self) -> bool:
+        """The inventory could not be refreshed this cycle (any reason).
+
+        A rate-limited refresh is just as stale as a failed one — the
+        difference is only whose limit stopped it — so both disqualify a
+        complete success and both are counted in the incomplete statistic.
+        """
+        return self.inventory_rate_limited or self.inventory_error is not None
+
+    @property
+    def complete_success(self) -> bool:
+        """A cycle counts as fully successful ONLY with no error, a current
+        inventory, and no partial/malformed data — a partial response or a
+        stale inventory is never reported as a complete ingestion."""
+        return self.error is None and not self.inventory_stale and not self.partial
 
 
 @dataclass(slots=True)
 class SchedulerStats:
     cycles_total: int = 0
     cycles_failed: int = 0
+    cycles_partial: int = 0
     consecutive_failures: int = 0
-    last_result: CycleResult | None = None
+    last_result: CycleResult | None = field(default=None)
 
 
 class IngestionScheduler:
@@ -45,40 +128,365 @@ class IngestionScheduler:
         repository: Repository,
         *,
         interval_seconds: float = 300.0,
+        min_interval_seconds: float = 0.0,
+        inventory_refresh_seconds: float = 21_600.0,
+        station_list_max_calls: int | None = None,
+        station_list_window_seconds: float | None = None,
         backoff_base_seconds: float = 60.0,
         backoff_max_seconds: float = 1800.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter: Callable[[], float] = random.random,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._adapter = adapter
         self._repository = repository
-        self._interval = interval_seconds
+        # min_interval lets real-mode wiring enforce the KPI window+margin.
+        # It is a floor on EVERY delay, not just the success interval: after
+        # a failed cycle a shorter backoff would just hit the client-side
+        # KPI limiter again and manufacture another failure.
+        self._min_interval = min_interval_seconds
+        self._interval = max(interval_seconds, min_interval_seconds)
+        self._inventory_refresh = inventory_refresh_seconds
+        # Station-list budget (when wired) stretches the effective refresh
+        # spacing for paginated inventories; None -> no derived spacing.
+        self._station_list_max_calls = station_list_max_calls
+        self._station_list_window = station_list_window_seconds
+        self._inventory_min_spacing = 0.0
+        # (time, budget slots) of recent successful refreshes, pruned to the
+        # station-list window: what the vendor's rolling limiter still holds
+        # against us when the next refresh comes due.
+        self._inventory_bursts: deque[tuple[float, int]] = deque()
+        self._inventory_not_before: float | None = None
         self._backoff_base = backoff_base_seconds
         self._backoff_max = backoff_max_seconds
         self._sleep = sleep
         self._jitter = jitter
+        self._clock = clock
+        self._last_inventory_at: float | None = None
+        # vendor_plant_ids of the last SUCCESSFUL inventory refresh. Plants
+        # the vendor has dropped stay in the repository (no delete in the
+        # Phase-1 schema), so polling the repository blindly would request
+        # KPIs for retired stations forever — every cycle partial, and KPI
+        # capacity wasted on rows the vendor will never answer for.
+        self._current_inventory: set[str] | None = None
+        # Why the inventory is stale, carried across the deferral window and
+        # cleared only by a successful refresh.
+        self._stale_rate_limited = False
+        self._stale_error: str | None = None
         self.stats = SchedulerStats()
         self._stopping = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
+    @property
+    def interval_seconds(self) -> float:
+        return self._interval
+
+    def _inventory_due(self) -> bool:
+        now = self._clock()
+        if self._inventory_not_before is not None and now < self._inventory_not_before:
+            return False
+        if self._last_inventory_at is None:
+            return True
+        spacing = max(self._inventory_refresh, self._inventory_min_spacing)
+        return (now - self._last_inventory_at) >= spacing
+
+    async def _refresh_inventory(self, result: CycleResult) -> None:
+        plants = await self._adapter.list_plants()
+        await self._repository.upsert_plants(plants)
+        self._last_inventory_at = self._clock()
+        self._inventory_not_before = None
+        self._stale_rate_limited = False
+        self._stale_error = None
+        result.inventory_refreshed = True
+        result.plants_upserted = len(plants)
+        self._current_inventory = {p.vendor_plant_id for p in plants}
+        slots = 1
+        diag = getattr(self._adapter, "last_inventory_diagnostics", None)
+        if diag is not None:
+            result.inventory_pages = diag.pages_retrieved
+            result.inventory_invalid_capacity = getattr(diag, "invalid_capacity", 0)
+            result.calls_consumed += diag.calls_consumed
+            # Budget slots, and EVERY request charges one — the retry after a
+            # failCode 305 included. Pacing from the logical page count
+            # undercounts such a refresh: a 2-page inventory that retried
+            # page 1 holds three slots, but a page-derived 12 h spacing
+            # leaves only one free when the next refresh starts, so it spends
+            # page 1, fails its remaining-page pre-flight, and leaves the
+            # inventory stale. The pages floor keeps the estimate honest if a
+            # counter ever reads low.
+            slots = max(diag.calls_consumed, diag.pages_retrieved, 1)
+        if self._station_list_max_calls and self._station_list_window:
+            self._record_inventory_burst(self._last_inventory_at, slots)
+            # Pacing keeps the budget spread over the window; availability
+            # keeps THIS burst from colliding with the calls still retained
+            # from earlier, differently sized ones. Neither implies the other.
+            self._inventory_min_spacing = max(
+                self._derive_inventory_spacing(slots),
+                self._earliest_burst_gap(self._last_inventory_at, slots),
+            )
+
+    def _failed_deferral(self, deferral: float, result: CycleResult) -> float:
+        """Extend a failed refresh's deferral to cover the calls it spent.
+
+        A refresh that dies on page 3 has already paid for three slots, and
+        the rolling limiter keeps holding them. Retrying on the plain
+        cadence would send the next attempt into a budget that cannot carry
+        it: it would spend another call, be rejected, and leave the
+        inventory stale for longer than simply waiting. The failed burst is
+        recorded like a successful one and the wait covers it.
+        """
+        needed = self._record_failed_burst(result)
+        if needed is None:
+            return deferral
+        return max(deferral, self._earliest_burst_gap(self._clock(), needed))
+
+    def _record_failed_burst(self, result: CycleResult | None = None) -> int | None:
+        """Book a failed refresh: what it spent, and what a retry will need.
+
+        The calls it spent go on the cycle result (they came out of the same
+        Huawei budget as a successful refresh's). The RESERVATION is sized
+        from the pages the vendor advertised, because the retry restarts at
+        page 1 and needs them all: sizing it from the two calls a 3-page
+        refresh managed before failing would accept a 6 h deferral, spend
+        page 1 again, and discover only then that the rest cannot fit.
+        """
+        diag = getattr(self._adapter, "last_inventory_diagnostics", None)
+        spent = max(getattr(diag, "calls_consumed", 0) or 0, 1)
+        if result is not None:
+            result.calls_consumed += getattr(diag, "calls_consumed", 0) or 0
+        if not (self._station_list_max_calls and self._station_list_window):
+            return None
+        needed = max(getattr(diag, "pages_advertised", 0) or 0, spent)
+        self._record_inventory_burst(self._clock(), spent)
+        return needed
+
+    def _record_inventory_burst(self, at: float, slots: int) -> None:
+        """Remember one refresh's budget slots; forget what has aged out."""
+        window = self._station_list_window or 0.0
+        self._inventory_bursts.append((at, slots))
+        cutoff = at - window
+        while self._inventory_bursts and self._inventory_bursts[0][0] <= cutoff:
+            self._inventory_bursts.popleft()
+
+    def _earliest_burst_gap(self, now: float, slots: int) -> float:
+        """Wait until ``slots`` are actually free in the rolling window.
+
+        The pacing formula assumes a STEADY sequence of equally sized
+        bursts. When an inventory grows a page, the calls from the smaller
+        refreshes are still occupying slots: on the 4/day default, a 1-page
+        refresh at hour 0 and a 2-page one at hour 6 leave only one free
+        slot at hour 18, so the paced 2-page burst gets page 1 and is
+        rate-limited on page 2 — the refresh fails and defers a full window.
+        Candidate times are the moments the retained calls expire; the last
+        of them empties the window entirely, so this always terminates.
+        """
+        window = self._station_list_window or 0.0
+        budget = self._station_list_max_calls or 0
+        for candidate in [now, *(at + window for at, _ in self._inventory_bursts)]:
+            cutoff = candidate - window
+            occupied = sum(count for at, count in self._inventory_bursts if at > cutoff)
+            if occupied + slots <= budget:
+                return max(candidate - now, 0.0)
+        # A burst larger than the whole budget: the page guard rejects that
+        # configuration, but never pace it faster than a full window here.
+        return window
+
+    def _derive_inventory_spacing(self, slots: int) -> float:
+        """Spacing that lets EVERY refresh spend all its pages at once.
+
+        The budget is a rolling window, not an average allowance: the
+        previous refreshes' calls keep occupying slots until they age out.
+        What fits is therefore a whole number of complete bursts —
+        ``floor(budget / slots)`` of them per window — so the spacing is
+        ``window / that count``. An average-rate formula
+        (``window * slots / budget``) looks safe for two bursts but drifts:
+        with a 5-call window and 2-page refreshes it would schedule bursts
+        at 0 h, 9.6 h and 19.2 h, needing six slots inside one window.
+        """
+        window = self._station_list_window or 0.0
+        budget = self._station_list_max_calls or 1
+        bursts_per_window = budget // max(slots, 1)
+        if bursts_per_window < 1:
+            # One refresh does not even fit the budget: the guard in the
+            # adapter factory rejects this, but never schedule faster than
+            # a full window here either.
+            return window
+        try:
+            return window / bursts_per_window
+        except OverflowError:
+            # A budget too large to convert to a float (a huge-integer env
+            # var; the pre-flight check reports it as a config error) paces
+            # nothing. Derive no spacing rather than killing the loop — the
+            # configured refresh cadence still applies.
+            return 0.0
+
+    def _login_count(self) -> int:
+        """Logins the client has sent so far; 0 when it does not count."""
+        counts = getattr(getattr(self._adapter, "_client", None), "call_counts", None)
+        return counts().login if callable(counts) else 0
+
+    def _copy_kpi_diagnostics(self, result: CycleResult) -> None:
+        """Mirror the adapter's KPI counts onto the cycle result."""
+        diag = getattr(self._adapter, "last_kpi_diagnostics", None)
+        if diag is None:
+            return
+        result.readings_returned = diag.returned
+        result.readings_missing = diag.missing
+        result.readings_duplicate = diag.duplicates
+        result.readings_unexpected = diag.unexpected
+        result.invalid_values = diag.invalid_values
+        result.batches = diag.batches
+        result.calls_consumed += diag.calls_consumed
+
     async def run_cycle(self) -> CycleResult:
         """One ingestion pass. Never raises — errors land in the result."""
         result = CycleResult()
+        logins_before = self._login_count()
         try:
             await self._adapter.authenticate()
-            plants = await self._adapter.list_plants()
-            await self._repository.upsert_plants(plants)
-            result.plants_upserted = len(plants)
-            readings = await self._adapter.fetch_plant_kpis([p.vendor_plant_id for p in plants])
-            result.readings_written = await self._repository.record_kpis(readings)
+
+            # Inventory on its own conservative cadence — never every cycle.
+            if self._inventory_due():
+                try:
+                    await self._refresh_inventory(result)
+                except AdapterRateLimitError as exc:
+                    # The station-list budget is independent of the KPI
+                    # budget: a rate-limited refresh defers itself and must
+                    # never abort KPI polling for this cycle.
+                    # One reason at a time: the refresh that just failed is
+                    # the one being reported, not whatever stopped an earlier
+                    # attempt before its deferral expired.
+                    self._stale_rate_limited = True
+                    self._stale_error = None
+                    if getattr(exc, "blocks_authentication", False):
+                        # Unless what was throttled is the session itself —
+                        # a re-login after failCode 305 can come back 429.
+                        # KPI polling would then re-authenticate and put
+                        # another request on the endpoint the vendor just
+                        # throttled. The whole cycle backs off instead, on
+                        # the vendor's own delay.
+                        self._inventory_not_before = self._clock() + self._failed_deferral(
+                            self._inventory_refresh, result
+                        )
+                        raise
+                    # A plain limiter hint frees ONE slot, which is not
+                    # enough for a paginated refresh: retrying then would
+                    # spend the same partial burst again and fail on the
+                    # same page, forever. Wait a full window so every call
+                    # of the failed burst has expired first. The exception
+                    # is a hint the adapter measured for the WHOLE next
+                    # attempt (its pre-flight capacity check): widening
+                    # that one only adds staleness the budget did not ask
+                    # for.
+                    deferral = exc.retry_after_seconds or self._inventory_refresh
+                    if self._station_list_window and not getattr(
+                        exc, "retry_after_covers_whole_attempt", False
+                    ):
+                        deferral = max(deferral, self._station_list_window)
+                    self._inventory_not_before = self._clock() + self._failed_deferral(
+                        deferral, result
+                    )
+                    logger.warning(
+                        "inventory refresh rate-limited, deferred; KPI polling continues"
+                    )
+                except AdapterError as exc:
+                    # A contract/guard failure (e.g. an inventory needing more
+                    # pages than the budget allows) will NOT fix itself on the
+                    # next cycle: retrying immediately would spend page 1 of
+                    # the budget every cycle until the window is exhausted,
+                    # and aborting the cycle would stop KPI monitoring too.
+                    # Defer the refresh instead and keep polling.
+                    self._stale_error = str(exc)
+                    self._stale_rate_limited = False
+                    # A server that named its own delay (Retry-After on a 503
+                    # from /getStationList) is asking for more than our
+                    # cadence would give it. This branch SWALLOWS the error so
+                    # KPI polling can continue, so the outer transient handler
+                    # never sees it — the lower bound has to be applied here
+                    # or a day-long request is answered after six hours.
+                    requested = getattr(exc, "retry_after_seconds", None) or 0.0
+                    if getattr(exc, "blocks_authentication", False):
+                        # Except when the failure was the session itself: a
+                        # re-login after failCode 305 can time out or answer
+                        # 5xx just as it can be throttled. Polling on would
+                        # log in again into the same outage.
+                        self._inventory_not_before = self._clock() + self._failed_deferral(
+                            max(self._inventory_refresh, requested), result
+                        )
+                        raise
+                    self._inventory_not_before = self._clock() + self._failed_deferral(
+                        max(self._inventory_refresh, self._inventory_min_spacing, requested),
+                        result,
+                    )
+                    logger.warning(
+                        "inventory refresh failed (%s), deferred; KPI polling continues",
+                        type(exc).__name__,
+                    )
+
+            # Report the CURRENT staleness, not just this cycle's attempt: a
+            # cycle suppressed by the deferral runs on the same old list.
+            result.inventory_rate_limited = self._stale_rate_limited
+            result.inventory_error = self._stale_error
+
+            # KPI polling uses the repository inventory, not a vendor call.
+            plants = [
+                p for p in await self._repository.list_plants() if p.vendor == self._adapter.vendor
+            ]
+            codes = [p.vendor_plant_id for p in plants]
+            if self._current_inventory is not None:
+                # Restrict to the last inventory the vendor actually served.
+                codes = [c for c in codes if c in self._current_inventory]
+            else:
+                # No confirmed inventory yet (fresh process, and the first
+                # refresh has not succeeded — e.g. it was rate-limited).
+                # Poll the persisted plants anyway: for an O&M platform a
+                # monitoring blackout is far worse than briefly polling a
+                # station the vendor has retired, and the set self-corrects
+                # at the first successful refresh. Flagged so the cycle's
+                # "missing" count is not mistaken for a data fault.
+                # PR-2 persists the inventory snapshot and removes this gap.
+                result.inventory_provisional = True
+                if codes:
+                    logger.warning(
+                        "KPI polling on a PROVISIONAL inventory (no confirmed "
+                        "station list yet): plants=%d",
+                        len(codes),
+                    )
+            result.requested_plants = len(codes)
+            if codes:
+                try:
+                    readings = await self._adapter.fetch_plant_kpis(codes)
+                except AdapterError:
+                    # The batches already sent SPENT their calls, and the
+                    # adapter publishes what the failed attempt did. Copy it
+                    # before the error propagates, or the cycle would report
+                    # zero KPI calls and hide budget it actually consumed.
+                    self._copy_kpi_diagnostics(result)
+                    raise
+                result.readings_returned = len(readings)
+                result.readings_written = await self._repository.record_kpis(readings)
+                self._copy_kpi_diagnostics(result)
         except AdapterRateLimitError as exc:
             result.rate_limited = True
             result.error = str(exc)
             result.retry_after_seconds = exc.retry_after_seconds
             logger.warning("ingestion rate-limited: %s", exc)
+        except AdapterTransientError as exc:
+            result.transient = True
+            result.error = str(exc)
+            # A server that named its own delay (Retry-After on a 503) is
+            # asking for more than our backoff curve would give it.
+            # next_delay() takes the max, so this can only lengthen the wait.
+            result.retry_after_seconds = exc.retry_after_seconds
+            logger.warning("ingestion transient failure: %s", exc)
         except AdapterError as exc:
             result.error = str(exc)
             logger.error("ingestion cycle failed: %s", exc)
+
+        # Logins are a separate, scarcer Huawei budget, and both the
+        # authenticate step and any re-login inside an operation spend one.
+        # Counted on every path, since a failed cycle spends them too.
+        result.calls_consumed += max(self._login_count() - logins_before, 0)
 
         self.stats.cycles_total += 1
         if result.error is None:
@@ -86,20 +494,41 @@ class IngestionScheduler:
         else:
             self.stats.cycles_failed += 1
             self.stats.consecutive_failures += 1
+        if result.error is None and (result.partial or result.inventory_stale):
+            self.stats.cycles_partial += 1
+            # Counts only — no identifiers or values in this log line.
+            logger.warning(
+                "ingestion cycle incomplete: requested=%d returned=%d missing=%d "
+                "duplicate=%d unexpected=%d invalid=%d invalid_capacity=%d",
+                result.requested_plants,
+                result.readings_returned,
+                result.readings_missing,
+                result.readings_duplicate,
+                result.readings_unexpected,
+                result.invalid_values,
+                result.inventory_invalid_capacity,
+            )
         self.stats.last_result = result
         return result
 
     def next_delay(self, result: CycleResult) -> float:
-        """Normal interval on success; exponential backoff + jitter on failure."""
+        """Normal interval on success; exponential backoff + jitter on failure.
+
+        Jitter is applied to the BACKOFF only. A vendor Retry-After (or a
+        budget hint) is a hard lower bound: scaling it by 0.75 would send the
+        next request before the server's requested delay and earn another
+        429. The same holds for the configured minimum interval.
+        """
         if result.error is None:
             return self._interval
         exponent = min(self.stats.consecutive_failures - 1, 5)
         delay = min(self._backoff_max, self._backoff_base * (2**exponent))
-        # The vendor's retry-after hint is a lower bound on the wait.
+        # 0.75x..1.25x jitter so multiple deployments don't sync up.
+        delay *= 0.75 + 0.5 * self._jitter()
+        # Hard lower bounds, applied AFTER jitter so they are never undercut.
         if result.retry_after_seconds is not None:
             delay = max(delay, result.retry_after_seconds)
-        # 0.75x..1.25x jitter so multiple deployments don't sync up.
-        return delay * (0.75 + 0.5 * self._jitter())
+        return max(delay, self._min_interval)
 
     async def run_forever(self) -> None:
         logger.info("ingestion scheduler started (interval=%ss)", self._interval)

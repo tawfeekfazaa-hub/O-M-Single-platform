@@ -19,7 +19,9 @@ async def client():
     app = create_app(settings)
     async with app.router.lifespan_context(app):
         # Seed through the real ingestion path (one scheduler cycle).
-        adapter = FusionSolarAdapter(MockFusionSolarClient(now=lambda: FIXED_NOON_UTC))
+        adapter = FusionSolarAdapter(
+            MockFusionSolarClient(now=lambda: FIXED_NOON_UTC), allow_synthetic_fields=True
+        )
         result = await IngestionScheduler(adapter, app.state.repository).run_cycle()
         assert result.error is None
         transport = httpx.ASGITransport(app=app)
