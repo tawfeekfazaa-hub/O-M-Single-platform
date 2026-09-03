@@ -165,8 +165,12 @@ def _statements(sql: str) -> list[list[str]]:
     while i < n:
         ch = sql[i]
         if sql.startswith("--", i):
-            end = sql.find("\n", i)
-            i = n if end == -1 else end
+            # PostgreSQL ends a line comment at CR as well as LF, and a bare CR
+            # survives _normalize (which only rewrites CRLF). Measured: with
+            # `-- note<CR>CREATE TABLE ...`, the server ran the statement after
+            # the comment. Looking only for LF would read it as commented out.
+            breaks = [p for p in (sql.find("\n", i), sql.find("\r", i)) if p != -1]
+            i = min(breaks) if breaks else n
         elif sql.startswith("/*", i):
             depth, i = 1, i + 2
             while i < n and depth:  # PostgreSQL block comments nest
@@ -210,6 +214,23 @@ def _statements(sql: str) -> list[list[str]]:
     return statements
 
 
+def _defines_a_routine(words: list[str]) -> bool:
+    """Whether ``words`` begin a ``CREATE [OR REPLACE] FUNCTION|PROCEDURE``.
+
+    A ``BEGIN ATOMIC`` body can only belong to one of those, so nothing else
+    can open one — and the two words land side by side in ordinary SQL often
+    enough to matter: ``CREATE TABLE begin (atomic int)`` is a table with a
+    column, ``SELECT * FROM begin atomic`` a table with an alias. Both used to
+    open a phantom body and spend the exemption on a real ``END``.
+    """
+    if words[:1] != ["CREATE"]:
+        return False
+    rest = words[1:]
+    if rest[:2] == ["OR", "REPLACE"]:
+        rest = rest[2:]
+    return rest[:1] in (["FUNCTION"], ["PROCEDURE"])
+
+
 def _transaction_control(sql: str) -> list[str]:
     """Transaction-control statements found in ``sql``, in order of appearance.
 
@@ -237,10 +258,7 @@ def _transaction_control(sql: str) -> list[str]:
         elif (first, second) in _TX_CONTROL_PAIRS:
             found.append(f"{first} {second}")
 
-        if first == "CREATE":
-            # A BEGIN ATOMIC body can only belong to CREATE [OR REPLACE]
-            # FUNCTION or PROCEDURE. Requiring that context stops the words
-            # being read as an opener where they are a table and its alias.
+        if _defines_a_routine(words):
             open_bodies += sum(
                 a == "BEGIN" and b == "ATOMIC" for a, b in zip(words, words[1:], strict=False)
             )

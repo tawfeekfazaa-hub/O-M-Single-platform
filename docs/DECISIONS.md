@@ -76,6 +76,14 @@ that decides the next schema's shape.
    impossible instead of excluding its members one at a time. Patching the
    fourth corner would have invited a fifth.
 
+   The rule the tokenizer follows is "read it the way the server does", and two
+   later findings came from places it still did not: a `BEGIN ATOMIC` body
+   belongs only to `CREATE [OR REPLACE] FUNCTION|PROCEDURE`, so nothing else
+   may open one (`CREATE TABLE begin (atomic int)` is a table with a column,
+   `SELECT * FROM begin atomic` a table with an alias); and PostgreSQL ends a
+   `--` comment at a bare carriage return as well as a newline, which a CRLF
+   normalizer leaves behind.
+
    Recorded from the same rounds, as measured false negatives rather than
    only fixed: `$` is legal inside an unquoted identifier, so
    reading the `$$` of `foo$$` as a dollar quote blanked the file through to

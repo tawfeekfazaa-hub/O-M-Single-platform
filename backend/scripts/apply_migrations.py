@@ -57,16 +57,20 @@ def _parse_args() -> argparse.Namespace:
 
 async def main() -> int:
     args = _parse_args()
-    settings = get_settings()
-    if not settings.database_url:
-        print("DATABASE_URL is not set — nothing to migrate.", file=sys.stderr)
-        return 1
-
     engine = None
     try:
-        # Inside the handler: a malformed URL or an unavailable dialect makes
-        # create_async_engine() raise synchronously, and a configuration mistake
-        # is exactly the failure an operator should see as a refusal.
+        # Settings and engine are both built inside the handler. get_settings()
+        # validates the WHOLE application config, so an unrelated invalid value
+        # — a stale variable, a bad FUSIONSOLAR_MODE — raises a Pydantic error
+        # before a migration run that only needs DATABASE_URL has begun; and a
+        # malformed URL or an unavailable dialect makes create_async_engine()
+        # raise synchronously. Either reaches the operator as a traceback unless
+        # it is caught here.
+        settings = get_settings()
+        if not settings.database_url:
+            print("DATABASE_URL is not set — nothing to migrate.", file=sys.stderr)
+            return 1
+
         engine = create_async_engine(settings.database_url)
         if args.status:
             drifted = 0

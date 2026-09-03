@@ -62,6 +62,12 @@ def write(tmp_path: Path, sql: str, *, down: str | None = None) -> Path:
         # `begin` is an unreserved word, so this is a table named `begin`
         # aliased `atomic` — not a function body, so the END is a real commit.
         "SELECT * FROM begin atomic; END;",
+        # Same two words inside a CREATE that defines no routine: a table named
+        # `begin` with a column named `atomic`.
+        "CREATE TABLE begin (atomic int); END;",
+        # PostgreSQL ends a line comment at a bare CR as well as a LF, so this
+        # COMMIT is not commented out.
+        "CREATE TABLE t (id int); -- note\rCOMMIT;",
         # A non-ASCII character is an identifier character to PostgreSQL, so
         # these dollars belong to the table names, not to a quote.
         "CREATE TABLE aq\u0301$$ (id int); COMMIT; CREATE TABLE bq\u0301$$ (id int);",
@@ -129,6 +135,16 @@ def test_the_refusal_names_what_it_found(tmp_path: Path):
             # closes one reaches the scanner as a statement of its own.
             "sql-standard function body",
             "CREATE FUNCTION f() RETURNS INT LANGUAGE SQL\nBEGIN ATOMIC\n  SELECT 1;\nEND;",
+        ),
+        (
+            "CREATE OR REPLACE of a sql-standard body",
+            "CREATE OR REPLACE FUNCTION f() RETURNS INT LANGUAGE SQL\n"
+            "BEGIN ATOMIC\n  SELECT 1;\nEND;",
+        ),
+        (
+            # The CR rule must not swallow the rest of the file either.
+            "line comment ended by a bare CR",
+            "-- a note\rCREATE TABLE t (id int);",
         ),
         (
             "sql-standard body containing CASE ... END",
@@ -239,3 +255,26 @@ def test_words_inside_quotes_and_comments_are_not_tokens(tmp_path: Path):
         ["SELECT"],
         ["SELECT"],
     ]
+
+
+def test_only_a_routine_definition_opens_a_body(tmp_path: Path):
+    """The exemption belongs to CREATE FUNCTION/PROCEDURE, not to CREATE.
+
+    `BEGIN` and `ATOMIC` land side by side in ordinary SQL — a table and its
+    alias, a table and its column — and each of those used to spend the
+    exemption on a real transaction-ending END.
+    """
+    from app.db.migrations import _defines_a_routine
+
+    assert _defines_a_routine(["CREATE", "FUNCTION", "F"])
+    assert _defines_a_routine(["CREATE", "OR", "REPLACE", "PROCEDURE", "P"])
+    assert not _defines_a_routine(["CREATE", "TABLE", "BEGIN"])
+    assert not _defines_a_routine(["CREATE", "OR", "REPLACE", "VIEW", "V"])
+    assert not _defines_a_routine(["SELECT"])
+
+
+def test_a_bare_carriage_return_ends_a_line_comment(tmp_path: Path):
+    from app.db.migrations import _statements
+
+    # Everything after the CR is live SQL, exactly as PostgreSQL reads it.
+    assert _statements("SELECT 1; -- note\rCOMMIT;") == [["SELECT"], ["COMMIT"], []]

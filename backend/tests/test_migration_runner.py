@@ -1070,3 +1070,36 @@ def test_the_maintenance_connection_uses_the_database_it_was_given():
 
     url = make_url("postgresql+asyncpg://someone@example.invalid:5432/their_db")
     assert _admin_url(url).database == "their_db"
+
+
+async def test_the_cli_reports_an_invalid_unrelated_setting_as_a_refusal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    # get_settings() validates the WHOLE application config, so a bad value in
+    # a variable a migration run never reads — a stale rate-limit setting, a
+    # mistyped FUSIONSOLAR_MODE — raised before the run began and reached the
+    # operator as a Pydantic traceback.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "apply_migrations_cli",
+        Path(__file__).resolve().parents[1] / "scripts" / "apply_migrations.py",
+    )
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    monkeypatch.setattr(
+        cli,
+        "_parse_args",
+        lambda: argparse.Namespace(status=False, down_to=None, adopt_legacy_checksums=False),
+    )
+    # The real thing rather than a stand-in: a genuinely invalid value, with the
+    # settings cache cleared so it is re-read.
+    monkeypatch.setenv("FUSIONSOLAR_MODE", "nonsense")
+    cli.get_settings.cache_clear()
+    try:
+        assert await cli.main() == 2
+        assert capsys.readouterr().err.startswith("migration refused: the run failed (")
+    finally:
+        cli.get_settings.cache_clear()
