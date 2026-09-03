@@ -17,8 +17,10 @@ python scripts/apply_migrations.py --down-to base               # undo everythin
 python scripts/apply_migrations.py --adopt-legacy-checksums     # see the recovery notes
 ```
 
-`--status` exits `2` when any migration has drifted from what was applied, so it
-can be used as a deployment gate.
+`--status` exits `2` when any migration has drifted from what was applied — an
+edited or missing file, an edited, removed or newly appeared rollback file, an
+unverifiable legacy row, or a history that is no longer a prefix of the
+sequence — so it can be used as a deployment gate.
 
 Exit codes: `0` success, `1` no `DATABASE_URL`, `2` the run was refused (the
 message says why). A refusal never leaves the schema half-changed.
@@ -45,10 +47,14 @@ message says why). A refusal never leaves the schema half-changed.
 6. **Every migration has a tested way back.** Each `NNN_name.sql` has a paired
    `NNN_name.down.sql`, and rollback refuses to start unless *every* down file it
    would need is present and matches what was recorded.
-7. **Nothing is trusted silently.** Rows from the pre-checksum runner are
-   refused until an operator adopts them deliberately, and every failure —
-   including a syntax error inside a migration — is reported as a refusal naming
-   the file and the error type, never the SQL.
+7. **A migration and its history row commit together.** The migration SQL and
+   the `schema_migrations` write share one transaction, so the schema can never
+   advance without its history — or the reverse.
+8. **Nothing is trusted silently.** Rows from the pre-checksum runner, and
+   rollback files that appeared after their migration was applied, are refused
+   until an operator adopts them deliberately. Every failure — including a
+   syntax error inside a migration — is reported as a refusal naming the file
+   and the error type, never the SQL.
 
 ## Writing a migration
 
@@ -79,10 +85,19 @@ files (compare against a freshly migrated database), then re-run with
 `--adopt-legacy-checksums`. The adoption is recorded as an **unverified**
 baseline and says so in its output.
 
-**"these rollback files changed after their migration was applied"**
-A `.down.sql` was edited after its forward migration ran. Nothing was unwound.
-Restore the recorded rollback file; if the rollback genuinely needs to change,
-that is a new forward migration, not an edit to history.
+**"these rollback files were edited or removed after their migration was applied"**
+A `.down.sql` changed or disappeared after its forward migration ran. This is
+checked on **every** run, not only when rolling back — letting the schema
+advance while its recovery path is known to be corrupt is exactly the moment a
+rollback is most likely to be needed. Restore the recorded rollback file; if it
+genuinely needs to change, that is a new forward migration, not an edit to
+history.
+
+**"these migrations were applied with no rollback file, and one has since appeared"**
+The recorded `down_checksum` is NULL, which is evidence that this file did not
+accompany the applied migration — it could contain anything. Review it, then
+re-run with `--adopt-legacy-checksums` to execute it anyway. The execution is
+announced as unverified.
 
 **"applied migrations are not a prefix of the migration sequence"**
 A migration is numbered behind ones already applied — typically a branch merge

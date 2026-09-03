@@ -228,6 +228,22 @@ async def _verify(
             + " — an applied migration is immutable; add a new one instead"
         )
 
+    down_changed = sorted(
+        name
+        for name, row in applied.items()
+        if row.down_checksum is not None and row.down_checksum != known[name].down_checksum
+    )
+    if down_changed:
+        # Checked on EVERY run, not only when rolling back: letting the schema
+        # advance while its recovery path is known to be corrupt is exactly the
+        # moment a rollback is most likely to be needed.
+        raise MigrationChecksumError(
+            "these rollback files were edited or removed after their migration was "
+            "applied: "
+            + ", ".join(down_changed)
+            + " — an applied migration's recovery path is part of its history"
+        )
+
     legacy = sorted(name for name, row in applied.items() if row.checksum is None)
     if legacy and not adopt_legacy:
         # Recording the current file's hash would declare the database verified
@@ -262,6 +278,16 @@ async def _run_sql(conn: AsyncConnection, sql: str, *, filename: str) -> None:
 
     The text comes from the Migration read at discovery and is never re-read.
     """
+    # SQLAlchemy's transaction is lazy: conn.begin() creates the transaction
+    # OBJECT, but asyncpg only opens the real one when a statement goes through
+    # the adapter. Reaching for the driver first would run the migration in its
+    # own implicit transaction, committing independently of the bookkeeping row
+    # that follows — measured: the DDL survived a rollback that should have
+    # discarded it, which would leave a schema advanced with no history, or
+    # history without its schema. This statement forces the transaction open so
+    # the raw call joins it and the two commit or roll back together.
+    await conn.execute(sa.text("SELECT 1"))
+
     raw = await conn.get_raw_connection()
     try:
         await raw.driver_connection.execute(sql)
@@ -384,27 +410,25 @@ async def downgrade_to(
                     "cannot roll back — these migrations have no .down.sql: "
                     + ", ".join(sorted(without_down))
                 )
-            tampered = sorted(
-                m.filename
-                for m in doomed
-                if applied[m.filename].down_checksum is not None
-                and applied[m.filename].down_checksum != m.down_checksum
-            )
-            if tampered:
-                raise MigrationChecksumError(
-                    "these rollback files changed after their migration was applied: "
-                    + ", ".join(tampered)
-                    + " — a rollback is destructive, so it is not run unless it is the "
-                    "one that accompanied the applied migration"
-                )
+            # An edited or removed rollback file is already refused by _verify,
+            # for every applied migration rather than only the doomed ones.
             unverifiable = sorted(
                 m.filename for m in doomed if applied[m.filename].down_checksum is None
             )
+            if unverifiable and not adopt_legacy:
+                # A recorded NULL is evidence this file did NOT accompany the
+                # applied migration. It can contain any destructive statement,
+                # which is the very risk the rollback checksum exists to remove,
+                # so a warning is not authorization — an operator has to say so.
+                raise MigrationChecksumError(
+                    "these migrations were applied with no rollback file, and one has "
+                    "since appeared: "
+                    + ", ".join(unverifiable)
+                    + " — it did not accompany the applied migration and cannot be "
+                    "verified. Review it, then re-run with --adopt-legacy-checksums"
+                )
             for name in unverifiable:
-                # The down file did not exist when the migration was applied, so
-                # there is nothing to compare it against. Say so rather than
-                # implying it was verified.
-                emit(f"warn  {name}  (rollback file was not recorded at apply time)")
+                emit(f"adopt {name}  (unverified rollback executed on operator request)")
 
             for migration in doomed:
                 async with conn.begin():
@@ -435,6 +459,15 @@ async def status(engine: AsyncEngine, directory: Path) -> list[MigrationState]:
         await conn.commit()
         applied = await _applied_rows(conn)
 
+    # Ordering is a property of the SEQUENCE, not of one file, so it is computed
+    # once and attributed to the files that break it. Without this, the
+    # branch-merge state that apply and rollback both refuse would report clean
+    # and exit 0 — useless as a deployment gate.
+    out_of_order: set[str] = set()
+    expected = {m.filename for m in migrations[: len(applied)]}
+    if expected != set(applied):
+        out_of_order = expected ^ set(applied)
+
     states: list[MigrationState] = []
     for migration in migrations:
         row = applied.get(migration.filename)
@@ -444,18 +477,27 @@ async def status(engine: AsyncEngine, directory: Path) -> list[MigrationState]:
                 drift = "applied without a checksum (unverifiable)"
             elif row.checksum != migration.checksum:
                 drift = "file edited after it was applied"
-            elif (
-                row.down_checksum is not None
-                and migration.down_checksum is not None
-                and row.down_checksum != migration.down_checksum
-            ):
+            elif (row.down_checksum is None) != (migration.down_checksum is None):
+                # Presence changed either way: a recorded rollback that is now
+                # gone (recovery path lost) or one that appeared afterwards
+                # (never verified). Comparing only non-null values missed both.
+                drift = (
+                    "rollback file removed after it was applied"
+                    if row.down_checksum is not None
+                    else "rollback file added after it was applied (unverified)"
+                )
+            elif row.down_checksum != migration.down_checksum:
                 drift = "rollback file edited after it was applied"
+        if drift is None and migration.filename in out_of_order:
+            drift = "applied out of sequence (history is not a prefix)"
         states.append(
             MigrationState(migration.filename, row is not None, migration.has_down, drift)
         )
 
-    # Applied rows whose file is gone would otherwise vanish from the report —
-    # the one drift an operator is least likely to notice on their own.
+    # An applied row whose file is gone would otherwise vanish from the report —
+    # the one drift an operator is least likely to notice unaided. It also lands
+    # in out_of_order by construction, but "the file is missing" is the more
+    # specific and more actionable of the two, so it is the one reported.
     for name in sorted(set(applied) - set(known)):
         states.append(MigrationState(name, True, False, "applied but the file is missing"))
     return states

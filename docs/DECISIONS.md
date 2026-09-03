@@ -45,6 +45,13 @@ that decides the next schema's shape.
    whole set of down files before unwinding anything — a missing rollback file
    must not be discovered half-way. Rollback is destructive by nature and
    documented as such in docs/MIGRATIONS.md.
+4b. **A migration and its history row are one transaction.** SQLAlchemy's
+   transaction is lazy — `begin()` creates the object, but asyncpg opens the
+   real transaction only when a statement passes through the adapter. Because
+   migration SQL must go to the raw driver (asyncpg forbids multi-statement
+   prepared statements), the transaction is forced open first. Measured before
+   the fix: DDL run through the driver survived a rollback that should have
+   discarded it, which would leave a schema advanced with no history.
 5. **Role provisioning is not a migration.** The runner is not assumed to be a
    superuser or able to create roles; roles and grants are an operator step, so
    no migration ever carries a role name bound to a password. The concrete

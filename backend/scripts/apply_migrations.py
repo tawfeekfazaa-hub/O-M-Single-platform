@@ -76,7 +76,7 @@ async def main() -> int:
             if drifted:
                 print(f"\n{drifted} migration(s) drifted from what was applied.", file=sys.stderr)
                 return 2
-        elif args.down_to:
+        elif args.down_to is not None:  # empty string must reach validation, not apply
             count = await downgrade_to(
                 engine,
                 MIGRATIONS_DIR,

@@ -384,18 +384,29 @@ async def test_an_edited_rollback_file_is_refused(db_engine: AsyncEngine, migrat
     assert await applied_names(db_engine) == ["001_first.sql", "002_second.sql"]
 
 
-async def test_a_rollback_file_added_after_the_fact_is_flagged_not_silently_trusted(
+async def test_a_rollback_file_added_after_the_fact_is_refused_until_adopted(
     db_engine: AsyncEngine, migrations_dir: Path
 ):
-    # Nothing was recorded to compare against, so it runs — but the operator is
-    # told the difference between "verified" and "unverifiable".
+    # Nothing was recorded to compare against, so it is not run on a warning:
+    # the operator has to look at it and say so.
     write_pair(migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", None)
     await apply_pending(db_engine, migrations_dir)
     (migrations_dir / "003_third.down.sql").write_text("DROP TABLE IF EXISTS sprocket;")
 
+    # Refused by default: a recorded NULL is evidence this file did not
+    # accompany the applied migration, and it can contain anything.
+    with pytest.raises(MigrationChecksumError, match="has\nsince appeared|since appeared"):
+        await downgrade_to(db_engine, migrations_dir, "002_second.sql")
+    assert await table_exists(db_engine, "sprocket")
+
     lines: list[str] = []
-    assert await downgrade_to(db_engine, migrations_dir, "002_second.sql", emit=lines.append) == 1
-    assert "warn  003_third.sql  (rollback file was not recorded at apply time)" in lines
+    assert (
+        await downgrade_to(
+            db_engine, migrations_dir, "002_second.sql", emit=lines.append, adopt_legacy=True
+        )
+        == 1
+    )
+    assert "adopt 003_third.sql  (unverified rollback executed on operator request)" in lines
     assert not await table_exists(db_engine, "sprocket")
 
 
@@ -535,3 +546,100 @@ async def test_a_failing_migration_stays_inside_the_error_taxonomy(
 
     # The two good migrations stand; the broken one recorded nothing.
     assert await applied_names(db_engine) == ["001_first.sql", "002_second.sql"]
+
+
+async def test_a_migration_and_its_bookkeeping_row_commit_together(
+    db_engine: AsyncEngine, migrations_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # SQLAlchemy's transaction is lazy: conn.begin() creates the transaction
+    # object, but asyncpg opens the real one only when a statement goes through
+    # the adapter. Reaching for the driver first ran the migration in its own
+    # implicit transaction, so it committed even when the bookkeeping INSERT
+    # that follows failed — leaving a schema advanced with no history, which the
+    # next run would then try to apply a second time.
+    real_execute = migrations_module.AsyncConnection.execute
+    calls = {"n": 0}
+
+    async def fail_on_bookkeeping(self, statement, *args, **kwargs):
+        if "INSERT INTO schema_migrations" in str(statement):
+            calls["n"] += 1
+            raise RuntimeError("simulated bookkeeping failure")
+        return await real_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(migrations_module.AsyncConnection, "execute", fail_on_bookkeeping)
+
+    with pytest.raises(RuntimeError, match="simulated bookkeeping failure"):
+        await apply_pending(db_engine, migrations_dir)
+    assert calls["n"] == 1
+
+    monkeypatch.undo()
+    # The DDL must have rolled back with it: no table, no history row.
+    assert not await table_exists(db_engine, "widget")
+    assert await applied_names(db_engine) == []
+
+
+async def test_an_edited_rollback_file_blocks_applying_anything_new(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # Letting the schema advance while its recovery path is known to be corrupt
+    # is exactly the moment a rollback is most likely to be needed.
+    await apply_pending(db_engine, migrations_dir)
+    (migrations_dir / "001_first.down.sql").write_text("DROP TABLE IF EXISTS widget CASCADE;")
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE TABLE sprocket (id INT);",
+        "DROP TABLE IF EXISTS sprocket;",
+    )
+
+    with pytest.raises(MigrationChecksumError, match="001_first.sql"):
+        await apply_pending(db_engine, migrations_dir)
+    assert not await table_exists(db_engine, "sprocket")
+
+
+async def test_a_removed_rollback_file_is_treated_like_an_edited_one(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    await apply_pending(db_engine, migrations_dir)
+    (migrations_dir / "002_second.down.sql").unlink()
+
+    with pytest.raises(MigrationChecksumError, match="002_second.sql"):
+        await apply_pending(db_engine, migrations_dir)
+
+
+async def test_status_reports_a_history_that_is_not_a_prefix(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # apply and rollback both refuse this state, so a status that called it
+    # clean and exited 0 would be worse than useless as a deployment gate.
+    held_up = (migrations_dir / "002_second.sql").read_text()
+    held_down = (migrations_dir / "002_second.down.sql").read_text()
+    (migrations_dir / "002_second.sql").unlink()
+    (migrations_dir / "002_second.down.sql").unlink()
+    write_pair(
+        migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", "DROP TABLE sprocket;"
+    )
+    await apply_pending(db_engine, migrations_dir)
+    (migrations_dir / "002_second.sql").write_text(held_up)
+    (migrations_dir / "002_second.down.sql").write_text(held_down)
+
+    states = {s.filename: s for s in await status(db_engine, migrations_dir)}
+    drifted = {name for name, s in states.items() if s.drift}
+    assert "003_third.sql" in drifted
+    assert all("out of sequence" in states[name].drift for name in drifted)
+
+
+async def test_status_reports_a_rollback_file_that_appeared_or_vanished(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # Comparing only non-null checksums missed both directions: a recorded
+    # rollback that is now gone, and one that appeared afterwards.
+    write_pair(migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", None)
+    await apply_pending(db_engine, migrations_dir)
+
+    (migrations_dir / "002_second.down.sql").unlink()  # recorded, now gone
+    (migrations_dir / "003_third.down.sql").write_text("DROP TABLE sprocket;")  # appeared
+
+    states = {s.filename: s for s in await status(db_engine, migrations_dir)}
+    assert states["002_second.sql"].drift == "rollback file removed after it was applied"
+    assert states["003_third.sql"].drift == "rollback file added after it was applied (unverified)"
