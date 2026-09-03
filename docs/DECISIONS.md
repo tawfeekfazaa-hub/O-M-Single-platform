@@ -113,6 +113,21 @@ that decides the next schema's shape.
    other process blocks, so the leak is invisible from inside the process that
    caused it. Measured with cancellation delivered before `pg_advisory_unlock`:
    another engine could not take the lock.
+4l. **The runner does not share a session with the migrations it runs, where it
+   matters.** Migration SQL executes on the runner's connection, so everything
+   the runner resolves by name or keeps in session state is reachable from it.
+   Three measured consequences, all closed: a migration containing
+   `SELECT pg_advisory_unlock_all()` released the run lock without ending its
+   transaction, letting a second runner in mid-migration — the lock now lives on
+   its own connection, which migration text cannot reach. A down migration
+   defining `shadow.=(text, text)` ahead of `pg_catalog` made the ledger DELETE
+   match nothing, leaving a rolled-back migration recorded as applied (the
+   mirror, an `=` returning true, would have deleted the whole history) — every
+   bookkeeping statement now runs under `SET LOCAL search_path = pg_catalog`,
+   and the advisory-lock functions are `pg_catalog`-qualified. And a migration's
+   `SET search_path` rode back into the pool, so a library caller's next query
+   resolved unqualified names in the migration's schema — the session is
+   restored before the connection is returned.
 4j. **The ledger cannot be redirected by the migrations it records.** Migration
    SQL runs on the runner's connection and may legitimately `SET search_path`,
    which would resolve a later unqualified `schema_migrations` elsewhere.

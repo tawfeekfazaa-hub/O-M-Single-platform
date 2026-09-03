@@ -87,9 +87,12 @@ message — a connection error's text carries the host and port.
   `VACUUM` — cannot be a migration here. Do it as an operator step.
 - `SET search_path` inside a migration is allowed and affects the statements
   after it, including later migrations in the same run. It cannot affect the
-  history table: the ledger's schema is resolved before any migration runs and
-  every bookkeeping statement is qualified with it, and each run starts by
-  resetting the search path.
+  runner: the ledger's schema is resolved before any migration runs, every
+  bookkeeping statement runs with the path pinned to `pg_catalog` (which pins
+  the `=` operator too, not just the table), each run starts by resetting the
+  path, and the connection is restored before it goes back to the pool.
+- The run lock is held on a **separate connection**. A migration cannot release
+  it — `pg_advisory_unlock_all()` in a migration affects only its own session.
 - If a value needs a carriage return in it, write the escape — `E'a\r\nb'` —
   rather than a physical CRLF in the file. Line endings are normalized by git on
   the way in and out, so they are not a reliable way to carry data, and a CR in

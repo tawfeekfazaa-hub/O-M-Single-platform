@@ -12,7 +12,6 @@ in test_migration_runner.py.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
@@ -391,32 +390,17 @@ def test_no_migration_in_this_repository_carries_a_carriage_return():
     assert offenders == []
 
 
-def test_the_cli_prints_without_letting_a_broken_stream_change_the_result():
-    """`say` is the CLI's own reporting, and reporting must not decide outcomes.
+def test_a_migration_numbered_with_unicode_digits_is_refused(tmp_path: Path):
+    """``\\d`` matches Unicode decimal digits; ``[0-9]`` does not.
 
-    With stdout closed, a successful run reached `print("applied N ...")` and
-    raised BrokenPipeError into the blanket handler, which reported a refusal
-    and exited 2 for migrations that had been applied.
+    ``٠٠٢_beta.sql`` passed the filename pattern and then compared unequal to
+    ``002`` as a string, so it slipped a reused sequence number past the
+    duplicate check — the safeguard added one round earlier.
     """
-    import importlib.util
+    from app.db.migrations import discover
 
-    spec = importlib.util.spec_from_file_location(
-        "apply_migrations_cli",
-        Path(__file__).resolve().parents[1] / "scripts" / "apply_migrations.py",
-    )
-    assert spec is not None and spec.loader is not None
-    cli = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli)
+    (tmp_path / "002_alpha.sql").write_text("CREATE TABLE a (id INT);")
+    (tmp_path / "\u0660\u0660\u0662_beta.sql").write_text("CREATE TABLE b (id INT);")
 
-    class Closed:
-        def write(self, *_args: object) -> int:
-            raise BrokenPipeError("stdout is closed")
-
-        def flush(self) -> None:
-            raise BrokenPipeError("stdout is closed")
-
-    real_stdout, sys.stdout = sys.stdout, Closed()
-    try:
-        cli.say("applied 2 migration(s)")  # must not raise
-    finally:
-        sys.stdout = real_stdout
+    with pytest.raises(MigrationError, match="does not match NNN_name.sql"):
+        discover(tmp_path)

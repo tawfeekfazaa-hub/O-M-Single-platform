@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1356,3 +1357,177 @@ async def test_two_migrations_may_not_share_a_sequence_number(
     # And it is refused on the diagnostic path too, not only on apply.
     with pytest.raises(MigrationOrderError, match="two migrations are numbered 002"):
         await status(db_engine, migrations_dir)
+
+
+async def test_the_ledger_delete_cannot_be_subverted_by_a_custom_equality(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # Qualifying the ledger RELATION does not pin the OPERATOR. A down migration
+    # that puts its own schema ahead of pg_catalog and defines =(text, text)
+    # returning false left the rolled-back migration still recorded as applied;
+    # one returning true would have deleted the entire history.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE TABLE sprocket (id INT);",
+        "DROP TABLE IF EXISTS sprocket;\n"
+        "CREATE SCHEMA shadow;\n"
+        "CREATE FUNCTION shadow.always_false(text, text) RETURNS boolean "
+        "LANGUAGE sql IMMUTABLE AS 'SELECT false';\n"
+        "CREATE OPERATOR shadow.= (LEFTARG=text, RIGHTARG=text, FUNCTION=shadow.always_false);\n"
+        "SET search_path = shadow, pg_catalog;",
+    )
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+    await downgrade_to(db_engine, migrations_dir, "002_second.sql", emit=lambda _: None)
+
+    assert await applied_names(db_engine) == ["001_first.sql", "002_second.sql"]
+
+
+async def test_the_advisory_lock_functions_come_from_pg_catalog(db_url: URL):
+    # Any route that leaves a hostile search_path on the connection _lock uses
+    # would otherwise let a migration-defined pg_try_advisory_lock(bigint)
+    # satisfy the runner without a real lock ever being taken. Tested as the
+    # property rather than through an exploit, because the dedicated lock
+    # connection and the session restore both also close the known route — and
+    # defence that nothing tests looks exactly like defence that works.
+    engine = create_async_engine(db_url)
+    other = create_async_engine(db_url)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(sa.text("CREATE SCHEMA app"))
+            await conn.execute(
+                sa.text(
+                    "CREATE FUNCTION app.pg_try_advisory_lock(bigint) RETURNS boolean "
+                    "LANGUAGE sql AS 'SELECT true'"
+                )
+            )
+            await conn.execute(sa.text("SET search_path = app, pg_catalog"))
+            await conn.commit()
+
+            await migrations_module._lock(conn)
+            try:
+                async with other.connect() as watcher:
+                    # If the shadow function had satisfied _lock, no real lock
+                    # would be held and this would succeed.
+                    assert not await watcher.scalar(
+                        sa.text("SELECT pg_catalog.pg_try_advisory_lock(:k)"),
+                        {"k": migrations_module.ADVISORY_LOCK_KEY},
+                    )
+            finally:
+                await migrations_module._unlock(conn, emit=lambda _: None)
+    finally:
+        await other.dispose()
+        await engine.dispose()
+
+
+async def test_a_migration_cannot_release_the_runners_lock(db_url: URL):
+    # The lock used to live on the same session the migrations run on, so a
+    # migration containing pg_advisory_unlock_all() released it without ending
+    # its transaction — and a second runner could enter mid-migration.
+    engine = create_async_engine(db_url)
+    other = create_async_engine(db_url)
+    directory = Path(str(db_url.database))  # placeholder, replaced below
+    try:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            write_pair(
+                directory,
+                "001_unlock",
+                "CREATE TABLE widget (id INT);\nSELECT pg_advisory_unlock_all();",
+                "DROP TABLE IF EXISTS widget;",
+            )
+            taken: dict[str, bool | None] = {}
+            real_run = migrations_module._run_sql
+
+            async def spy(conn, sql, *, filename):
+                await real_run(conn, sql, filename=filename)
+                async with other.connect() as watcher:
+                    taken["free"] = bool(
+                        await watcher.scalar(
+                            sa.text("SELECT pg_catalog.pg_try_advisory_lock(:k)"),
+                            {"k": migrations_module.ADVISORY_LOCK_KEY},
+                        )
+                    )
+
+            migrations_module._run_sql = spy
+            try:
+                await apply_pending(engine, directory, emit=lambda _: None)
+            finally:
+                migrations_module._run_sql = real_run
+            assert taken["free"] is False
+    finally:
+        await other.dispose()
+        await engine.dispose()
+
+
+async def test_the_connection_is_returned_without_the_migrations_search_path(
+    db_url: URL, migrations_dir: Path
+):
+    # A migration's SET search_path is committed with it and rides back into the
+    # pool. A library caller's next query never reaches _ensure_bookkeeping's
+    # reset, so it would resolve unqualified names in the migration's schema.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE SCHEMA app;\nSET search_path = app;",
+        "DROP SCHEMA IF EXISTS app CASCADE;",
+    )
+    engine = create_async_engine(db_url)
+    try:
+        await apply_pending(engine, migrations_dir, emit=lambda _: None)
+        async with engine.connect() as conn:
+            assert "app" not in str(await conn.scalar(sa.text("SHOW search_path")))
+    finally:
+        await engine.dispose()
+
+
+async def test_the_cli_survives_a_closed_stdout_on_a_successful_run(db_url: URL, tmp_path: Path):
+    """Drives main() rather than say(), which is the point.
+
+    The previous version of this test called `say()` directly, so replacing any
+    `say(...)` call site with `print(...)` would have restored the bug while the
+    test stayed green — it proved the helper works, not that it is used at the
+    boundary it protects.
+    """
+    import argparse
+    import importlib.util
+    from types import SimpleNamespace
+
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    write_pair(directory, "001_first", "CREATE TABLE widget (id INT);", "DROP TABLE widget;")
+
+    spec = importlib.util.spec_from_file_location(
+        "apply_migrations_cli_e2e",
+        Path(__file__).resolve().parents[1] / "scripts" / "apply_migrations.py",
+    )
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    cli.MIGRATIONS_DIR = directory
+    cli._parse_args = lambda: argparse.Namespace(
+        status=False, down_to=None, adopt_legacy_checksums=False
+    )
+    cli.get_settings = lambda: SimpleNamespace(database_url=str(db_url))
+
+    class Closed:
+        def write(self, *_args: object) -> int:
+            raise BrokenPipeError("stdout is closed")
+
+        def flush(self) -> None:
+            raise BrokenPipeError("stdout is closed")
+
+    real_stdout, sys.stdout = sys.stdout, Closed()
+    try:
+        exit_code = await cli.main()
+    finally:
+        sys.stdout = real_stdout
+
+    assert exit_code == 0  # the run succeeded and says so
+    engine = create_async_engine(db_url)
+    try:
+        assert await table_exists(engine, "widget")  # and it really did the work
+    finally:
+        await engine.dispose()

@@ -48,7 +48,10 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 #: Forward migrations are ``NNN_name.sql``; their rollback is ``NNN_name.down.sql``.
-MIGRATION_PATTERN = re.compile(r"^\d{3}_[a-z0-9_]+\.sql$")
+#: ``[0-9]`` rather than ``\d``: Python's ``\d`` also matches Unicode decimal
+#: digits, so ``٠٠٢_beta.sql`` would pass and then compare unequal to ``002``,
+#: slipping a reused sequence number past the duplicate check below.
+MIGRATION_PATTERN = re.compile(r"^[0-9]{3}_[a-z0-9_]+\.sql$")
 DOWN_SUFFIX = ".down.sql"
 
 #: ``--down-to base`` unwinds every applied migration.
@@ -496,8 +499,27 @@ async def _ensure_bookkeeping(conn: AsyncConnection) -> str:
     return str(qualified)
 
 
+async def _ledger(conn: AsyncConnection, statement: sa.TextClause, params: dict | None = None):
+    """Run a bookkeeping statement with name resolution pinned to ``pg_catalog``.
+
+    Qualifying the ledger RELATION is not enough. Migration SQL shares this
+    session and can put its own schema ahead of ``pg_catalog``, which also
+    redirects OPERATORS: measured, a down migration defining
+    ``shadow.=(text, text)`` that returns false left the rolled-back migration
+    still recorded as applied, because ``WHERE filename = :f`` matched nothing.
+    The mirror image — an ``=`` returning true — would have deleted the whole
+    history.
+
+    ``SET LOCAL``, so it lasts only to the end of the current transaction. The
+    bookkeeping statement is the last thing in it, and a migration's own
+    session-level ``SET search_path`` survives for the migrations that follow.
+    """
+    await conn.execute(sa.text("SET LOCAL search_path = pg_catalog"))
+    return await conn.execute(statement, params or {})
+
+
 async def _applied_rows(conn: AsyncConnection, ledger: str) -> dict[str, _AppliedRow]:
-    result = await conn.execute(sa.text(f"SELECT filename, checksum, down_checksum FROM {ledger}"))
+    result = await _ledger(conn, sa.text(f"SELECT filename, checksum, down_checksum FROM {ledger}"))
     return {r.filename: _AppliedRow(r.checksum, r.down_checksum) for r in result}
 
 
@@ -585,7 +607,8 @@ async def _verify(
         )
     for name in legacy:
         migration = known[name]
-        await conn.execute(
+        await _ledger(
+            conn,
             sa.text(f"UPDATE {ledger} SET checksum = :c, down_checksum = :d WHERE filename = :f"),
             {"c": migration.checksum, "d": migration.down_checksum, "f": name},
         )
@@ -624,7 +647,8 @@ async def _adopt_new_rollbacks(
         and row.down_checksum is None
         and known[name].down_checksum is not None
     ):
-        await conn.execute(
+        await _ledger(
+            conn,
             sa.text(f"UPDATE {ledger} SET down_checksum = :d WHERE filename = :f"),
             {"d": known[name].down_checksum, "f": name},
         )
@@ -722,7 +746,7 @@ async def _atomic(conn: AsyncConnection) -> AsyncIterator[None]:
 
 async def _lock(conn: AsyncConnection) -> None:
     acquired = await conn.scalar(
-        sa.text("SELECT pg_try_advisory_lock(:k)"), {"k": ADVISORY_LOCK_KEY}
+        sa.text("SELECT pg_catalog.pg_try_advisory_lock(:k)"), {"k": ADVISORY_LOCK_KEY}
     )
     if not acquired:
         raise MigrationLockError(
@@ -748,6 +772,21 @@ async def _discard(conn: AsyncConnection) -> None:
         conn.sync_connection.invalidate()  # type: ignore[union-attr]
 
 
+async def _restore_session(conn: AsyncConnection) -> None:
+    """Undo session state a migration left, before the connection is pooled.
+
+    A migration's ``SET search_path`` is committed with it and rides back into
+    the pool, so a library caller's next query — which never reaches
+    :func:`_ensure_bookkeeping` and its reset — resolves unqualified names in
+    the migration's schema. Measured: ``SHOW search_path`` returned ``app`` on
+    the next application query.
+    """
+    with suppress(Exception):
+        await conn.rollback()
+        await conn.execute(sa.text("RESET search_path"))
+        await conn.commit()
+
+
 async def _unlock(conn: AsyncConnection, *, emit: Emit) -> None:
     """Release explicitly — closing the connection only returns it to the pool.
 
@@ -771,7 +810,9 @@ async def _unlock(conn: AsyncConnection, *, emit: Emit) -> None:
     """
     try:
         await conn.rollback()
-        await conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY})
+        await conn.execute(
+            sa.text("SELECT pg_catalog.pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY}
+        )
         await conn.commit()
     except BaseException as exc:
         # BaseException, not Exception: asyncio.CancelledError inherits straight
@@ -800,12 +841,17 @@ async def apply_pending(
     migrations = discover(directory)
     known = {m.filename: m for m in migrations}
     applied_count = 0
-    async with engine.connect() as conn:
+    # The lock lives on its own connection. Migration SQL runs on the other one
+    # and shares that session: a migration containing `SELECT
+    # pg_advisory_unlock_all()` released the runner's own lock without ending
+    # its transaction, and a second runner could then enter mid-migration —
+    # measured. A separate session is not reachable from migration text at all.
+    async with engine.connect() as lock_conn, engine.connect() as conn:
         # _lock is INSIDE the guarded region: PostgreSQL may grant the lock and
         # the caller be cancelled before the result is seen, which would return
         # a locked session to the pool with nothing arranged to release it.
         try:
-            await _lock(conn)
+            await _lock(lock_conn)
             ledger = await _ensure_bookkeeping(conn)
             await conn.commit()
             applied = await _applied_rows(conn, ledger)
@@ -823,7 +869,8 @@ async def apply_pending(
                     continue
                 async with _atomic(conn):
                     await _run_sql(conn, migration.content, filename=migration.filename)
-                    await conn.execute(
+                    await _ledger(
+                        conn,
                         sa.text(
                             f"INSERT INTO {ledger} (filename, checksum, down_checksum) "
                             "VALUES (:f, :c, :d)"
@@ -837,7 +884,14 @@ async def apply_pending(
                 emit(f"apply {migration.filename}")
                 applied_count += 1
         finally:
-            await _unlock(conn, emit=emit)
+            # Nested, not sequential: _restore_session suppresses Exceptions but
+            # a cancellation delivered inside it would otherwise skip the unlock
+            # entirely and strand the lock — which is what the cancellation test
+            # caught when these were two statements in a row.
+            try:
+                await _restore_session(conn)
+            finally:
+                await _unlock(lock_conn, emit=emit)
     return applied_count
 
 
@@ -862,11 +916,13 @@ async def downgrade_to(
     if target != BASE_TARGET and target not in known:
         raise MigrationError(f"unknown --down-to target: {target}")
 
-    async with engine.connect() as conn:
-        # As in apply_pending: the lock is taken inside the region that releases
-        # it, so a cancellation landing on the grant cannot strand it.
+    # As in apply_pending, on its own connection: migration SQL cannot reach a
+    # session it does not run on.
+    async with engine.connect() as lock_conn, engine.connect() as conn:
+        # The lock is taken inside the region that releases it, so a
+        # cancellation landing on the grant cannot strand it.
         try:
-            await _lock(conn)
+            await _lock(lock_conn)
             ledger = await _ensure_bookkeeping(conn)
             await conn.commit()
             applied = await _applied_rows(conn, ledger)
@@ -924,7 +980,8 @@ async def downgrade_to(
                 async with _atomic(conn):
                     assert migration.down_content is not None  # checked above
                     await _run_sql(conn, migration.down_content, filename=migration.down_filename)
-                    await conn.execute(
+                    await _ledger(
+                        conn,
                         sa.text(f"DELETE FROM {ledger} WHERE filename = :f"),
                         {"f": migration.filename},
                     )
@@ -938,7 +995,14 @@ async def downgrade_to(
                     )
                 emit(f"down  {migration.filename}")
         finally:
-            await _unlock(conn, emit=emit)
+            # Nested, not sequential: _restore_session suppresses Exceptions but
+            # a cancellation delivered inside it would otherwise skip the unlock
+            # entirely and strand the lock — which is what the cancellation test
+            # caught when these were two statements in a row.
+            try:
+                await _restore_session(conn)
+            finally:
+                await _unlock(lock_conn, emit=emit)
     return len(doomed)
 
 
