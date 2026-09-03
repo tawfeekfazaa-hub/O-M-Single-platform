@@ -3,6 +3,56 @@
 Format: newest first. Every change to the fixed architecture in CLAUDE.md
 requires an entry here.
 
+## ADR-006 — 2026-09-03 — Migration harness and the TimescaleDB reference rule (PR-2A0)
+
+Groundwork for the Raw/Quarantine storage of PR-2A1. No schema change: this
+entry records how migrations are governed and one measured database constraint
+that decides the next schema's shape.
+
+1. **Migrations stay numbered plain SQL** (ADR-003 upheld). PR-2 adds several
+   tables, a partial index and triggers — all DDL-first and awkward through an
+   ORM migration framework — and introducing such a framework in the same change
+   as the schema would double the review surface. Revisit as a standalone change
+   after PR-2.
+2. **An applied migration is immutable, enforced not documented.**
+   `schema_migrations` gains a `checksum` column; every run re-verifies it and
+   refuses the whole run on a mismatch, a deleted file, or a file that cannot be
+   ordered. Rows written by the PR-1 runner have no checksum: the current file is
+   adopted as their baseline and the adoption is announced, because the original
+   content is unknowable. The checksum is taken over newline-normalized content
+   so a CRLF checkout (README documents a Windows workflow) cannot brick it.
+3. **One writer at a time.** A session-level advisory lock, taken before any
+   bookkeeping; a concurrent run fails immediately rather than interleaving DDL.
+4. **Every migration ships a paired `.down.sql`**, and `--down-to` verifies the
+   whole set of down files before unwinding anything — a missing rollback file
+   must not be discovered half-way. Rollback is destructive by nature and
+   documented as such in docs/MIGRATIONS.md.
+5. **Role provisioning is not a migration.** The runner is not assumed to be a
+   superuser or able to create roles; roles and grants are an operator step, so
+   no migration ever carries a role name bound to a password. The concrete
+   API/ingestion privilege split lands with PR-2A1.
+6. **Live-database tests are a first-class CI job.** `backend-db` runs against
+   the same pinned TimescaleDB image as docker-compose, applies the real
+   migrations, rolls them back, re-applies them, and exercises
+   `PostgresRepository` — which had no test coverage at all before this change.
+   The offline job deselects them (`-m "not dbtest"`) rather than letting them
+   skip, and the DB job fails up front if the database is unreachable, so a
+   green run can never mean "verified nothing".
+
+**Measured constraint, deciding D2 for PR-2A1.** A TimescaleDB hypertable
+refuses any unique index that omits its partitioning column, so a surrogate `id`
+alone can never be unique on a hypertable — and therefore nothing can hold a
+foreign key referencing one. Verified against the pinned image in
+`tests/test_db_schema.py`, not taken from documentation.
+
+Consequence: raw payloads stored in a hypertable (so retention is a chunk drop
+rather than a mass DELETE) can only be referenced SOFTLY — a plain `BIGINT` with
+no foreign key — from `kpi_measurements` and the quarantine tables. Provenance
+pointing at a purged payload is therefore an expected state to be reported, not
+corruption to be prevented. The opposite direction (a hypertable referencing a
+regular table) is permitted and is what `kpi_measurements.plant_id` already
+relies on; it is pinned by a test so PR-2A1 can build on it.
+
 ## ADR-005 — 2026-09-01 — FusionSolar contract hardening (PR-1)
 
 Decisions (full contract: docs/FUSIONSOLAR-CONTRACT.md):

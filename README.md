@@ -49,8 +49,29 @@ adapter — no credentials, no database needed.
 
 ```bash
 docker compose up -d timescaledb
-cd backend && python scripts/apply_migrations.py   # uses DATABASE_URL
+cd backend && python scripts/apply_migrations.py       # uses DATABASE_URL
+python scripts/apply_migrations.py --status            # what is applied
+python scripts/apply_migrations.py --down-to base      # roll everything back
 ```
+
+An applied migration is immutable: its checksum is verified on every run and an
+edit refuses the whole run. Rollback, recovery and the rules for writing a
+migration are in `docs/MIGRATIONS.md`.
+
+### Live-database tests
+
+The default `pytest` run is offline and needs no database. The migration and
+repository tests need a real PostgreSQL/TimescaleDB and are deselected unless
+asked for:
+
+```bash
+TEST_DATABASE_URL=postgresql+asyncpg://aq_om@127.0.0.1:5432/postgres \
+  pytest -m dbtest
+```
+
+Each test creates and drops its own database, so the one in the URL is only used
+to connect. CI runs these in the `backend-db` job against the same pinned
+TimescaleDB image as `docker-compose.yml`.
 
 ## Frontend quickstart
 
@@ -93,7 +114,8 @@ All configuration via environment variables — see `.env.example`
   disabled scheduler — and prints counts only, never station identities,
   values, tokens, or credentials. A green mock run (or green tests) is no
   evidence that a real Huawei connection works.
-- CI enforces: ruff + pytest, `pip-audit` on the fully resolved production
+- CI enforces: ruff + pytest (offline), the migration/repository suite against
+  a real TimescaleDB, `pip-audit` on the fully resolved production
   tree and on the complete installed environment (blocking on any finding),
   `npm audit` blocking on high/critical for production and for all
   dependencies, ESLint, `tsc --noEmit`, production build, a `/plants`

@@ -73,6 +73,10 @@ come in a later phase once meteo data is ingested.
    normalization, real-mode safety gate). No live vendor call. *(done)*
 3. **PR-2** — Raw/Quarantine storage: every real payload lands in raw
    storage first; malformed data is quarantined, never silently ingested.
+   Delivered in small steps: **PR-2A0** migration/rollback harness and live
+   database CI *(done)*; **PR-2A1** raw schema, provenance and timestamp model;
+   **PR-2A2** raw-first capture; **PR-2B** validation, quarantine, idempotent
+   promotion and offline replay.
 4. Only after PR-2 **and** an approved staging host **and** the company
    data-location policy decision: one controlled live contract-validation
    check (see docs/FUSIONSOLAR-CONTRACT.md "live unknowns"), then
