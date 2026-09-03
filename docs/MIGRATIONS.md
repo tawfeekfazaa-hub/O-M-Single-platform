@@ -104,6 +104,13 @@ message — a connection error's text carries the host and port.
 15. **Reading the history does not change the session it read on.** `--status`
    restores the caller's `search_path` rather than leaving the runner's reset
    behind or ending the session.
+16. **The engine has to be able to do the job, and is checked rather than
+   assumed.** It must supply two connections, run real transactions (not
+   `AUTOCOMMIT`), at read-committed isolation (not `REPEATABLE READ` or
+   `SERIALIZABLE`), over a connection that is one PostgreSQL session (not a
+   transaction-pooling proxy). Each is refused with a message naming it. The
+   pooler check is best-effort detection, not a guarantee — see the warning
+   about a lock released on another backend, below.
 
 ## Writing a migration
 
@@ -155,6 +162,27 @@ message — a connection error's text carries the host and port.
   migration.
 
 ## When something goes wrong
+
+**"this engine does not give the runner a transaction"**
+The engine was built with `isolation_level="AUTOCOMMIT"`. A migration and its
+history row must commit together, which that engine cannot do — every statement
+commits as it runs. Nothing has been applied. Pass an engine with the default
+transactional behaviour; the CLI's own always qualifies.
+
+**"this engine runs its transactions at 'repeatable read'"**
+(Or `'serializable'`.) The runner's fence takes a lock and then re-reads the
+history, and at a snapshot isolation level that re-read returns what the
+transaction saw before it waited — so two overlapping runs would both believe
+nothing had changed. Nothing has been applied. Pass an engine with the default
+isolation.
+
+**"WARNING: the run lock was taken on backend N but released on M"**
+Not a refusal — the run finished — but the advisory key was **not** released and
+is now held by a backend this process cannot reach. Every later migration run
+will refuse with "another migration run holds the advisory lock" until it is
+cleared. The cause is a connection that is not one PostgreSQL session, i.e. a
+transaction-pooling proxy. The warning includes the statement that clears it;
+then fix `DATABASE_URL` to reach the server directly or a session-pooled port.
 
 **"the migration history changed while this run was working"**
 Two migration runs overlapped and this one lost. Its work was rolled back before

@@ -2516,3 +2516,97 @@ async def test_an_adoption_that_lost_the_row_underneath_it_refuses_rather_than_o
         assert stored == "somebody-else"
     finally:
         await verify.dispose()
+
+
+async def test_an_autocommit_engine_is_refused_before_any_migration_runs(
+    db_url: URL, migrations_dir: Path
+):
+    # SQLAlchemy's begin() is a facade over a DBAPI in autocommit: the fence's
+    # lock is released as soon as its statement finishes and the migration SQL
+    # commits on its own. The existing in-transaction guard then fires AFTER the
+    # schema change is durable — measured, `widget` created, 0 history rows,
+    # exit 2. A refusal that arrives after the damage is a report, not a guard.
+    engine = create_async_engine(db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with pytest.raises(MigrationError, match="does not give the runner a transaction"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    finally:
+        await engine.dispose()
+
+    verify = create_async_engine(db_url)
+    try:
+        assert not await table_exists(verify, "widget")  # nothing durable
+        assert await applied_names(verify) == []
+    finally:
+        await verify.dispose()
+
+
+async def test_a_snapshot_isolation_engine_is_refused(db_url: URL, migrations_dir: Path):
+    # The fence re-reads the history after taking its lock, which is worth
+    # nothing at an isolation level that does not re-read: under REPEATABLE READ
+    # the lock statement fixes the snapshot BEFORE the wait, so the loser sees
+    # the pre-winner rows and proceeds. Measured on such an engine — an apply of
+    # 003 and a rollback of 002 both committed, leaving `001, 003`.
+    engine = create_async_engine(db_url, isolation_level="REPEATABLE READ")
+    try:
+        with pytest.raises(MigrationError, match="'repeatable read'.*needs read committed"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    finally:
+        await engine.dispose()
+
+    # SERIALIZABLE is the same class of problem and refused the same way.
+    engine = create_async_engine(db_url, isolation_level="SERIALIZABLE")
+    try:
+        with pytest.raises(MigrationError, match="needs read committed"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    finally:
+        await engine.dispose()
+
+    verify = create_async_engine(db_url)
+    try:
+        assert await applied_names(verify) == []
+    finally:
+        await verify.dispose()
+
+
+async def test_a_lock_released_on_another_backend_says_the_key_is_stranded(
+    db_url: URL, migrations_dir: Path
+):
+    """The case the pre-lock probe cannot cover, reported rather than silent.
+
+    The probe before the lock is exactly that — a probe. A pooler holding one
+    server connection can hand back the same backend for both samples and pass
+    it. And an up-to-date run does no other session check at all, so nothing
+    else would ever notice. If the release then lands on a different backend the
+    key stays held by a backend this process cannot reach, and every later run
+    refuses with "another migration run holds the advisory lock" — for no
+    visible reason.
+
+    This does not fix that; nothing in the runner can. It names it at the moment
+    it happens, with the statement that clears it.
+    """
+    engine = create_async_engine(db_url)
+    try:
+        assert await apply_pending(engine, migrations_dir, emit=lambda _: None) == 2
+    finally:
+        await engine.dispose()
+
+    # An UP-TO-DATE run, which is the one that reaches no other check.
+    engine = create_async_engine(db_url)
+    lines: list[str] = []
+    real_lock = migrations_module._lock
+
+    async def lock_then_move(conn):
+        return await real_lock(conn) + 1  # as if the release landed elsewhere
+
+    migrations_module._lock = lock_then_move
+    try:
+        assert await apply_pending(engine, migrations_dir, emit=lines.append) == 0
+    finally:
+        migrations_module._lock = real_lock
+        await engine.dispose()
+
+    stranded = [line for line in lines if line.startswith("WARNING: the run lock was taken on")]
+    assert stranded, f"expected a warning naming the stranded key, got {lines}"
+    # And it tells the operator how to clear it, not just that it happened.
+    assert "pg_terminate_backend" in stranded[0]

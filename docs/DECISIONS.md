@@ -189,6 +189,31 @@ that decides the next schema's shape.
    costs nothing to undo. A transaction-scoped lock is also the one kind
    `pg_advisory_unlock_all()` cannot release, which is why it is safe on the
    connection migration SQL shares.
+4z. **The runner states what it needs of the caller's engine, and refuses
+   otherwise.** Three assumptions were implicit and each broke a guarantee when
+   it did not hold. `isolation_level="AUTOCOMMIT"`: SQLAlchemy's `begin()` is a
+   facade, so the fence's lock released immediately and the migration committed
+   on its own — measured, the table was created, `schema_migrations` had 0 rows,
+   and the in-transaction guard reported a refusal with the damage already
+   durable. A snapshot isolation level (`REPEATABLE READ`, `SERIALIZABLE`): the
+   fence's lock statement fixes the transaction's snapshot BEFORE it waits, so
+   the re-read afterwards returns the pre-winner rows and the loser proceeds —
+   measured, `001, 003` again. Both are now refused, the isolation level READ
+   from the server rather than inferred from the engine's configuration.
+   Correcting the isolation instead of refusing does not work: `SET TRANSACTION
+   ISOLATION LEVEL` must precede every query in its transaction and the preamble
+   has already read, and SQLAlchemy passes the engine's level at `BEGIN` so the
+   session characteristic is overridden — both measured.
+4aa. **A lock released on the wrong backend is reported, not swallowed.** The
+   pre-lock session probe is a probe: a pooler holding one server connection can
+   return the same backend for both samples and pass it, and a run that applies
+   nothing reaches no other session check. If the release then lands on a
+   different backend the key stays held where this process cannot reach it and
+   every later run refuses for no visible reason. The release now reads the
+   backend in the same statement and, when it differs, emits a warning naming
+   the stranded key and the statement that clears it. This does not fix the
+   case — nothing in the runner can, which is why removing the session lock
+   entirely is an open question — it makes it nameable.
 4x. **The session is checked BEFORE the lock is taken, not while using it.**
    4u put the check in `_confirm_lock`, which runs once per migration APPLIED —
    so the commonest run of all never reached it. Measured: a second run over an

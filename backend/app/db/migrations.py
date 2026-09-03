@@ -671,6 +671,49 @@ async def _fence(
     # privilege. So restore what was in force on the way in, exactly as ledger
     # discovery does.
     entry_path = str(await conn.scalar(sa.text("SHOW search_path")))
+
+    # That statement is also how we learn there IS a transaction. With
+    # `isolation_level="AUTOCOMMIT"` SQLAlchemy's begin() is a facade over a
+    # DBAPI that commits every statement: the lock below would be released
+    # immediately, the migration SQL would commit on its own, and the guard in
+    # _run_sql would report a refusal with the schema change already durable and
+    # no history row — measured, `widget` created, 0 rows in schema_migrations,
+    # exit 2. This is before any migration SQL runs.
+    raw = (await conn.get_raw_connection()).driver_connection
+    if not raw.is_in_transaction():
+        raise MigrationError(
+            "this engine does not give the runner a transaction — its statements commit as "
+            "they execute, which is what isolation_level='AUTOCOMMIT' does. A migration and "
+            "its history row have to commit together, so there is nothing safe to do with "
+            "such an engine. Pass one with the default transactional behaviour. Nothing has "
+            "been applied"
+        )
+
+    # The re-read below is only worth anything at an isolation level that
+    # re-reads. Under REPEATABLE READ the lock statement establishes this
+    # transaction's snapshot BEFORE it waits for the winner, so afterwards the
+    # history still looks unchanged and the loser acts on a plan that has
+    # expired. Measured on an engine with `isolation_level="REPEATABLE READ"`:
+    # an apply of 003 and a rollback of 002 both committed, leaving `001, 003`,
+    # exactly as before the fence existed.
+    #
+    # Refused rather than corrected: `SET TRANSACTION ISOLATION LEVEL` has to
+    # precede every query in its transaction and the preamble has already read
+    # by the time this runs, and SQLAlchemy passes the engine's level at BEGIN
+    # so setting the session characteristic does not survive either — both
+    # measured. The level is READ from the server rather than inferred from the
+    # engine's configuration, so an engine that arrives at it any other way is
+    # judged the same.
+    isolation = str(await conn.scalar(sa.text("SHOW transaction_isolation")))
+    if isolation != "read committed":
+        raise MigrationError(
+            f"this engine runs its transactions at {isolation!r}, and the runner needs read "
+            "committed: the fence takes a lock and then re-reads the history, which at a "
+            "snapshot isolation level returns what it saw before it waited — so two "
+            "overlapping runs would both believe nothing had changed. Pass an engine with "
+            "the default isolation. Nothing has been applied"
+        )
+
     await _ledger(
         conn, sa.text("SELECT pg_catalog.pg_advisory_xact_lock(:k)"), {"k": WRITER_LOCK_KEY}
     )
@@ -1186,7 +1229,7 @@ async def _restore_session(conn: AsyncConnection) -> None:
     await _discard(conn)
 
 
-async def _unlock(conn: AsyncConnection, *, emit: Emit) -> None:
+async def _unlock(conn: AsyncConnection, *, emit: Emit, backend: int | None = None) -> None:
     """Release explicitly — closing the connection only returns it to the pool.
 
     A session-level lock left on a pooled connection stays held: another engine
@@ -1209,10 +1252,38 @@ async def _unlock(conn: AsyncConnection, *, emit: Emit) -> None:
     """
     try:
         await conn.rollback()
-        await conn.execute(
-            sa.text("SELECT pg_catalog.pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY}
-        )
+        # The backend is read in the SAME statement that releases, so what is
+        # compared is the session that actually ran the release.
+        #
+        # This is the last chance to notice a connection that is not one
+        # session. The check before the lock is a probe and can miss a quiet
+        # pooler, and it runs once — a run that applies nothing does no other
+        # session check at all. If the release landed on a different backend
+        # from the one that took the key, the key is still held by a backend
+        # nothing here can reach, and every later run will refuse with "another
+        # migration run holds the advisory lock" until somebody terminates it.
+        # Saying so is the difference between a deployment that is stuck for a
+        # nameable reason and one that is stuck for no visible reason at all.
+        released = (
+            await conn.execute(
+                sa.text(
+                    "SELECT pg_catalog.pg_advisory_unlock(:k) AS released, "
+                    "pg_catalog.pg_backend_pid() AS backend"
+                ),
+                {"k": ADVISORY_LOCK_KEY},
+            )
+        ).one()
         await conn.commit()
+        if backend is not None and released.backend != backend:
+            emit(
+                f"WARNING: the run lock was taken on backend {backend} but released on "
+                f"{released.backend}, so it was NOT released and is now held by a backend "
+                "this process cannot reach — every later migration run will refuse until it "
+                "is. This connection is not a single PostgreSQL session, which is what a "
+                "transaction-pooling proxy does. To clear it: SELECT pg_terminate_backend("
+                f"pid) FROM pg_locks WHERE locktype = 'advisory' AND classid = {_LOCK_CLASSID}"
+                f" AND objid = {_LOCK_OBJID}"
+            )
         # Then end the session anyway, exactly as the failure path does. The
         # release above lowers the hold count by one, which is right only if the
         # count was one — and the check in _lock is what establishes that for
@@ -1258,6 +1329,11 @@ async def apply_pending(
         # _lock is INSIDE the guarded region: PostgreSQL may grant the lock and
         # the caller be cancelled before the result is seen, which would return
         # a locked session to the pool with nothing arranged to release it.
+        # Bound before the try: every path out of it runs the finally, including
+        # the checks that refuse BEFORE the lock is taken. `None` there is exact
+        # rather than defensive — no key was taken, so there is no backend to
+        # compare the release against.
+        lock_pid: int | None = None
         try:
             await _require_a_stable_session(lock_conn)
             lock_pid = await _lock(lock_conn)
@@ -1336,7 +1412,7 @@ async def apply_pending(
             try:
                 await _restore_session(conn)
             finally:
-                await _unlock(lock_conn, emit=emit)
+                await _unlock(lock_conn, emit=emit, backend=lock_pid)
     return applied_count
 
 
@@ -1367,6 +1443,11 @@ async def downgrade_to(
         lock_conn, conn = await _two_connections(engine, stack)
         # The lock is taken inside the region that releases it, so a
         # cancellation landing on the grant cannot strand it.
+        # Bound before the try: every path out of it runs the finally, including
+        # the checks that refuse BEFORE the lock is taken. `None` there is exact
+        # rather than defensive — no key was taken, so there is no backend to
+        # compare the release against.
+        lock_pid: int | None = None
         try:
             await _require_a_stable_session(lock_conn)
             lock_pid = await _lock(lock_conn)
@@ -1484,7 +1565,7 @@ async def downgrade_to(
             try:
                 await _restore_session(conn)
             finally:
-                await _unlock(lock_conn, emit=emit)
+                await _unlock(lock_conn, emit=emit, backend=lock_pid)
     return len(doomed)
 
 
