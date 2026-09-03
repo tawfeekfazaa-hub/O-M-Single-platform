@@ -63,6 +63,20 @@ that decides the next schema's shape.
    false alarm. Text analysis is the guard, not the guarantee: after every
    migration the runner asks the driver whether the transaction is still open,
    which holds however the transaction was ended.
+
+   Reading SQL without parsing it is exactly the kind of code that is
+   confidently wrong, so three measured false negatives are recorded here
+   rather than only fixed: `$` is legal inside an unquoted identifier, so
+   reading the `$$` of `foo$$` as a dollar quote blanked the file through to
+   the next `$$` and hid a real `COMMIT`; one `BEGIN ATOMIC` body used to
+   exempt *every* `END` in the file rather than its own; and with
+   `standard_conforming_strings` off the server read `'it\'s'` as one string
+   where the guard read two, so a `COMMIT` the guard thought was quoted was
+   real SQL — both tables committed with no history row. The first two are
+   scanner fixes. The third is not fixable in the scanner, because the same
+   text has two valid readings: the migration transaction now begins with
+   `SET LOCAL standard_conforming_strings = on`, which makes the server's
+   reading and the guard's the same one.
 4d. **Cleanup never replaces the failure it is cleaning up after.** Rolling back
    and releasing the lock both run in `finally`, and both raise when the failure
    was the database going away — replacing the `MigrationError` the CLI knows
@@ -70,7 +84,22 @@ that decides the next schema's shape.
    backend was terminated surfaced as `InterfaceError: cannot call
    Transaction.rollback()`. Cleanup failures are now suppressed in favour of the
    original error, and the connection is discarded rather than returned to the
-   pool, which ends its session and the session-scoped lock with it.
+   pool, which ends its session and the session-scoped lock with it. That
+   handler catches `BaseException`, not `Exception`: `asyncio.CancelledError`
+   inherits straight from `BaseException`, and a caller cancelling mid-cleanup
+   otherwise skipped it entirely and returned a still-locked session to the
+   pool — where the same pool's next call succeeds reentrantly while every
+   other process blocks, so the leak is invisible from inside the process that
+   caused it. Measured with cancellation delivered before `pg_advisory_unlock`:
+   another engine could not take the lock.
+4f. **A database problem is a refusal, not a traceback.** The documented exit
+   contract is 0/1/2, and the runner's taxonomy only covers what the runner
+   itself recognises. Measured: with the server not running the CLI printed a
+   `ConnectionRefusedError` traceback, and a pooled connection killed by a
+   restart escaped as an asyncpg `InternalClientError` — from the lock step,
+   before any migration ran. The CLI now reports any unrecognised failure as a
+   refusal naming the exception TYPE only, since a connection error's message
+   carries the host and port.
 4e. **Every refusal has a way forward that is not hand-editing
    `schema_migrations`.** A rollback file written *after* its migration was
    applied has a NULL recorded `down_checksum`, which rollback refuses and

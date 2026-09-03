@@ -23,7 +23,9 @@ unverifiable legacy row, or a history that is no longer a prefix of the
 sequence — so it can be used as a deployment gate.
 
 Exit codes: `0` success, `1` no `DATABASE_URL`, `2` the run was refused (the
-message says why). A refusal never leaves the schema half-changed.
+message says why). A refusal never leaves the schema half-changed. A database
+that cannot be reached is a refusal too, reported by exception type rather than
+message — a connection error's text carries the host and port.
 
 ## The guarantees
 
@@ -71,7 +73,13 @@ message says why). A refusal never leaves the schema half-changed.
   rejected on the way in. (A `COMMIT` inside a `$$ … $$` function body, a string
   or a comment is fine — only real transaction control counts, and a
   `BEGIN ATOMIC … END` function body is recognised as a body, not a
-  transaction.)
+  transaction — though only for the `END` that closes it.)
+- Migrations are executed with `standard_conforming_strings = on`, set on the
+  migration's own transaction, whatever the database or role default is. So a
+  backslash in an ordinary `'...'` literal is a backslash; use `E'...'` if you
+  want escapes. This is not a style preference: with the setting off, the same
+  file means two different things to the server and to the guard above, and a
+  `COMMIT` the guard reads as quoted text is one the server executes.
 - Anything that cannot run inside a transaction — `CREATE INDEX CONCURRENTLY`,
   `VACUUM` — cannot be a migration here. Do it as an operator step.
 - Write the paired `NNN_lower_snake.down.sql` at the same time. A migration

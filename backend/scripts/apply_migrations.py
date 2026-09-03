@@ -93,6 +93,15 @@ async def main() -> int:
         # Names and reasons only — never file contents, never connection details.
         print(f"migration refused: {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:
+        # The documented contract is that a failed run exits 2 with a reason.
+        # Anything the runner did not itself recognise would otherwise reach the
+        # operator as a traceback — measured with the server simply not running
+        # (ConnectionRefusedError) and with a pooled connection killed by a
+        # restart (an asyncpg InternalClientError). The exception TYPE only: a
+        # connection error's message carries the host and port.
+        print(f"migration refused: the run failed ({type(exc).__name__})", file=sys.stderr)
+        return 2
     finally:
         await engine.dispose()
     return 0

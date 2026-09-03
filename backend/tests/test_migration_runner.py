@@ -12,12 +12,15 @@ PostgreSQL as well.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.db import migrations as migrations_module
@@ -857,3 +860,138 @@ async def test_a_sql_standard_function_body_applies_end_to_end(
     # And the transaction survived it, which is what the carve-out relies on:
     # the history row is there, so the pairing held.
     assert "003_third.sql" in await applied_names(db_engine)
+
+
+async def test_a_connection_lost_before_a_migration_starts_stays_in_the_taxonomy(
+    db_engine: AsyncEngine, migrations_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The disconnect window the taxonomy used to miss: after the lock is taken,
+    # before the migration's own SQL runs. The statement that opens the
+    # transaction is the first thing to touch a connection that may already be
+    # dead, and it sat outside the block that translates driver errors, so it
+    # reached the CLI as a traceback instead of the documented refusal.
+    real_execute = migrations_module.AsyncConnection.execute
+
+    async def die_on_the_primer(self, statement, *args, **kwargs):
+        if "standard_conforming_strings" in str(statement):
+            raise DBAPIError("SET LOCAL ...", None, Exception("connection is closed"))
+        return await real_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(migrations_module.AsyncConnection, "execute", die_on_the_primer)
+
+    with pytest.raises(MigrationError, match="could not be started"):
+        await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+
+    monkeypatch.undo()
+    assert not await table_exists(db_engine, "widget")
+    assert await applied_names(db_engine) == []
+
+
+async def test_cancelling_a_run_mid_cleanup_still_frees_the_lock(
+    db_url: URL, migrations_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # asyncio.CancelledError inherits from BaseException, so an `except
+    # Exception` around the unlock skips it entirely and the session goes back
+    # to the pool still holding the lock. The same pool's next call then
+    # succeeds reentrantly while every other process blocks — the leak is
+    # invisible from inside the process that caused it.
+    engine = create_async_engine(db_url)
+    real_rollback = migrations_module.AsyncConnection.rollback
+
+    async def cancel_before_the_unlock(self, *args, **kwargs):
+        # _unlock's first await. Cancel, then yield so the CancelledError lands
+        # here — before pg_advisory_unlock is ever sent.
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+        return await real_rollback(self, *args, **kwargs)
+
+    monkeypatch.setattr(migrations_module.AsyncConnection, "rollback", cancel_before_the_unlock)
+
+    task = asyncio.create_task(apply_pending(engine, migrations_dir, emit=lambda _: None))
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    monkeypatch.undo()
+
+    # The caller's engine is still alive, as a library caller's would be.
+    other = create_async_engine(db_url)
+    try:
+        async with other.connect() as conn:
+            assert await conn.scalar(
+                sa.text("SELECT pg_try_advisory_lock(:k)"),
+                {"k": migrations_module.ADVISORY_LOCK_KEY},
+            )
+    finally:
+        await other.dispose()
+        await engine.dispose()
+
+
+async def test_migrations_are_lexed_as_standard_strings_whatever_the_database_default(
+    db_url: URL, migrations_dir: Path
+):
+    # standard_conforming_strings can be turned off per database or per role.
+    # With it off, PostgreSQL honours backslash escapes in ORDINARY literals, so
+    # 'it\'s' is one string and the COMMIT after it is real SQL — while the
+    # guard reads the same text as two strings with the COMMIT inside the
+    # second, and waves it through. Measured before the fix: both tables were
+    # created and committed, with no history row.
+    admin = create_async_engine(db_url, isolation_level="AUTOCOMMIT")
+    try:
+        async with admin.connect() as conn:
+            await conn.execute(
+                sa.text(f'ALTER DATABASE "{db_url.database}" SET standard_conforming_strings = off')
+            )
+    finally:
+        await admin.dispose()
+
+    engine = create_async_engine(db_url)
+    try:
+        async with engine.connect() as conn:
+            assert await conn.scalar(sa.text("SHOW standard_conforming_strings")) == "off"
+
+        write_pair(
+            migrations_dir,
+            "003_third",
+            "CREATE TABLE note (body TEXT DEFAULT 'it\\'s');\nCOMMIT;\n"
+            "CREATE TABLE smuggled (id INT);",
+            "DROP TABLE IF EXISTS note;",
+        )
+        with pytest.raises(MigrationError):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+
+        # Nothing was smuggled past the guard, because the server lexed the file
+        # the same way the guard did.
+        assert not await table_exists(engine, "smuggled")
+        assert not await table_exists(engine, "note")
+    finally:
+        await engine.dispose()
+
+
+async def test_the_cli_reports_an_unreachable_database_as_a_refusal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    # The documented contract is exit 2 with a reason. A server that is simply
+    # not running used to print a ConnectionRefusedError traceback instead —
+    # and that message carries the host and port, which nothing else in this
+    # module lets into the output.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "apply_migrations_cli",
+        Path(__file__).resolve().parents[1] / "scripts" / "apply_migrations.py",
+    )
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    closed_port = "postgresql+asyncpg://nobody@127.0.0.1:1/nothing"
+    monkeypatch.setattr(
+        cli,
+        "_parse_args",
+        lambda: argparse.Namespace(status=False, down_to=None, adopt_legacy_checksums=False),
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: SimpleNamespace(database_url=closed_port))
+
+    assert await cli.main() == 2
+    err = capsys.readouterr().err
+    assert err.startswith("migration refused: the run failed (")
+    assert "127.0.0.1" not in err and "1" not in err.split("(")[0]

@@ -46,6 +46,12 @@ def write(tmp_path: Path, sql: str, *, down: str | None = None) -> Path:
         "SAVEPOINT s;\nCREATE TABLE widget (id INT);\nRELEASE SAVEPOINT s;",
         "PREPARE TRANSACTION 'x';",
         "\n\n   COMMIT   ;\n",  # leading blank statements and loose spacing
+        # PostgreSQL accepts `$` inside an unquoted identifier, so `foo$$` is a
+        # table name. Reading its `$$` as a dollar-quote opener blanks the file
+        # through to the next `$$`, hiding the COMMIT in between.
+        "CREATE TABLE foo$$ (id int); COMMIT; CREATE TABLE bar$$ (id int);",
+        # A genuine END after a BEGIN ATOMIC body: PostgreSQL commits on it.
+        "CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1; END; END;",
     ],
 )
 def test_a_migration_that_manages_its_own_transaction_is_refused(tmp_path: Path, sql: str):
@@ -116,6 +122,18 @@ def test_the_refusal_names_what_it_found(tmp_path: Path):
             "CREATE FUNCTION f(n INT) RETURNS INT LANGUAGE SQL\nBEGIN ATOMIC\n"
             "  SELECT CASE WHEN n > 0 THEN 1 ELSE 0 END;\nEND;",
         ),
+        (
+            # One exemption per body, so two bodies must both be exempt.
+            "two sql-standard function bodies",
+            "CREATE FUNCTION a() RETURNS INT LANGUAGE SQL BEGIN ATOMIC SELECT 1; END;\n"
+            "CREATE FUNCTION b() RETURNS INT LANGUAGE SQL BEGIN ATOMIC SELECT 2; END;",
+        ),
+        (
+            # The identifier rule must not break real dollar quoting elsewhere.
+            "dollar-quoted body beside an identifier containing $",
+            "CREATE TABLE tbl$x (id INT);\n"
+            "CREATE FUNCTION f() RETURNS INT AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql;",
+        ),
     ],
 )
 def test_transaction_keywords_that_are_not_transaction_control_are_allowed(
@@ -144,3 +162,26 @@ def test_a_real_commit_is_still_refused_beside_a_sql_standard_function_body(tmp_
     )
     with pytest.raises(MigrationError, match="manages its own transaction"):
         read_migration(path)
+
+
+def test_a_commit_between_identifiers_containing_dollars_is_still_found(tmp_path: Path):
+    # The narrow version of the case above: the COMMIT sits exactly where a
+    # naive dollar-quote reading would blank it.
+    with pytest.raises(MigrationError) as excinfo:
+        read_migration(
+            write(tmp_path, "CREATE TABLE foo$$ (id int); COMMIT; CREATE TABLE bar$$ (id int);")
+        )
+    assert "COMMIT" in str(excinfo.value)
+
+
+def test_the_end_exemption_is_spent_by_the_body_that_earned_it(tmp_path: Path):
+    # One BEGIN ATOMIC exempts exactly one statement-initial END. The second is
+    # a transaction commit and must still be refused.
+    with pytest.raises(MigrationError) as excinfo:
+        read_migration(
+            write(
+                tmp_path,
+                "CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1; END; END;",
+            )
+        )
+    assert "END" in str(excinfo.value)

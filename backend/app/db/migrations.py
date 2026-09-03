@@ -110,6 +110,16 @@ _BEGIN_ATOMIC = re.compile(r"\bBEGIN\s+ATOMIC\b", re.IGNORECASE)
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _ident_char(ch: str) -> bool:
+    """Whether ``ch`` can continue an unquoted PostgreSQL identifier.
+
+    Deliberately liberal: treating a character as part of an identifier can
+    only make the scanner blank LESS, which risks a false alarm. Treating one
+    as a delimiter blanks more, which risks missing a real COMMIT.
+    """
+    return ch.isalnum() or ch in "_$"
+
+
 def _blank_quoted_and_commented(sql: str) -> str:
     """Replace comments and quoted text with spaces, keeping every other offset.
 
@@ -173,7 +183,17 @@ def _blank_quoted_and_commented(sql: str) -> str:
             end = scan_quote(i, ch, escaped)
             blank(i, end)
             i = end
-        elif ch == "$" and (tag := _DOLLAR_TAG.match(sql, i)):
+        elif (
+            ch == "$"
+            and not _ident_char(sql[i - 1] if i else "")
+            and (tag := _DOLLAR_TAG.match(sql, i))
+        ):
+            # A `$` that CONTINUES an identifier does not open a dollar quote:
+            # PostgreSQL accepts `foo$$` as a table name, and reading its `$$`
+            # as an opener blanks everything up to the next `$$` in the file —
+            # hiding any real COMMIT in between. Closing is deliberately not
+            # boundary-checked: PostgreSQL ends a dollar-quoted string at the
+            # first literal occurrence of the tag, wherever it falls.
             close = sql.find(tag.group(0), tag.end())
             end = n if close == -1 else close + len(tag.group(0))
             blank(i, end)
@@ -190,26 +210,29 @@ def _transaction_control(sql: str) -> list[str]:
     is the post-execution check in :func:`_run_sql`, which measures whether the
     transaction is still open rather than inferring it from the text.
     """
-    blanked = _blank_quoted_and_commented(sql)
-    # The ``END`` closing a ``BEGIN ATOMIC`` body is not transaction control,
-    # and finding where that body ends needs a real parser — the statements
-    # inside it can carry their own ``CASE ... END``. So in a file that has one,
-    # ``END`` is left to the post-execution check, which measures the
-    # transaction instead of reading the text. Every other keyword still
-    # applies, so a genuine ``COMMIT;`` in such a file is still refused here.
-    control = _TX_CONTROL - {"END"} if _BEGIN_ATOMIC.search(blanked) else _TX_CONTROL
-
     found: list[str] = []
-    for statement in blanked.split(";"):
+    open_bodies = 0
+    for statement in _blank_quoted_and_commented(sql).split(";"):
         words = _WORD.findall(statement)
         if not words:
             continue
         first = words[0].upper()
         second = words[1].upper() if len(words) > 1 else ""
-        if first in control:
+
+        if first == "END" and open_bodies:
+            # This END closes a BEGIN ATOMIC body rather than a transaction.
+            # Statements INSIDE such a body never begin with END — a
+            # `CASE ... END` sits mid-statement — so the first statement-initial
+            # END after the body opened is precisely its terminator. Counting
+            # them keeps the exemption to the body: a second END, with no body
+            # left open, is a COMMIT synonym and is still refused.
+            open_bodies -= 1
+            continue
+        if first in _TX_CONTROL:
             found.append(first)
         elif (first, second) in _TX_CONTROL_PAIRS:
             found.append(f"{first} {second}")
+        open_bodies += len(_BEGIN_ATOMIC.findall(statement))
     return found
 
 
@@ -456,18 +479,31 @@ async def _run_sql(conn: AsyncConnection, sql: str, *, filename: str) -> None:
 
     The text comes from the Migration read at discovery and is never re-read.
     """
-    # SQLAlchemy's transaction is lazy: conn.begin() creates the transaction
-    # OBJECT, but asyncpg only opens the real one when a statement goes through
-    # the adapter. Reaching for the driver first would run the migration in its
-    # own implicit transaction, committing independently of the bookkeeping row
-    # that follows — measured: the DDL survived a rollback that should have
-    # discarded it, which would leave a schema advanced with no history, or
-    # history without its schema. This statement forces the transaction open so
-    # the raw call joins it and the two commit or roll back together.
-    await conn.execute(sa.text("SELECT 1"))
+    # This one statement does two load-bearing jobs, which is why it is not the
+    # no-op it resembles:
+    #
+    # 1. It opens the transaction. SQLAlchemy's is lazy — conn.begin() creates
+    #    the transaction OBJECT, but asyncpg opens the real one only when a
+    #    statement goes through the adapter. Reaching for the driver first would
+    #    run the migration in its own implicit transaction, committing
+    #    independently of the bookkeeping row that follows — measured: the DDL
+    #    survived a rollback that should have discarded it.
+    # 2. It pins how the migration text is lexed. With
+    #    standard_conforming_strings OFF (settable per database or per role),
+    #    PostgreSQL honours backslash escapes in ordinary literals, so
+    #    'it\'s' is ONE string — while the guard in read_migration() reads it as
+    #    two and blanks whatever follows, which could include a real COMMIT.
+    #    Forcing it on makes the guard's reading and the server's the same.
+    #    SET LOCAL, so it lasts exactly as long as this migration's transaction.
+    try:
+        await conn.execute(sa.text("SET LOCAL standard_conforming_strings = on"))
+        driver = (await conn.get_raw_connection()).driver_connection
+    except Exception as exc:
+        # Outside the block below, this would escape the taxonomy: a connection
+        # lost between taking the lock and starting the migration is an ordinary
+        # disconnect, and the CLI catches only MigrationError.
+        raise MigrationError(f"{filename} could not be started: {type(exc).__name__}") from exc
 
-    raw = await conn.get_raw_connection()
-    driver = raw.driver_connection
     try:
         await driver.execute(sql)
     except Exception as exc:
@@ -529,6 +565,21 @@ async def _lock(conn: AsyncConnection) -> None:
     await conn.commit()
 
 
+async def _discard(conn: AsyncConnection) -> None:
+    """End this connection's session, best effort, however broken it is.
+
+    Ending the session is what actually releases a session-scoped advisory
+    lock, so this must not depend on the connection still working — and under
+    cancellation even the async path can be interrupted again, which is why the
+    synchronous fallback exists.
+    """
+    with suppress(BaseException):
+        await conn.invalidate()
+        return
+    with suppress(BaseException):  # pragma: no cover - only reachable mid-cancel
+        conn.sync_connection.invalidate()  # type: ignore[union-attr]
+
+
 async def _unlock(conn: AsyncConnection, *, emit: Emit) -> None:
     """Release explicitly — closing the connection only returns it to the pool.
 
@@ -548,11 +599,15 @@ async def _unlock(conn: AsyncConnection, *, emit: Emit) -> None:
         await conn.rollback()
         await conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY})
         await conn.commit()
-    except Exception as exc:
-        try:
-            await conn.invalidate()
-        except Exception:  # pragma: no cover - the connection was already gone
-            pass
+    except BaseException as exc:
+        # BaseException, not Exception: asyncio.CancelledError inherits straight
+        # from BaseException, so a caller cancelling mid-cleanup used to skip the
+        # handler entirely and return a still-locked session to the pool — where
+        # the same pool's next call succeeds reentrantly while every other
+        # process blocks. Measured: another engine could not take the lock.
+        await _discard(conn)
+        if not isinstance(exc, Exception):
+            raise  # cancellation is the caller's to see; the lock is gone now
         emit(
             f"note: the advisory lock could not be released cleanly ({type(exc).__name__}); "
             "the connection was discarded, which ends its session and the lock with it"
