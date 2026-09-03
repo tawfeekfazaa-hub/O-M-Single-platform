@@ -156,6 +156,37 @@ message — a connection error's text carries the host and port.
 
 ## When something goes wrong
 
+**"the migration history changed while this run was working"**
+Two migration runs overlapped and this one lost. Its work was rolled back before
+the migration SQL ran, so nothing of it took effect and the other run's result
+stands — the database is consistent and needs no repair. Re-run to apply whatever
+the winner did not reach. Then find why two runs started: that is the actual
+fault, and a short `idle_in_transaction_session_timeout` or a connection proxy
+closing an idle lock session mid-run makes it likelier.
+
+**"this connection served one statement on backend N and the next on M"**
+`DATABASE_URL` points at a transaction-pooling proxy — PgBouncer in `transaction`
+mode, or similar. The runner's exclusion is a session-level advisory lock, which
+belongs to one backend, and a transaction pooler hands that backend to somebody
+else between transactions. This is checked before the run lock is taken, so
+nothing has been applied and no lock has been left anywhere. Point `DATABASE_URL`
+at the server directly, or at a session-pooled port (PgBouncer's `session` mode);
+migrations are a once-per-deploy operation and do not need the pooler. Note the
+check can only see a pooler that actually moved the connection between two
+statements — a quiet one may pass it — so treat a green run through a pooler as
+unverified rather than proven.
+
+**"the run lock was taken on backend N but this connection is now backend M"**
+The same cause as above, caught later: the connection stopped being one session
+part-way through a run. Nothing further has been applied. Same fix.
+
+**"was adopted by another run while this one was adopting it"**
+Two runs used `--adopt-legacy-checksums` at once. Adoption records a baseline on
+your word that the database matches one specific file, so the runner will not
+choose between two answers: the loser is refused and nothing is applied. Run
+`--status` to see which baseline is now recorded, confirm the database matches
+*that* checkout, then re-run. Then find why two runs started.
+
 **"no forward migrations found in ..."**
 The directory exists but holds no `NNN_name.sql` file — usually a deployment
 artifact that did not include them, or a checkout with only `.down.sql` files
