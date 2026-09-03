@@ -1,27 +1,53 @@
-"""Apply SQL migrations from backend/migrations/ in filename order.
+"""Apply (or roll back) the SQL migrations in backend/migrations/.
 
-Usage: DATABASE_URL=postgresql+asyncpg://... python scripts/apply_migrations.py
-Tracks applied files in schema_migrations; each migration runs in its own
-transaction and is applied at most once.
+    DATABASE_URL=postgresql+asyncpg://... python scripts/apply_migrations.py
+    DATABASE_URL=... python scripts/apply_migrations.py --status
+    DATABASE_URL=... python scripts/apply_migrations.py --down-to 001_initial_schema.sql
+    DATABASE_URL=... python scripts/apply_migrations.py --down-to base
+
+The runner itself lives in app/db/migrations.py so it can be exercised by the
+integration tests; this file is the operator entry point. Rollback and recovery
+procedures are documented in docs/MIGRATIONS.md.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
 from pathlib import Path
 
-import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import get_settings  # noqa: E402
+from app.db.migrations import (  # noqa: E402
+    MigrationError,
+    apply_pending,
+    downgrade_to,
+    status,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--status", action="store_true", help="list migrations and whether each is applied"
+    )
+    group.add_argument(
+        "--down-to",
+        metavar="FILENAME|base",
+        help="roll back every migration applied AFTER this one ('base' unwinds all)",
+    )
+    return parser.parse_args()
+
+
 async def main() -> int:
+    args = _parse_args()
     settings = get_settings()
     if not settings.database_url:
         print("DATABASE_URL is not set — nothing to migrate.", file=sys.stderr)
@@ -29,34 +55,21 @@ async def main() -> int:
 
     engine = create_async_engine(settings.database_url)
     try:
-        async with engine.begin() as conn:
-            await conn.execute(
-                sa.text(
-                    "CREATE TABLE IF NOT EXISTS schema_migrations ("
-                    "  filename TEXT PRIMARY KEY,"
-                    "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
-                    ")"
-                )
-            )
-            applied = {
-                row.filename
-                for row in await conn.execute(sa.text("SELECT filename FROM schema_migrations"))
-            }
-
-        for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            if path.name in applied:
-                print(f"skip  {path.name}")
-                continue
-            async with engine.begin() as conn:
-                # asyncpg prepares statements, which forbids multi-statement
-                # strings — run migration files on the raw driver connection.
-                raw = await conn.get_raw_connection()
-                await raw.driver_connection.execute(path.read_text())
-                await conn.execute(
-                    sa.text("INSERT INTO schema_migrations (filename) VALUES (:f)"),
-                    {"f": path.name},
-                )
-            print(f"apply {path.name}")
+        if args.status:
+            for state in await status(engine, MIGRATIONS_DIR):
+                mark = "applied" if state.applied else "pending"
+                down = "" if state.has_down else "   (no .down.sql)"
+                print(f"{mark:8} {state.filename}{down}")
+        elif args.down_to:
+            count = await downgrade_to(engine, MIGRATIONS_DIR, args.down_to)
+            print(f"rolled back {count} migration(s)")
+        else:
+            count = await apply_pending(engine, MIGRATIONS_DIR)
+            print(f"applied {count} migration(s)")
+    except MigrationError as exc:
+        # Names and reasons only — never file contents, never connection details.
+        print(f"migration refused: {exc}", file=sys.stderr)
+        return 2
     finally:
         await engine.dispose()
     return 0
