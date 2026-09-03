@@ -14,13 +14,31 @@ that decides the next schema's shape.
    ORM migration framework — and introducing such a framework in the same change
    as the schema would double the review surface. Revisit as a standalone change
    after PR-2.
-2. **An applied migration is immutable, enforced not documented.**
-   `schema_migrations` gains a `checksum` column; every run re-verifies it and
-   refuses the whole run on a mismatch, a deleted file, or a file that cannot be
-   ordered. Rows written by the PR-1 runner have no checksum: the current file is
-   adopted as their baseline and the adoption is announced, because the original
-   content is unknowable. The checksum is taken over newline-normalized content
-   so a CRLF checkout (README documents a Windows workflow) cannot brick it.
+2. **An applied migration is immutable, and so is its rollback.**
+   `schema_migrations` records a checksum for the forward file AND for its
+   `.down.sql`; every run re-verifies both and refuses the whole run on a
+   mismatch or a deleted file. A rollback file is as destructive as the forward
+   file is constructive — one edited after the fact was observed dropping a
+   table belonging to a different migration while every preflight passed — so it
+   gets the same protection. Rows written by the PR-1 runner have no checksum
+   and are **refused** rather than adopted: recording the current file's hash
+   would declare the database verified against SQL that may never have run
+   there, which is the exact drift the checksum exists to reveal. Adoption is a
+   deliberate operator action (`--adopt-legacy-checksums`) and is announced as
+   an unverified baseline. The checksum is taken over newline-normalized content
+   so a CRLF checkout (README documents a Windows workflow) cannot brick it, and
+   that same normalized text is what gets executed, so "checksummed" and
+   "executed" cannot diverge if a file is replaced mid-run.
+2b. **History must be a prefix.** Applied migrations have to be the first N of
+   the discovered sequence. With 001 and 003 applied, a 002 appearing later
+   would be applied *after* 003 while the bookkeeping implied filename order —
+   and rollback, which unwinds in reverse filename order, would then run down
+   files in an order that never happened.
+2c. **`--status` reports drift instead of hiding it.** It is the command an
+   operator reaches for when something looks wrong, so it must show the same
+   inconsistencies that apply and rollback refuse to run with — including an
+   applied migration whose file is gone, which used to vanish from the output
+   entirely.
 3. **One writer at a time.** A session-level advisory lock, taken before any
    bookkeeping; a concurrent run fails immediately rather than interleaving DDL.
 4. **Every migration ships a paired `.down.sql`**, and `--down-to` verifies the
@@ -41,9 +59,19 @@ that decides the next schema's shape.
 
 **Measured constraint, deciding D2 for PR-2A1.** A TimescaleDB hypertable
 refuses any unique index that omits its partitioning column, so a surrogate `id`
-alone can never be unique on a hypertable — and therefore nothing can hold a
-foreign key referencing one. Verified against the pinned image in
+alone can never be unique on a hypertable — and a foreign key needs a unique
+constraint on what it references. Verified against the pinned image in
 `tests/test_db_schema.py`, not taken from documentation.
+
+The claim is deliberately scoped to that. A foreign key to `id` alone is
+rejected by *plain* PostgreSQL too, with the same "no unique constraint matching
+given keys" message, so a test written that way would prove nothing about
+TimescaleDB; a guard test pins that distinction so it is not lost later. The
+only remaining way to reference a hypertable is its full composite key
+`(id, partitioning_column)`, and that case is probed separately: if it ever
+succeeds, PR-2A1 gains an option it does not have today — a composite hard
+reference, at the cost of carrying the partitioning column in every referencing
+row.
 
 Consequence: raw payloads stored in a hypertable (so retention is a chunk drop
 rather than a mass DELETE) can only be referenced SOFTLY — a plain `BIGINT` with

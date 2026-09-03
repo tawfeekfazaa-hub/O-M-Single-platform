@@ -14,24 +14,41 @@ python scripts/apply_migrations.py                              # apply everythi
 python scripts/apply_migrations.py --status                     # what is applied, what is not
 python scripts/apply_migrations.py --down-to 001_initial_schema.sql   # undo everything after it
 python scripts/apply_migrations.py --down-to base               # undo everything
+python scripts/apply_migrations.py --adopt-legacy-checksums     # see the recovery notes
 ```
+
+`--status` exits `2` when any migration has drifted from what was applied, so it
+can be used as a deployment gate.
 
 Exit codes: `0` success, `1` no `DATABASE_URL`, `2` the run was refused (the
 message says why). A refusal never leaves the schema half-changed.
 
-## The four guarantees
+## The guarantees
 
-1. **An applied migration is immutable.** Its SHA-256 is stored on first apply
-   and re-verified on every later run. Editing an applied file refuses the whole
-   run — including any pending migrations behind it. The checksum is taken over
+1. **An applied migration is immutable — and so is its rollback.** A SHA-256 of
+   the forward file *and* of its `.down.sql` is stored on first apply and
+   re-verified on every later run. Editing either refuses the whole run,
+   including any pending migrations behind it. The checksum is taken over
    newline-normalized content, so a CRLF checkout does not trip it.
-2. **One writer at a time.** A session-level advisory lock is taken before
-   anything else; a second concurrent run fails immediately instead of
-   interleaving DDL.
-3. **Safe to re-run.** Re-applying is a no-op, so a retried deploy is harmless.
-4. **Every migration has a tested way back.** Each `NNN_name.sql` has a paired
+2. **What is executed is what was checksummed.** Each file is read once, at
+   discovery; that exact text is both hashed and executed. A file replaced
+   mid-run cannot record one hash and run different SQL.
+3. **History is a prefix.** Applied migrations must be the first N of the
+   sequence. A migration numbered behind ones already applied is refused —
+   applying it would make the recorded order a lie and send rollback, which
+   unwinds in reverse filename order, down the wrong path.
+4. **One writer at a time.** A session-level advisory lock is taken before
+   anything else and released explicitly, so it is not left held on a pooled
+   connection where the next call from the same process succeeds while every
+   other process blocks.
+5. **Safe to re-run.** Re-applying is a no-op, so a retried deploy is harmless.
+6. **Every migration has a tested way back.** Each `NNN_name.sql` has a paired
    `NNN_name.down.sql`, and rollback refuses to start unless *every* down file it
-   would need is present.
+   would need is present and matches what was recorded.
+7. **Nothing is trusted silently.** Rows from the pre-checksum runner are
+   refused until an operator adopts them deliberately, and every failure —
+   including a syntax error inside a migration — is reported as a refusal naming
+   the file and the error type, never the SQL.
 
 ## Writing a migration
 
@@ -55,6 +72,29 @@ change is genuinely wanted — add a new migration that makes the change. The
 checksum is doing its job: it is telling you the recorded history no longer
 describes the database.
 
+**"these migrations were applied by a runner that recorded no checksum"**
+The database was migrated by the pre-checksum runner, so what actually ran there
+is unknown. Do not adopt reflexively: confirm the schema matches the current
+files (compare against a freshly migrated database), then re-run with
+`--adopt-legacy-checksums`. The adoption is recorded as an **unverified**
+baseline and says so in its output.
+
+**"these rollback files changed after their migration was applied"**
+A `.down.sql` was edited after its forward migration ran. Nothing was unwound.
+Restore the recorded rollback file; if the rollback genuinely needs to change,
+that is a new forward migration, not an edit to history.
+
+**"applied migrations are not a prefix of the migration sequence"**
+A migration is numbered behind ones already applied — typically a branch merge
+that reused a number. Renumber it to the end of the sequence. Applying it in
+place would record an order that never happened.
+
+**"NNN_name.sql failed to execute: ..."**
+The SQL itself failed. Its transaction rolled back and nothing was recorded for
+it, so the fix is to correct the file (or add a new one, if it was already
+applied elsewhere) and re-run. The message names the file and the error type
+only — the SQL and any values stay out of logs.
+
 **"these migrations are recorded as applied but are no longer present"**
 A migration file was deleted or the checkout is on a branch that predates it.
 Check out the commit that has the file. Repairing `schema_migrations` by hand is
@@ -70,11 +110,6 @@ holder.
 Nothing was unwound. Write the missing down file first, then re-run. This check
 runs before any rollback begins precisely so a missing file cannot leave the
 schema in a state no file describes.
-
-**A migration failed part-way**
-Each migration runs in its own transaction, so it either applied fully or not at
-all, and no bookkeeping row was written for it. Fix the SQL — in a *new* file if
-the broken one was already applied elsewhere — and re-run.
 
 ## Rollback is destructive
 

@@ -43,6 +43,15 @@ def _parse_args() -> argparse.Namespace:
         metavar="FILENAME|base",
         help="roll back every migration applied AFTER this one ('base' unwinds all)",
     )
+    parser.add_argument(
+        "--adopt-legacy-checksums",
+        action="store_true",
+        help=(
+            "record checksums for migrations applied by the pre-checksum runner. "
+            "Only after confirming the database matches the current files: this "
+            "records an UNVERIFIED baseline."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -56,15 +65,29 @@ async def main() -> int:
     engine = create_async_engine(settings.database_url)
     try:
         if args.status:
+            drifted = 0
             for state in await status(engine, MIGRATIONS_DIR):
                 mark = "applied" if state.applied else "pending"
-                down = "" if state.has_down else "   (no .down.sql)"
-                print(f"{mark:8} {state.filename}{down}")
+                note = "" if state.has_down else "   (no .down.sql)"
+                if state.drift:
+                    drifted += 1
+                    note = f"   !! {state.drift}"
+                print(f"{mark:8} {state.filename}{note}")
+            if drifted:
+                print(f"\n{drifted} migration(s) drifted from what was applied.", file=sys.stderr)
+                return 2
         elif args.down_to:
-            count = await downgrade_to(engine, MIGRATIONS_DIR, args.down_to)
+            count = await downgrade_to(
+                engine,
+                MIGRATIONS_DIR,
+                args.down_to,
+                adopt_legacy=args.adopt_legacy_checksums,
+            )
             print(f"rolled back {count} migration(s)")
         else:
-            count = await apply_pending(engine, MIGRATIONS_DIR)
+            count = await apply_pending(
+                engine, MIGRATIONS_DIR, adopt_legacy=args.adopt_legacy_checksums
+            )
             print(f"applied {count} migration(s)")
     except MigrationError as exc:
         # Names and reasons only — never file contents, never connection details.

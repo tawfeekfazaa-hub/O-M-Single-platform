@@ -146,7 +146,18 @@ async def test_a_hypertable_cannot_be_keyed_without_its_partitioning_column(
 
 
 async def test_a_regular_table_cannot_foreign_key_into_a_hypertable(migrated: AsyncEngine):
-    """The same finding from the other side, stated as the design rule."""
+    """The only remaining way to reference a hypertable: its full composite key.
+
+    Referencing ``id`` alone fails on PLAIN PostgreSQL too — "no unique
+    constraint matching given keys" — so that form measures nothing about
+    TimescaleDB. The composite primary key `(id, received_at)` does exist and
+    is unique, so this is the case that actually decides whether a HARD
+    reference into raw storage is possible at all.
+
+    If this ever starts passing, PR-2A1 gains an option it does not have today:
+    a composite foreign key, at the cost of carrying ``received_at`` in every
+    referencing row. Until then, soft references stand.
+    """
     async with migrated.begin() as conn:
         await conn.execute(
             sa.text(
@@ -158,11 +169,48 @@ async def test_a_regular_table_cannot_foreign_key_into_a_hypertable(migrated: As
         )
         await conn.execute(sa.text("SELECT create_hypertable('probe_raw2', 'received_at')"))
 
-    with pytest.raises(DBAPIError):
+    with pytest.raises(DBAPIError) as excinfo:
         async with migrated.begin() as conn:
             await conn.execute(
-                sa.text("CREATE TABLE probe_child (  raw_id BIGINT REFERENCES probe_raw2(id))")
+                sa.text(
+                    "CREATE TABLE probe_child ("
+                    "  raw_id BIGINT NOT NULL,"
+                    "  raw_received_at TIMESTAMPTZ NOT NULL,"
+                    "  FOREIGN KEY (raw_id, raw_received_at)"
+                    "    REFERENCES probe_raw2 (id, received_at))"
+                )
             )
+    # Not the generic "no unique constraint" error — that would mean the key was
+    # never found, and this key exists. The refusal has to be about hypertables.
+    assert "no unique constraint" not in str(excinfo.value).lower()
+
+
+async def test_referencing_a_hypertable_by_id_alone_is_not_a_timescale_specific_result(
+    migrated: AsyncEngine,
+):
+    """Guards the finding above against being restated in a form that proves nothing.
+
+    Plain PostgreSQL rejects a foreign key to a non-unique column with exactly
+    the same error, so a test written that way would pass for a reason that has
+    nothing to do with TimescaleDB. Recording that here keeps the distinction
+    from being lost the next time these probes are edited.
+    """
+    async with migrated.begin() as conn:
+        await conn.execute(
+            sa.text(
+                "CREATE TABLE probe_plain ("
+                "  id BIGINT NOT NULL,"
+                "  received_at TIMESTAMPTZ NOT NULL,"
+                "  PRIMARY KEY (id, received_at))"
+            )
+        )  # deliberately NOT a hypertable
+
+    with pytest.raises(DBAPIError) as excinfo:
+        async with migrated.begin() as conn:
+            await conn.execute(
+                sa.text("CREATE TABLE probe_plain_child (raw_id BIGINT REFERENCES probe_plain(id))")
+            )
+    assert "no unique constraint" in str(excinfo.value).lower()
 
 
 # --------------------------------------------------------------------- #
