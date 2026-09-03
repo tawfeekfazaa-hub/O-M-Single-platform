@@ -113,6 +113,20 @@ that decides the next schema's shape.
    other process blocks, so the leak is invisible from inside the process that
    caused it. Measured with cancellation delivered before `pg_advisory_unlock`:
    another engine could not take the lock.
+4j. **The ledger cannot be redirected by the migrations it records.** Migration
+   SQL runs on the runner's connection and may legitimately `SET search_path`,
+   which would resolve a later unqualified `schema_migrations` elsewhere.
+   Measured: a migration that created `app.schema_migrations` and set the path
+   wrote its history row there, leaving the real ledger empty — so the next run
+   saw the migration as unapplied. The ledger's schema is resolved once, before
+   any migration runs, and every later statement is qualified with it; the
+   search path is reset at the start of each run, because a `SET` from a
+   previous run rides back on the pooled connection and would otherwise poison
+   that resolution.
+4k. **Two migrations may not share a sequence number.** Filename order hides a
+   reused number from the prefix rule — `002_beta` sorts after `002_alpha`, so
+   the applied set stays a prefix and a second `002` is applied. "We are at 002"
+   would then name two different schemas.
 4i. **Reporting never changes the outcome it reports.** Every announcement is
    made after the work it describes commits, so an exception from the caller's
    `emit` — a closed stdout, a logging handler that raises — turned a completed

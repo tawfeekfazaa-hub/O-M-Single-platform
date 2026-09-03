@@ -85,6 +85,11 @@ message — a connection error's text carries the host and port.
   `COMMIT` the guard reads as quoted text is one the server executes.
 - Anything that cannot run inside a transaction — `CREATE INDEX CONCURRENTLY`,
   `VACUUM` — cannot be a migration here. Do it as an operator step.
+- `SET search_path` inside a migration is allowed and affects the statements
+  after it, including later migrations in the same run. It cannot affect the
+  history table: the ledger's schema is resolved before any migration runs and
+  every bookkeeping statement is qualified with it, and each run starts by
+  resetting the search path.
 - If a value needs a carriage return in it, write the escape — `E'a\r\nb'` —
   rather than a physical CRLF in the file. Line endings are normalized by git on
   the way in and out, so they are not a reliable way to carry data, and a CR in
@@ -153,6 +158,11 @@ it: what the migration did is already committed, with no history row, so the
 next run would apply it a second time. Remove the transaction control, then
 reconcile by hand — either undo what it did, or insert its `schema_migrations`
 row once you have confirmed the schema matches the file.
+
+**"two migrations are numbered NNN: A and B"**
+A reused sequence number, usually from a branch merge. Renumber one to the end
+of the sequence. Filename order would otherwise hide it from the prefix check
+below and apply both, leaving the numeric revision ambiguous.
 
 **"applied migrations are not a prefix of the migration sequence"**
 A migration is numbered behind ones already applied — typically a branch merge

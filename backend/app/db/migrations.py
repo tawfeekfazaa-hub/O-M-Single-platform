@@ -422,6 +422,21 @@ def discover(directory: Path) -> list[Migration]:
             # cannot be ordered deterministically must not be guessed at.
             raise MigrationError(f"migration filename does not match NNN_name.sql: {path.name}")
         migrations.append(read_migration(path))
+
+    # Two files numbered the same are the branch-merge case the prefix rule is
+    # supposed to catch, but filename order hides it: `002_beta` sorts after
+    # `002_alpha`, so the applied set stays a prefix and a second `002` is
+    # applied. The recorded revision is then ambiguous — "we are at 002" names
+    # two different schemas.
+    seen: dict[str, str] = {}
+    for migration in migrations:
+        number = migration.filename[:3]
+        if number in seen:
+            raise MigrationOrderError(
+                f"two migrations are numbered {number}: {seen[number]} and "
+                f"{migration.filename} — renumber one to the end of the sequence"
+            )
+        seen[number] = migration.filename
     return migrations
 
 
@@ -431,12 +446,28 @@ class _AppliedRow:
     down_checksum: str | None
 
 
-async def _ensure_bookkeeping(conn: AsyncConnection) -> None:
-    """Create or upgrade ``schema_migrations``.
+async def _ensure_bookkeeping(conn: AsyncConnection) -> str:
+    """Create or upgrade ``schema_migrations``; return its qualified name.
 
     The PR-1 runner tracked only (filename, applied_at); the ADD COLUMN
     statements upgrade an existing deployment in place.
+
+    The RETURN VALUE is the security-relevant part. Migration SQL runs on this
+    same connection and may legitimately ``SET search_path``, which would then
+    resolve a later unqualified ``schema_migrations`` somewhere else entirely.
+    Measured: a migration that created ``app.schema_migrations`` and set the
+    search path wrote its history row there, leaving the real ledger empty — so
+    the next run saw the migration as unapplied and would apply it again.
+    Resolving the name ONCE here, before any migration has run, and qualifying
+    every later ledger statement with it, removes the redirection rather than
+    forbidding the SET.
     """
+    # Start from the session default rather than whatever is currently set. A
+    # migration's `SET search_path` persists on the connection, and the
+    # connection goes back to the pool, so WITHOUT this the next run resolves
+    # the ledger against the previous run's leftover path — found by the test
+    # for the qualification below, which re-applied an applied migration.
+    await conn.execute(sa.text("RESET search_path"))
     await conn.execute(
         sa.text(
             "CREATE TABLE IF NOT EXISTS schema_migrations ("
@@ -451,12 +482,22 @@ async def _ensure_bookkeeping(conn: AsyncConnection) -> None:
         await conn.execute(
             sa.text(f"ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS {column} TEXT")
         )
-
-
-async def _applied_rows(conn: AsyncConnection) -> dict[str, _AppliedRow]:
-    result = await conn.execute(
-        sa.text("SELECT filename, checksum, down_checksum FROM schema_migrations")
+    # quote_ident on the server, so the identifier is escaped by PostgreSQL
+    # rather than by string formatting here.
+    qualified = await conn.scalar(
+        sa.text(
+            "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.oid = to_regclass('schema_migrations')"
+        )
     )
+    if not qualified:  # pragma: no cover - it was just created
+        raise MigrationError("schema_migrations could not be resolved after creating it")
+    return str(qualified)
+
+
+async def _applied_rows(conn: AsyncConnection, ledger: str) -> dict[str, _AppliedRow]:
+    result = await conn.execute(sa.text(f"SELECT filename, checksum, down_checksum FROM {ledger}"))
     return {r.filename: _AppliedRow(r.checksum, r.down_checksum) for r in result}
 
 
@@ -483,6 +524,7 @@ async def _verify(
     conn: AsyncConnection,
     applied: dict[str, _AppliedRow],
     known: dict[str, Migration],
+    ledger: str,
     *,
     adopt_legacy: bool,
 ) -> list[str]:
@@ -544,9 +586,7 @@ async def _verify(
     for name in legacy:
         migration = known[name]
         await conn.execute(
-            sa.text(
-                "UPDATE schema_migrations SET checksum = :c, down_checksum = :d WHERE filename = :f"
-            ),
+            sa.text(f"UPDATE {ledger} SET checksum = :c, down_checksum = :d WHERE filename = :f"),
             {"c": migration.checksum, "d": migration.down_checksum, "f": name},
         )
         announcements.append(f"adopt {name}  (unverified baseline recorded on operator request)")
@@ -557,6 +597,7 @@ async def _adopt_new_rollbacks(
     conn: AsyncConnection,
     applied: dict[str, _AppliedRow],
     known: dict[str, Migration],
+    ledger: str,
 ) -> list[str]:
     """Record a rollback file that was written after its migration was applied.
 
@@ -584,7 +625,7 @@ async def _adopt_new_rollbacks(
         and known[name].down_checksum is not None
     ):
         await conn.execute(
-            sa.text("UPDATE schema_migrations SET down_checksum = :d WHERE filename = :f"),
+            sa.text(f"UPDATE {ledger} SET down_checksum = :d WHERE filename = :f"),
             {"d": known[name].down_checksum, "f": name},
         )
         applied[name] = _AppliedRow(applied[name].checksum, known[name].down_checksum)
@@ -765,13 +806,13 @@ async def apply_pending(
         # a locked session to the pool with nothing arranged to release it.
         try:
             await _lock(conn)
-            await _ensure_bookkeeping(conn)
+            ledger = await _ensure_bookkeeping(conn)
             await conn.commit()
-            applied = await _applied_rows(conn)
-            announcements = await _verify(conn, applied, known, adopt_legacy=adopt_legacy)
+            applied = await _applied_rows(conn, ledger)
+            announcements = await _verify(conn, applied, known, ledger, adopt_legacy=adopt_legacy)
             _require_prefix(migrations, applied)
             if adopt_legacy:
-                announcements += await _adopt_new_rollbacks(conn, applied, known)
+                announcements += await _adopt_new_rollbacks(conn, applied, known, ledger)
             await conn.commit()
             for line in announcements:  # only now is any of it true
                 emit(line)
@@ -784,7 +825,7 @@ async def apply_pending(
                     await _run_sql(conn, migration.content, filename=migration.filename)
                     await conn.execute(
                         sa.text(
-                            "INSERT INTO schema_migrations (filename, checksum, down_checksum) "
+                            f"INSERT INTO {ledger} (filename, checksum, down_checksum) "
                             "VALUES (:f, :c, :d)"
                         ),
                         {
@@ -826,10 +867,10 @@ async def downgrade_to(
         # it, so a cancellation landing on the grant cannot strand it.
         try:
             await _lock(conn)
-            await _ensure_bookkeeping(conn)
+            ledger = await _ensure_bookkeeping(conn)
             await conn.commit()
-            applied = await _applied_rows(conn)
-            announcements = await _verify(conn, applied, known, adopt_legacy=adopt_legacy)
+            applied = await _applied_rows(conn, ledger)
+            announcements = await _verify(conn, applied, known, ledger, adopt_legacy=adopt_legacy)
             _require_prefix(migrations, applied)
             await conn.commit()
             for line in announcements:  # only now is any of it true
@@ -884,7 +925,7 @@ async def downgrade_to(
                     assert migration.down_content is not None  # checked above
                     await _run_sql(conn, migration.down_content, filename=migration.down_filename)
                     await conn.execute(
-                        sa.text("DELETE FROM schema_migrations WHERE filename = :f"),
+                        sa.text(f"DELETE FROM {ledger} WHERE filename = :f"),
                         {"f": migration.filename},
                     )
                 if migration.filename in adopted:
@@ -912,9 +953,9 @@ async def status(engine: AsyncEngine, directory: Path) -> list[MigrationState]:
     migrations = discover(directory)
     known = {m.filename: m for m in migrations}
     async with engine.connect() as conn:
-        await _ensure_bookkeeping(conn)
+        ledger = await _ensure_bookkeeping(conn)
         await conn.commit()
-        applied = await _applied_rows(conn)
+        applied = await _applied_rows(conn, ledger)
 
     # Ordering is a property of the SEQUENCE, not of one file, so it is computed
     # once and attributed to the files that break it. Without this, the
@@ -946,7 +987,15 @@ async def status(engine: AsyncEngine, directory: Path) -> list[MigrationState]:
             elif row.down_checksum != migration.down_checksum:
                 drift = "rollback file edited after it was applied"
         if drift is None and migration.filename in out_of_order:
-            drift = "applied out of sequence (history is not a prefix)"
+            # The symmetric difference holds both halves of the disagreement:
+            # the applied migration that jumped the queue AND the pending one it
+            # jumped over. Calling the pending file "applied out of sequence"
+            # contradicted the `applied` flag on the very same row.
+            drift = (
+                "applied out of sequence (history is not a prefix)"
+                if row is not None
+                else "pending behind an applied migration (history is not a prefix)"
+            )
         states.append(
             MigrationState(migration.filename, row is not None, migration.has_down, drift)
         )

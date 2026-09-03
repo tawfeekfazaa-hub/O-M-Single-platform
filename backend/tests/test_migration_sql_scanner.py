@@ -12,6 +12,7 @@ in test_migration_runner.py.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -388,3 +389,34 @@ def test_no_migration_in_this_repository_carries_a_carriage_return():
     directory = Path(__file__).resolve().parents[1] / "migrations"
     offenders = [p.name for p in sorted(directory.glob("*.sql")) if b"\r" in p.read_bytes()]
     assert offenders == []
+
+
+def test_the_cli_prints_without_letting_a_broken_stream_change_the_result():
+    """`say` is the CLI's own reporting, and reporting must not decide outcomes.
+
+    With stdout closed, a successful run reached `print("applied N ...")` and
+    raised BrokenPipeError into the blanket handler, which reported a refusal
+    and exited 2 for migrations that had been applied.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "apply_migrations_cli",
+        Path(__file__).resolve().parents[1] / "scripts" / "apply_migrations.py",
+    )
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    class Closed:
+        def write(self, *_args: object) -> int:
+            raise BrokenPipeError("stdout is closed")
+
+        def flush(self) -> None:
+            raise BrokenPipeError("stdout is closed")
+
+    real_stdout, sys.stdout = sys.stdout, Closed()
+    try:
+        cli.say("applied 2 migration(s)")  # must not raise
+    finally:
+        sys.stdout = real_stdout

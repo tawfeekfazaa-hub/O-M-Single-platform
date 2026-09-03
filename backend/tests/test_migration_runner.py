@@ -581,7 +581,7 @@ async def test_a_migration_and_its_bookkeeping_row_commit_together(
     calls = {"n": 0}
 
     async def fail_on_bookkeeping(self, statement, *args, **kwargs):
-        if "INSERT INTO schema_migrations" in str(statement):
+        if "INSERT INTO" in str(statement) and "schema_migrations" in str(statement):
             calls["n"] += 1
             raise RuntimeError("simulated bookkeeping failure")
         return await real_execute(self, statement, *args, **kwargs)
@@ -644,9 +644,21 @@ async def test_status_reports_a_history_that_is_not_a_prefix(
     (migrations_dir / "002_second.down.sql").write_text(held_down)
 
     states = {s.filename: s for s in await status(db_engine, migrations_dir)}
-    drifted = {name for name, s in states.items() if s.drift}
-    assert "003_third.sql" in drifted
-    assert all("out of sequence" in states[name].drift for name in drifted)
+
+    # Both halves of the disagreement are reported, and each is described as
+    # what it actually is. The earlier version of this test asserted only that
+    # every drift string contained "out of sequence", which let the pending
+    # file be labelled "applied out of sequence" — contradicting the `applied`
+    # flag on the same row.
+    assert states["003_third.sql"].applied
+    assert states["003_third.sql"].drift == "applied out of sequence (history is not a prefix)"
+
+    assert not states["002_second.sql"].applied
+    assert states["002_second.sql"].drift == (
+        "pending behind an applied migration (history is not a prefix)"
+    )
+
+    assert states["001_first.sql"].drift is None  # the part of history that is fine
 
 
 async def test_status_reports_a_rollback_file_that_appeared_or_vanished(
@@ -1297,3 +1309,50 @@ async def test_only_one_body_is_opened_per_routine_definition(
     with pytest.raises(MigrationError, match="manages its own transaction"):
         await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
     assert not await table_exists(db_engine, "widget")  # the whole run is refused
+
+
+async def test_a_migration_cannot_redirect_the_ledger_with_search_path(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # Migration SQL runs on this connection and may legitimately SET
+    # search_path. If the bookkeeping statement is unqualified it then resolves
+    # somewhere else: measured, a migration that created app.schema_migrations
+    # and set the path wrote its history row there, leaving the real ledger
+    # empty — so the next run would apply the migration a second time.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE SCHEMA app;\n"
+        "CREATE TABLE app.schema_migrations ("
+        " filename TEXT PRIMARY KEY, checksum TEXT, down_checksum TEXT,"
+        " applied_at TIMESTAMPTZ NOT NULL DEFAULT now());\n"
+        "SET search_path = app;",
+        "DROP SCHEMA IF EXISTS app CASCADE;",
+    )
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+
+    async with db_engine.connect() as conn:
+        assert await conn.scalar(sa.text("SELECT count(*) FROM public.schema_migrations")) == 3
+        assert await conn.scalar(sa.text("SELECT count(*) FROM app.schema_migrations")) == 0
+
+    # The real proof: a fresh run sees all three as applied, not as pending.
+    assert await apply_pending(db_engine, migrations_dir, emit=lambda _: None) == 0
+
+
+async def test_two_migrations_may_not_share_a_sequence_number(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # Filename order hides this from the prefix rule: `002_beta` sorts after
+    # `002_alpha`, so the applied set stays a prefix and a second 002 applies.
+    # "We are at 002" would then name two different schemas.
+    write_pair(
+        migrations_dir, "002_beta", "CREATE TABLE sprocket (id INT);", "DROP TABLE sprocket;"
+    )
+
+    with pytest.raises(MigrationOrderError, match="two migrations are numbered 002"):
+        await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+    assert not await table_exists(db_engine, "widget")  # nothing ran
+
+    # And it is refused on the diagnostic path too, not only on apply.
+    with pytest.raises(MigrationOrderError, match="two migrations are numbered 002"):
+        await status(db_engine, migrations_dir)

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -30,6 +31,19 @@ from app.db.migrations import (  # noqa: E402
 )
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
+
+
+def say(message: str, *, err: bool = False) -> None:
+    """Print without letting a broken stream change the run's outcome.
+
+    The runner already refuses to let its own reporting reverse a result. These
+    are the CLI's own lines, and they were outside that: with stdout closed, a
+    successful run reached `print("applied N migration(s)")`, raised
+    BrokenPipeError into the handler below, and exited 2 — telling automation to
+    handle a refusal for migrations that had been applied.
+    """
+    with suppress(Exception):
+        print(message, file=sys.stderr if err else sys.stdout)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -68,7 +82,7 @@ async def main() -> int:
         # it is caught here.
         settings = get_settings()
         if not settings.database_url:
-            print("DATABASE_URL is not set — nothing to migrate.", file=sys.stderr)
+            say("DATABASE_URL is not set — nothing to migrate.", err=True)
             return 1
 
         engine = create_async_engine(settings.database_url)
@@ -80,9 +94,9 @@ async def main() -> int:
                 if state.drift:
                     drifted += 1
                     note = f"   !! {state.drift}"
-                print(f"{mark:8} {state.filename}{note}")
+                say(f"{mark:8} {state.filename}{note}")
             if drifted:
-                print(f"\n{drifted} migration(s) drifted from what was applied.", file=sys.stderr)
+                say(f"\n{drifted} migration(s) drifted from what was applied.", err=True)
                 return 2
         elif args.down_to is not None:  # empty string must reach validation, not apply
             count = await downgrade_to(
@@ -91,15 +105,15 @@ async def main() -> int:
                 args.down_to,
                 adopt_legacy=args.adopt_legacy_checksums,
             )
-            print(f"rolled back {count} migration(s)")
+            say(f"rolled back {count} migration(s)")
         else:
             count = await apply_pending(
                 engine, MIGRATIONS_DIR, adopt_legacy=args.adopt_legacy_checksums
             )
-            print(f"applied {count} migration(s)")
+            say(f"applied {count} migration(s)")
     except MigrationError as exc:
         # Names and reasons only — never file contents, never connection details.
-        print(f"migration refused: {exc}", file=sys.stderr)
+        say(f"migration refused: {exc}", err=True)
         return 2
     except Exception as exc:
         # The documented contract is that a failed run exits 2 with a reason.
@@ -108,7 +122,7 @@ async def main() -> int:
         # (ConnectionRefusedError) and with a pooled connection killed by a
         # restart (an asyncpg InternalClientError). The exception TYPE only: a
         # connection error's message carries the host and port.
-        print(f"migration refused: the run failed ({type(exc).__name__})", file=sys.stderr)
+        say(f"migration refused: the run failed ({type(exc).__name__})", err=True)
         return 2
     finally:
         if engine is not None:
