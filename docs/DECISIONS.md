@@ -189,6 +189,29 @@ that decides the next schema's shape.
    costs nothing to undo. A transaction-scoped lock is also the one kind
    `pg_advisory_unlock_all()` cannot release, which is why it is safe on the
    connection migration SQL shares.
+4x. **The session is checked BEFORE the lock is taken, not while using it.**
+   4u put the check in `_confirm_lock`, which runs once per migration APPLIED —
+   so the commonest run of all never reached it. Measured: a second run over an
+   unchanged directory called it zero times, while still taking the session lock
+   and releasing it on whatever backend the proxy supplied; under a pooler that
+   strands the key where nothing can reach it and every later deployment blocks.
+   The check now runs before the lock, on every run: two committed transactions,
+   and the backend must be the same in both. It DETECTS rather than guarantees —
+   a pooler with one server connection and no contention can hand back the same
+   backend twice — but it cannot false-alarm, and correctness does not rest on
+   it: the fence of 4t never outlives its transaction and holds under a pooler
+   regardless.
+4y. **Adoption cannot be a race.** Adoption is the operator vouching for one
+   specific file, so two runs adopting the same pre-checksum row from checkouts
+   with DIFFERENT content is the one thing it must not resolve silently.
+   Measured: each recorded its own baseline over the other's and both announced
+   success, with the set of recorded filenames never changing — which is why the
+   fence's original name-only snapshot could not have caught it. The fence now
+   carries each row's checksums, and the preamble (where adoption commits) is
+   fenced like any other writer. The `UPDATE` is also conditional on the row
+   still being unadopted; with the fence in place I could not construct a run
+   that reaches that guard, so it is defence in depth rather than a fix for a
+   reachable bug, and its test says so.
 4u. **The lock connection must be a real PostgreSQL session.** A session
    advisory lock belongs to one backend. Through a transaction-pooling proxy
    (PgBouncer in transaction mode) the commit in `_lock` returns the backend to

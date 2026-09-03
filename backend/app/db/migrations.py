@@ -634,7 +634,9 @@ async def _applied_rows(conn: AsyncConnection, ledger: str) -> dict[str, _Applie
     return {r.filename: _AppliedRow(r.checksum, r.down_checksum) for r in result}
 
 
-async def _fence(conn: AsyncConnection, ledger: str, expected: set[str]) -> None:
+async def _fence(
+    conn: AsyncConnection, ledger: str, expected: dict[str, tuple[str | None, str | None]]
+) -> None:
     """Serialise this writer against every other, and re-check what it assumed.
 
     Two runs can both believe they hold the run lock: the lock session can be
@@ -656,9 +658,12 @@ async def _fence(conn: AsyncConnection, ledger: str, expected: set[str]) -> None
       was built on. Without this the loser simply waits and then applies a stale
       plan.
 
-    ``expected`` is what this run last saw. Anything else means somebody else
-    committed to the ledger, so this run's remaining plan is not trustworthy —
-    whichever direction either run was going.
+    ``expected`` is what this run last saw: the whole of each row, not just its
+    name. Names alone missed a third shape — two runs adopting a legacy row with
+    DIFFERENT file contents each recorded its own checksum over the other's, with
+    the same set of filenames throughout and both runs announcing success.
+    Anything else means somebody else committed to the ledger, so this run's
+    remaining plan is not trustworthy — whichever direction either run was going.
     """
     # _ledger pins search_path to pg_catalog for the rest of the TRANSACTION, and
     # the migration runs later in this same one — under the pin its `CREATE
@@ -669,18 +674,22 @@ async def _fence(conn: AsyncConnection, ledger: str, expected: set[str]) -> None
     await _ledger(
         conn, sa.text("SELECT pg_catalog.pg_advisory_xact_lock(:k)"), {"k": WRITER_LOCK_KEY}
     )
-    rows = await _ledger(conn, sa.text(f"SELECT filename FROM {ledger}"))
-    current = {r.filename for r in rows}
+    rows = await _ledger(conn, sa.text(f"SELECT filename, checksum, down_checksum FROM {ledger}"))
+    current = {r.filename: (r.checksum, r.down_checksum) for r in rows}
     await conn.execute(
         sa.text("SELECT pg_catalog.set_config('search_path', :p, true)"), {"p": entry_path}
     )
     if current != expected:
-        appeared = sorted(current - expected)
-        vanished = sorted(expected - current)
+        appeared = sorted(set(current) - set(expected))
+        vanished = sorted(set(expected) - set(current))
+        rewritten = sorted(
+            name for name in set(current) & set(expected) if current[name] != expected[name]
+        )
         raise MigrationError(
             "the migration history changed while this run was working"
             + (f" (now recorded: {', '.join(appeared)})" if appeared else "")
             + (f" (no longer recorded: {', '.join(vanished)})" if vanished else "")
+            + (f" (recorded differently: {', '.join(rewritten)})" if rewritten else "")
             + " — another run committed to it, so two runs overlapped. This run's work has "
             "been rolled back and nothing further is applied. Check that only one migration "
             "run is started per deploy, then re-run"
@@ -771,11 +780,29 @@ async def _verify(
         )
     for name in legacy:
         migration = known[name]
-        await _ledger(
+        # `AND checksum IS NULL`, so this can only adopt a row that is STILL
+        # unadopted. Two runs adopting the same legacy row from checkouts with
+        # different content each overwrote the other's baseline and both
+        # announced success — measured, the second run's checksum won and the
+        # first was told it had recorded its own. Adoption is the operator
+        # vouching for one specific file; silently replacing that with another
+        # run's answer is the one thing it must not do.
+        adopted_now = await _ledger(
             conn,
-            sa.text(f"UPDATE {ledger} SET checksum = :c, down_checksum = :d WHERE filename = :f"),
+            sa.text(
+                f"UPDATE {ledger} SET checksum = :c, down_checksum = :d "
+                "WHERE filename = :f AND checksum IS NULL"
+            ),
             {"c": migration.checksum, "d": migration.down_checksum, "f": name},
         )
+        if adopted_now.rowcount != 1:
+            raise MigrationChecksumError(
+                f"{name} was adopted by another run while this one was adopting it, so two "
+                "runs overlapped and the baseline now recorded may be a different file's. "
+                "Nothing has been applied. Re-run --status to see what is recorded, confirm "
+                "the database matches it, then re-run"
+            )
+        applied[name] = _AppliedRow(migration.checksum, migration.down_checksum)
         announcements.append(f"adopt {name}  (unverified baseline recorded on operator request)")
     return announcements
 
@@ -811,11 +838,21 @@ async def _adopt_new_rollbacks(
         and row.down_checksum is None
         and known[name].down_checksum is not None
     ):
-        await _ledger(
+        adopted_now = await _ledger(
             conn,
-            sa.text(f"UPDATE {ledger} SET down_checksum = :d WHERE filename = :f"),
+            sa.text(
+                f"UPDATE {ledger} SET down_checksum = :d "
+                "WHERE filename = :f AND down_checksum IS NULL"
+            ),
             {"d": known[name].down_checksum, "f": name},
         )
+        if adopted_now.rowcount != 1:
+            raise MigrationChecksumError(
+                f"{name}'s rollback file was adopted by another run while this one was "
+                "adopting it, so two runs overlapped and the baseline now recorded may be a "
+                "different file's. Nothing has been applied. Re-run --status to see what is "
+                "recorded, confirm the files match it, then re-run"
+            )
         applied[name] = _AppliedRow(applied[name].checksum, known[name].down_checksum)
         announcements.append(
             f"adopt {name}  (rollback file recorded unverified on operator request)"
@@ -916,6 +953,60 @@ _LOCK_CLASSID = (ADVISORY_LOCK_KEY & 0xFFFFFFFFFFFFFFFF) >> 32
 _LOCK_OBJID = ADVISORY_LOCK_KEY & 0xFFFFFFFF
 
 
+async def _backend_pid(conn: AsyncConnection) -> int:
+    """Which PostgreSQL backend is serving this connection right now.
+
+    Asked in two places — before the lock and at every confirmation — because a
+    session-scoped lock belongs to a backend, and the whole design assumes the
+    connection keeps the same one.
+    """
+    return int(await conn.scalar(sa.text("SELECT pg_catalog.pg_backend_pid()")))
+
+
+async def _require_a_stable_session(conn: AsyncConnection) -> None:
+    """Refuse a connection that is not one PostgreSQL session, BEFORE locking it.
+
+    The run lock is session-scoped, so everything about it assumes this
+    connection is one backend for the length of the run. Through a
+    transaction-pooling proxy (PgBouncer in ``transaction`` mode) it is not: the
+    backend goes back to the proxy at every commit.
+
+    Checking after the fact was not enough, which is the finding this exists for.
+    The pid comparison in :func:`_confirm_lock` runs once per migration APPLIED —
+    so an up-to-date run never reaches it at all. Measured: a second run over an
+    unchanged directory called it zero times, while still taking the session lock
+    and then "releasing" it on whatever backend the proxy supplied. Under a
+    pooler that strands the key on a backend nobody can reach, and every later
+    deployment blocks on it. The commonest run of all is the one that was
+    unprotected.
+
+    So the check moves ahead of the lock: two committed transactions, and the
+    backend must be the same in both. Nothing is held while this runs, so a
+    refusal here costs nothing.
+
+    **This detects; it does not guarantee.** A pooler with one server connection
+    and no contention may hand back the same backend both times and pass. It
+    cannot produce a false alarm — a direct or session-pooled connection is
+    always stable — and correctness does not rest on it: the per-transaction
+    fence in :func:`_fence` never outlives its own transaction and holds under a
+    pooler regardless. What this buys is that the common misconfiguration is
+    caught and named instead of silently stranding a lock.
+    """
+    first = await _backend_pid(conn)
+    await conn.commit()
+    second = await _backend_pid(conn)
+    await conn.commit()
+    if first != second:
+        raise MigrationError(
+            f"this connection served one statement on backend {first} and the next on "
+            f"{second}, so it is not a single PostgreSQL session — which is what a "
+            "transaction-pooling proxy (PgBouncer in transaction mode) does. The run lock "
+            "is session-scoped and cannot fence a run across it, and releasing it would "
+            "strand the key on a backend nothing can reach. Point DATABASE_URL at the "
+            "server directly, or at a session-pooled port. Nothing has been applied"
+        )
+
+
 async def _lock(conn: AsyncConnection) -> int:
     # Session advisory locks are REENTRANT: taking one this session already
     # holds succeeds and raises the hold count, while the single release below
@@ -951,9 +1042,9 @@ async def _lock(conn: AsyncConnection) -> int:
     # Session-scoped, so it survives this commit and every later per-migration
     # transaction on the same connection — provided the connection keeps the
     # same session across it, which _confirm_lock is given this pid to check.
-    backend = await conn.scalar(sa.text("SELECT pg_catalog.pg_backend_pid()"))
+    backend = await _backend_pid(conn)
     await conn.commit()
-    return int(backend)
+    return backend
 
 
 async def _discard(conn: AsyncConnection) -> None:
@@ -1168,16 +1259,26 @@ async def apply_pending(
         # the caller be cancelled before the result is seen, which would return
         # a locked session to the pool with nothing arranged to release it.
         try:
+            await _require_a_stable_session(lock_conn)
             lock_pid = await _lock(lock_conn)
             ledger = await _ensure_bookkeeping(conn)
             await conn.commit()
             applied = await _applied_rows(conn, ledger)
-            expected = set(applied)  # what every writer transaction re-checks
+            # The whole row, not just the name: adoption rewrites a checksum
+            # without changing which filenames are recorded.
+            expected = {n: (r.checksum, r.down_checksum) for n, r in applied.items()}
+            # The preamble writes too — adoption commits here — so it is fenced
+            # like any other writer, and re-read under the fence.
+            await _fence(conn, ledger, expected)
             announcements = await _verify(conn, applied, known, ledger, adopt_legacy=adopt_legacy)
             _require_prefix(migrations, applied)
             if adopt_legacy:
                 announcements += await _adopt_new_rollbacks(conn, applied, known, ledger)
             await conn.commit()
+            # _verify and _adopt_new_rollbacks update `applied` with whatever they
+            # adopted, so this picks their writes up; without it the next fence
+            # would trip over this run's own adoption.
+            expected = {n: (r.checksum, r.down_checksum) for n, r in applied.items()}
             for line in announcements:  # only now is any of it true
                 emit(line)
 
@@ -1224,7 +1325,7 @@ async def apply_pending(
                             "other run's stands. Check that only one migration run is started "
                             "per deploy, then re-run"
                         ) from exc
-                expected.add(migration.filename)
+                expected[migration.filename] = (migration.checksum, migration.down_checksum)
                 emit(f"apply {migration.filename}")
                 applied_count += 1
         finally:
@@ -1267,14 +1368,24 @@ async def downgrade_to(
         # The lock is taken inside the region that releases it, so a
         # cancellation landing on the grant cannot strand it.
         try:
+            await _require_a_stable_session(lock_conn)
             lock_pid = await _lock(lock_conn)
             ledger = await _ensure_bookkeeping(conn)
             await conn.commit()
             applied = await _applied_rows(conn, ledger)
-            expected = set(applied)  # what every writer transaction re-checks
+            # The whole row, not just the name: adoption rewrites a checksum
+            # without changing which filenames are recorded.
+            expected = {n: (r.checksum, r.down_checksum) for n, r in applied.items()}
+            # The preamble writes too — adoption commits here — so it is fenced
+            # like any other writer, and re-read under the fence.
+            await _fence(conn, ledger, expected)
             announcements = await _verify(conn, applied, known, ledger, adopt_legacy=adopt_legacy)
             _require_prefix(migrations, applied)
             await conn.commit()
+            # _verify and _adopt_new_rollbacks update `applied` with whatever they
+            # adopted, so this picks their writes up; without it the next fence
+            # would trip over this run's own adoption.
+            expected = {n: (r.checksum, r.down_checksum) for n, r in applied.items()}
             for line in announcements:  # only now is any of it true
                 emit(line)
 
@@ -1363,7 +1474,7 @@ async def downgrade_to(
                         f"adopt {migration.filename}  "
                         "(unverified rollback executed on operator request)"
                     )
-                expected.discard(migration.filename)
+                expected.pop(migration.filename, None)
                 emit(f"down  {migration.filename}")
         finally:
             # Nested, not sequential: _restore_session suppresses Exceptions but

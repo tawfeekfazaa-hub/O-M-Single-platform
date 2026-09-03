@@ -34,6 +34,7 @@ from app.db.migrations import (
     MigrationError,
     MigrationLockError,
     MigrationOrderError,
+    _digest,
     apply_pending,
     discover,
     downgrade_to,
@@ -2289,3 +2290,229 @@ async def test_a_cancellation_during_cleanup_is_not_swallowed(db_url: URL, migra
     finally:
         AsyncConnection.invalidate = real_invalidate  # type: ignore[method-assign]
         await engine.dispose()
+
+
+async def test_an_unstable_session_is_refused_before_the_lock_is_taken(
+    db_url: URL, migrations_dir: Path
+):
+    # The pid check added last round lives in _confirm_lock, which runs once per
+    # migration APPLIED — so it had to move ahead of the lock, because the run
+    # that most needs it applies nothing (below). Refusing before the lock also
+    # means a refusal cannot itself strand anything.
+    engine = create_async_engine(db_url)
+    real_pid = migrations_module._backend_pid
+    seen: list[int] = []
+
+    async def a_different_backend_each_time(conn):
+        seen.append(await real_pid(conn))
+        return seen[-1] + len(seen)  # never twice the same
+
+    migrations_module._backend_pid = a_different_backend_each_time
+    try:
+        with pytest.raises(MigrationError, match="not a single PostgreSQL session"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    finally:
+        migrations_module._backend_pid = real_pid
+        await engine.dispose()
+
+    verify = create_async_engine(db_url)
+    try:
+        # Refused before the lock, so before the ledger existed.
+        assert not await table_exists(verify, "schema_migrations")
+        assert not await table_exists(verify, "widget")
+    finally:
+        await verify.dispose()
+
+
+async def test_even_a_run_with_nothing_to_do_checks_the_session_first(
+    db_url: URL, migrations_dir: Path
+):
+    """The gap the check moved to close, asserted at the call site.
+
+    An up-to-date run — the commonest run there is, every redeploy — takes the
+    session lock, skips every file, and releases. It never applies a migration,
+    so it never reached the per-migration confirmation: measured, `_confirm_lock`
+    was called 0 times on the second run while the first called it twice. Under a
+    transaction pooler that run would take the key on one backend and "release"
+    it on another, stranding it against every later deployment, and the check
+    that was supposed to refuse the configuration would never have run.
+    """
+    engine = create_async_engine(db_url)
+    order: list[str] = []
+    real_check, real_lock = migrations_module._require_a_stable_session, migrations_module._lock
+
+    async def note_check(conn):
+        order.append("check")
+        return await real_check(conn)
+
+    async def note_lock(conn):
+        order.append("lock")
+        return await real_lock(conn)
+
+    migrations_module._require_a_stable_session = note_check
+    migrations_module._lock = note_lock
+    try:
+        assert await apply_pending(engine, migrations_dir, emit=lambda _: None) == 2
+        applied_run = list(order)
+        order.clear()
+        assert await apply_pending(engine, migrations_dir, emit=lambda _: None) == 0
+        up_to_date_run = list(order)
+    finally:
+        migrations_module._require_a_stable_session = real_check
+        migrations_module._lock = real_lock
+        await engine.dispose()
+
+    # Both runs, and the check first each time — a lock taken on a session that
+    # was never verified is the thing that cannot be undone.
+    assert applied_run == ["check", "lock"], applied_run
+    assert up_to_date_run == ["check", "lock"], up_to_date_run
+
+
+async def test_two_runs_cannot_adopt_the_same_legacy_row_from_different_files(
+    db_url: URL, migrations_dir: Path
+):
+    """Adoption is the operator vouching for ONE file, so it cannot be a race.
+
+    Two runs adopting the same pre-checksum row from checkouts with different
+    content each recorded its own baseline over the other's, and both announced
+    success — measured. The filename set never changed, which is why the fence's
+    original name-only snapshot could not have caught it either.
+    """
+    other_checkout = migrations_dir.parent / "other_checkout"
+    other_checkout.mkdir()
+    for name in ("001_first", "002_second"):
+        (other_checkout / f"{name}.down.sql").write_text(
+            (migrations_dir / f"{name}.down.sql").read_text()
+        )
+    (other_checkout / "001_first.sql").write_text("CREATE TABLE widget (id INT, extra TEXT);")
+    (other_checkout / "002_second.sql").write_text((migrations_dir / "002_second.sql").read_text())
+
+    # A pre-checksum ledger row, as the PR-1 runner left them.
+    boot = create_async_engine(db_url)
+    try:
+        async with boot.connect() as conn:
+            await conn.execute(
+                sa.text(
+                    "CREATE TABLE schema_migrations (filename TEXT PRIMARY KEY, checksum TEXT,"
+                    " down_checksum TEXT, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+                )
+            )
+            await conn.execute(
+                sa.text("INSERT INTO schema_migrations (filename) VALUES ('001_first.sql')")
+            )
+            await conn.execute(sa.text("CREATE TABLE widget (id INT)"))
+            await conn.commit()
+    finally:
+        await boot.dispose()
+
+    mine, theirs = create_async_engine(db_url), create_async_engine(db_url)
+    real_lock, real_confirm = migrations_module._lock, migrations_module._confirm_lock
+
+    async def no_exclusion(conn):
+        return 0
+
+    async def no_confirmation(lock_conn, *, backend=None):
+        return None
+
+    # Two runs at once is the premise, so the run lock is out of the way.
+    migrations_module._lock = no_exclusion
+    migrations_module._confirm_lock = no_confirmation
+    try:
+        outcomes = await asyncio.gather(
+            apply_pending(mine, migrations_dir, emit=lambda _: None, adopt_legacy=True),
+            apply_pending(theirs, other_checkout, emit=lambda _: None, adopt_legacy=True),
+            return_exceptions=True,
+        )
+    finally:
+        migrations_module._lock = real_lock
+        migrations_module._confirm_lock = real_confirm
+        for engine in (mine, theirs):
+            await engine.dispose()
+
+    refused = [o for o in outcomes if isinstance(o, MigrationError)]
+    assert len(refused) == 1, f"expected exactly one refusal, got {outcomes}"
+    # The fence gets there first, naming the rewritten row — which is only
+    # visible because `expected` carries checksums now and not just filenames.
+    assert "recorded differently: 001_first.sql" in str(refused[0]), refused[0]
+
+    verify = create_async_engine(db_url)
+    try:
+        async with verify.connect() as conn:
+            stored = await conn.scalar(
+                sa.text("SELECT checksum FROM schema_migrations WHERE filename = :f"),
+                {"f": "001_first.sql"},
+            )
+        # Whichever won, the baseline is ONE checkout's file and not a mixture.
+        assert stored in (
+            _digest((migrations_dir / "001_first.sql").read_text()),
+            _digest((other_checkout / "001_first.sql").read_text()),
+        )
+    finally:
+        await verify.dispose()
+
+
+async def test_an_adoption_that_lost_the_row_underneath_it_refuses_rather_than_overwriting(
+    db_url: URL, migrations_dir: Path
+):
+    """The `AND checksum IS NULL` guard, which the fence otherwise hides.
+
+    Stated plainly: with the fence in place I could not construct a run that
+    reaches this guard, because the fence holds its transaction-scoped lock
+    across the whole preamble and re-reads the row first — so a second RUNNER is
+    always caught earlier. What can still reach it is a writer that does not go
+    through the fence at all, which is what this simulates. That makes the guard
+    defence in depth rather than a fix for a reachable bug, and I would rather
+    say so than let the test imply otherwise.
+    """
+    boot = create_async_engine(db_url)
+    try:
+        async with boot.connect() as conn:
+            await conn.execute(
+                sa.text(
+                    "CREATE TABLE schema_migrations (filename TEXT PRIMARY KEY, checksum TEXT,"
+                    " down_checksum TEXT, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+                )
+            )
+            await conn.execute(
+                sa.text("INSERT INTO schema_migrations (filename) VALUES ('001_first.sql')")
+            )
+            await conn.execute(sa.text("CREATE TABLE widget (id INT)"))
+            await conn.commit()
+    finally:
+        await boot.dispose()
+
+    engine = create_async_engine(db_url)
+    interloper = create_async_engine(db_url, isolation_level="AUTOCOMMIT")
+    real_fence = migrations_module._fence
+
+    async def adopt_it_from_outside_the_fence(conn, ledger, expected):
+        await real_fence(conn, ledger, expected)
+        async with interloper.connect() as other:
+            await other.execute(
+                sa.text(
+                    "UPDATE schema_migrations SET checksum = 'somebody-else' "
+                    "WHERE filename = '001_first.sql'"
+                )
+            )
+
+    migrations_module._fence = adopt_it_from_outside_the_fence
+    try:
+        with pytest.raises(MigrationChecksumError, match="adopted by another run"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None, adopt_legacy=True)
+    finally:
+        migrations_module._fence = real_fence
+        await interloper.dispose()
+        await engine.dispose()
+
+    verify = create_async_engine(db_url)
+    try:
+        async with verify.connect() as conn:
+            stored = await conn.scalar(
+                sa.text("SELECT checksum FROM schema_migrations WHERE filename = :f"),
+                {"f": "001_first.sql"},
+            )
+        # Not overwritten: the run refused rather than recording its own file's
+        # hash over a baseline somebody else had just vouched for.
+        assert stored == "somebody-else"
+    finally:
+        await verify.dispose()
