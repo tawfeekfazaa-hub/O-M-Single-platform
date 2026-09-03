@@ -458,9 +458,16 @@ async def _verify(
     known: dict[str, Migration],
     *,
     adopt_legacy: bool,
-    emit: Emit,
-) -> None:
-    """Refuse the run if history and files disagree. Never trusts silently."""
+) -> list[str]:
+    """Refuse the run if history and files disagree. Never trusts silently.
+
+    Returns what should be ANNOUNCED if the surrounding transaction commits —
+    it does not emit. An adoption written here can still be rolled back by a
+    later check (a history that is not a prefix) or by a failed commit, and
+    saying "recorded" for a row that is still NULL sends an operator, or a log
+    parser, away believing the opposite of the truth.
+    """
+    announcements: list[str] = []
     missing = sorted(name for name in applied if name not in known)
     if missing:
         raise MigrationChecksumError(
@@ -515,16 +522,15 @@ async def _verify(
             ),
             {"c": migration.checksum, "d": migration.down_checksum, "f": name},
         )
-        emit(f"adopt {name}  (unverified baseline recorded on operator request)")
+        announcements.append(f"adopt {name}  (unverified baseline recorded on operator request)")
+    return announcements
 
 
 async def _adopt_new_rollbacks(
     conn: AsyncConnection,
     applied: dict[str, _AppliedRow],
     known: dict[str, Migration],
-    *,
-    emit: Emit,
-) -> None:
+) -> list[str]:
     """Record a rollback file that was written after its migration was applied.
 
     Its recorded ``down_checksum`` is NULL, which is evidence the file did not
@@ -538,7 +544,11 @@ async def _adopt_new_rollbacks(
     migration's rollback later, on nothing but an operator's word. Hence the
     same explicit flag as an unverifiable forward checksum, and the same
     reporting.
+
+    Returns what to announce once the transaction commits, for the reason given
+    on :func:`_verify`.
     """
+    announcements: list[str] = []
     for name in sorted(
         name
         for name, row in applied.items()
@@ -551,7 +561,10 @@ async def _adopt_new_rollbacks(
             {"d": known[name].down_checksum, "f": name},
         )
         applied[name] = _AppliedRow(applied[name].checksum, known[name].down_checksum)
-        emit(f"adopt {name}  (rollback file recorded unverified on operator request)")
+        announcements.append(
+            f"adopt {name}  (rollback file recorded unverified on operator request)"
+        )
+    return announcements
 
 
 async def _run_sql(conn: AsyncConnection, sql: str, *, filename: str) -> None:
@@ -727,11 +740,13 @@ async def apply_pending(
             await _ensure_bookkeeping(conn)
             await conn.commit()
             applied = await _applied_rows(conn)
-            await _verify(conn, applied, known, adopt_legacy=adopt_legacy, emit=emit)
+            announcements = await _verify(conn, applied, known, adopt_legacy=adopt_legacy)
             _require_prefix(migrations, applied)
             if adopt_legacy:
-                await _adopt_new_rollbacks(conn, applied, known, emit=emit)
+                announcements += await _adopt_new_rollbacks(conn, applied, known)
             await conn.commit()
+            for line in announcements:  # only now is any of it true
+                emit(line)
 
             for migration in migrations:
                 if migration.filename in applied:
@@ -785,9 +800,11 @@ async def downgrade_to(
             await _ensure_bookkeeping(conn)
             await conn.commit()
             applied = await _applied_rows(conn)
-            await _verify(conn, applied, known, adopt_legacy=adopt_legacy, emit=emit)
+            announcements = await _verify(conn, applied, known, adopt_legacy=adopt_legacy)
             _require_prefix(migrations, applied)
             await conn.commit()
+            for line in announcements:  # only now is any of it true
+                emit(line)
 
             if target != BASE_TARGET and target not in applied:
                 # The file exists but the database never reached it. Filtering
@@ -831,8 +848,7 @@ async def downgrade_to(
                     + " — it did not accompany the applied migration and cannot be "
                     "verified. Review it, then re-run with --adopt-legacy-checksums"
                 )
-            for name in unverifiable:
-                emit(f"adopt {name}  (unverified rollback executed on operator request)")
+            adopted = set(unverifiable)
 
             for migration in doomed:
                 async with _atomic(conn):
@@ -841,6 +857,14 @@ async def downgrade_to(
                     await conn.execute(
                         sa.text("DELETE FROM schema_migrations WHERE filename = :f"),
                         {"f": migration.filename},
+                    )
+                if migration.filename in adopted:
+                    # After the fact, because it says "executed": announcing it
+                    # up front claimed execution for every unverifiable rollback
+                    # in the set, including any the run never reached.
+                    emit(
+                        f"adopt {migration.filename}  "
+                        "(unverified rollback executed on operator request)"
                     )
                 emit(f"down  {migration.filename}")
         finally:

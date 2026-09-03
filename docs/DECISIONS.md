@@ -25,10 +25,12 @@ that decides the next schema's shape.
    would declare the database verified against SQL that may never have run
    there, which is the exact drift the checksum exists to reveal. Adoption is a
    deliberate operator action (`--adopt-legacy-checksums`) and is announced as
-   an unverified baseline. The checksum is taken over newline-normalized content
-   so a CRLF checkout (README documents a Windows workflow) cannot brick it, and
-   that same normalized text is what gets executed, so "checksummed" and
-   "executed" cannot diverge if a file is replaced mid-run.
+   an unverified baseline — after the transaction commits, never before, so the
+   announcement cannot outlive a write that a later refusal rolls back. The
+   checksum is over the file's **exact bytes**, which are also what executes, so
+   "checksummed" and "executed" cannot diverge if a file is replaced mid-run.
+   Newline normalization was tried here and withdrawn; see 4h for why, and for
+   where the CRLF-checkout problem went instead.
 2b. **History must be a prefix.** Applied migrations have to be the first N of
    the discovered sequence. With 001 and 003 applied, a 002 appearing later
    would be applied *after* 003 while the bookkeeping implied filename order —

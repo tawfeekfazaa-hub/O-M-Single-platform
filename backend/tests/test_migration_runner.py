@@ -1147,3 +1147,87 @@ async def test_a_crlf_migration_stores_what_it_says(db_engine: AsyncEngine, migr
 
     async with db_engine.connect() as conn:
         assert await conn.scalar(sa.text("SELECT body FROM note")) == "first\r\nsecond"
+
+
+async def test_an_adoption_that_gets_rolled_back_is_never_announced(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # _verify writes the adopted checksums, then _require_prefix can still
+    # refuse the run — and the refusal takes the write with it. Announcing
+    # inside that transaction told the operator, and any log parser, that a
+    # baseline was recorded when the row is still NULL.
+    write_pair(
+        migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", "DROP TABLE sprocket;"
+    )
+    (migrations_dir / "002_second.sql").rename(migrations_dir / "002_second.sql.hidden")
+    (migrations_dir / "002_second.down.sql").rename(migrations_dir / "002_second.down.sql.hidden")
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+
+    async with db_engine.connect() as conn:
+        await conn.execute(
+            sa.text(
+                "UPDATE schema_migrations SET checksum = NULL, down_checksum = NULL "
+                "WHERE filename = '001_first.sql'"
+            )
+        )
+        await conn.commit()
+
+    # 002 reappearing makes the history stop being a prefix, so the run is
+    # refused after _verify has already written the adoption.
+    (migrations_dir / "002_second.sql.hidden").rename(migrations_dir / "002_second.sql")
+    (migrations_dir / "002_second.down.sql.hidden").rename(migrations_dir / "002_second.down.sql")
+
+    lines: list[str] = []
+    with pytest.raises(MigrationOrderError):
+        await apply_pending(db_engine, migrations_dir, emit=lines.append, adopt_legacy=True)
+
+    assert [line for line in lines if line.startswith("adopt")] == []
+    async with db_engine.connect() as conn:
+        stored = await conn.scalar(
+            sa.text("SELECT checksum FROM schema_migrations WHERE filename = '001_first.sql'")
+        )
+    assert stored is None  # what was announced and what is recorded now agree
+
+
+async def test_an_adoption_that_commits_is_announced(db_engine: AsyncEngine, migrations_dir: Path):
+    # The other half: buffering must not swallow the announcement when the
+    # adoption does land.
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+    async with db_engine.connect() as conn:
+        await conn.execute(
+            sa.text("UPDATE schema_migrations SET checksum = NULL WHERE filename = '001_first.sql'")
+        )
+        await conn.commit()
+
+    lines: list[str] = []
+    await apply_pending(db_engine, migrations_dir, emit=lines.append, adopt_legacy=True)
+    assert "adopt 001_first.sql  (unverified baseline recorded on operator request)" in lines
+
+    async with db_engine.connect() as conn:
+        assert await conn.scalar(
+            sa.text("SELECT checksum FROM schema_migrations WHERE filename = '001_first.sql'")
+        )
+
+
+async def test_an_unverified_rollback_is_announced_only_once_it_has_run(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # The adopt lines used to be printed for the whole doomed set before any of
+    # it ran, so a run that failed on the first rollback still claimed the rest
+    # had been executed.
+    write_pair(migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", None)
+    write_pair(migrations_dir, "004_fourth", "CREATE TABLE cog (id INT);", None)
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+    (migrations_dir / "003_third.down.sql").write_text("DROP TABLE IF EXISTS sprocket;")
+    (migrations_dir / "004_fourth.down.sql").write_text("DROP TABLE nonexistent_on_purpose;")
+
+    lines: list[str] = []
+    with pytest.raises(MigrationError, match="004_fourth.down.sql failed to execute"):
+        await downgrade_to(
+            db_engine, migrations_dir, "002_second.sql", emit=lines.append, adopt_legacy=True
+        )
+
+    # 004 is unwound first and fails, so 003 never ran — and must not be
+    # reported as executed.
+    assert not any("003_third" in line and "adopt" in line for line in lines)
+    assert await table_exists(db_engine, "sprocket")
