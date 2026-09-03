@@ -39,7 +39,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, Protocol
@@ -449,6 +449,49 @@ class _AppliedRow:
     down_checksum: str | None
 
 
+async def _ledger_locations(conn: AsyncConnection) -> tuple[str | None, list[str]]:
+    """Where ``schema_migrations`` is: the one this search_path resolves, and the rest.
+
+    Both names come back ``format('%I.%I', ...)``-quoted by the server rather
+    than assembled here.
+
+    The resolution query is deliberately operator-free — one qualified function
+    call and a literal — because it must run under the REAL search_path to
+    resolve the same name the rest of the session would. Everything after it is
+    pinned to ``pg_catalog`` by :func:`_ledger`, for the reason recorded there:
+    this is the connection migration SQL shares, so ``=`` itself is shadowable.
+    """
+    # _ledger pins the path for the rest of this TRANSACTION, and the caller
+    # still has a `CREATE TABLE schema_migrations` to run in it — which under
+    # the pin tried to create `pg_catalog.schema_migrations` and was refused by
+    # the server. So restore what was in force on the way in.
+    entry_path = str(await conn.scalar(sa.text("SHOW search_path")))
+    oid = await conn.scalar(
+        sa.text("SELECT pg_catalog.to_regclass('schema_migrations')::pg_catalog.oid")
+    )
+    rows = (
+        await _ledger(
+            conn,
+            sa.text(
+                "SELECT c.oid, pg_catalog.format('%I.%I', n.nspname, c.relname) AS name "
+                "FROM pg_catalog.pg_class c "
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE c.relname = 'schema_migrations' "
+                # Only a real table can be the ledger: the runner creates one.
+                # Anything else answering to the name — a view put there to
+                # shadow it — is not it, and leaving it out is what makes the
+                # refusal below fire instead of writing history into it.
+                "AND c.relkind = ANY (ARRAY['r', 'p'])"
+            ),
+        )
+    ).all()
+    await conn.execute(
+        sa.text("SELECT pg_catalog.set_config('search_path', :p, true)"), {"p": entry_path}
+    )
+    on_path = next((r.name for r in rows if oid is not None and r.oid == oid), None)
+    return on_path, sorted(r.name for r in rows if r.name != on_path)
+
+
 async def _ensure_bookkeeping(conn: AsyncConnection) -> str:
     """Create or upgrade ``schema_migrations``; return its qualified name.
 
@@ -471,32 +514,51 @@ async def _ensure_bookkeeping(conn: AsyncConnection) -> str:
     # the ledger against the previous run's leftover path — found by the test
     # for the qualification below, which re-applied an applied migration.
     await conn.execute(sa.text("RESET search_path"))
-    await conn.execute(
-        sa.text(
-            "CREATE TABLE IF NOT EXISTS schema_migrations ("
-            "  filename TEXT PRIMARY KEY,"
-            "  checksum TEXT,"
-            "  down_checksum TEXT,"
-            "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
-            ")"
+    ledger, elsewhere = await _ledger_locations(conn)
+
+    if ledger is None and elsewhere:
+        # RESET restores the CONFIGURED default, which is not beyond a
+        # migration's reach: `ALTER DATABASE ... SET search_path = evil, public`
+        # outlives the session, the pool and the process. Measured on a fresh
+        # engine afterwards: RESET yielded `evil, public`, `CREATE TABLE IF NOT
+        # EXISTS schema_migrations` made a SECOND, empty ledger there, and the
+        # run re-applied an already-applied migration — silently, inserting a
+        # data migration's row a second time. An operator retargeting `ALTER
+        # ROLE ... SET search_path` gets there by accident just as easily.
+        #
+        # Creating a second ledger is never the right answer: an empty history
+        # means "nothing has ever been applied". Refusing only in this exact
+        # transition leaves a database that legitimately hosts several
+        # applications, each with its own ledger in its own schema, working —
+        # each one's search_path finds its own, and this branch never runs.
+        raise MigrationError(
+            "schema_migrations is not on this connection's search_path, but "
+            f"{'one already exists' if len(elsewhere) == 1 else 'ledgers already exist'} at "
+            f"{', '.join(elsewhere)}. Creating another here would read as an empty history "
+            "and re-apply every migration, so nothing has been applied. Point search_path at "
+            "the existing ledger, or move it, and run again"
         )
-    )
-    for column in ("checksum", "down_checksum"):
+
+    if ledger is None:
         await conn.execute(
-            sa.text(f"ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS {column} TEXT")
+            sa.text(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "  filename TEXT PRIMARY KEY,"
+                "  checksum TEXT,"
+                "  down_checksum TEXT,"
+                "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            )
         )
-    # quote_ident on the server, so the identifier is escaped by PostgreSQL
-    # rather than by string formatting here.
-    qualified = await conn.scalar(
-        sa.text(
-            "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) "
-            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE c.oid = to_regclass('schema_migrations')"
-        )
-    )
-    if not qualified:  # pragma: no cover - it was just created
-        raise MigrationError("schema_migrations could not be resolved after creating it")
-    return str(qualified)
+        ledger, _ = await _ledger_locations(conn)
+        if not ledger:  # pragma: no cover - it was just created
+            raise MigrationError("schema_migrations could not be resolved after creating it")
+
+    for column in ("checksum", "down_checksum"):
+        # Qualified, like every other ledger statement: unqualified, this
+        # upgraded whatever the current path happened to resolve.
+        await _ledger(conn, sa.text(f"ALTER TABLE {ledger} ADD COLUMN IF NOT EXISTS {column} TEXT"))
+    return ledger
 
 
 async def _ledger(conn: AsyncConnection, statement: sa.TextClause, params: dict | None = None):
@@ -772,19 +834,84 @@ async def _discard(conn: AsyncConnection) -> None:
         conn.sync_connection.invalidate()  # type: ignore[union-attr]
 
 
+async def _two_connections(
+    engine: AsyncEngine, stack: AsyncExitStack
+) -> tuple[AsyncConnection, AsyncConnection]:
+    """One connection for the lock, one for the work.
+
+    The lock needs a session migration SQL cannot reach, which means the pool
+    must be able to supply two. An engine configured ``pool_size=1,
+    max_overflow=0`` otherwise blocks on the second checkout until
+    ``pool_timeout`` and reports a pool error — a requirement the caller never
+    agreed to, stated as one here instead.
+    """
+    lock_conn = await stack.enter_async_context(engine.connect())
+    try:
+        conn = await stack.enter_async_context(engine.connect())
+    except Exception as exc:
+        raise MigrationError(
+            "could not open a second connection "
+            f"({type(exc).__name__}): the run lock is held on a connection of its own, so "
+            "migrations cannot run on an engine whose pool supplies fewer than two"
+        ) from exc
+    return lock_conn, conn
+
+
+async def _confirm_lock(lock_conn: AsyncConnection) -> None:
+    """Fail the run if the lock session no longer holds the lock.
+
+    The lock lives on its own connection, which is idle for as long as the
+    migration takes — so ``idle_session_timeout`` or a proxy can close it, and a
+    session-scoped advisory lock dies with its session. Measured: with the lock
+    session terminated mid-migration, a second runner took the key and the first
+    carried on regardless.
+
+    Checked immediately before each history row is written, which is the last
+    moment the work can still be abandoned. It doubles as a keep-alive: between
+    migrations the lock session is no longer idle.
+    """
+    try:
+        held = await lock_conn.scalar(
+            sa.text(
+                "SELECT count(*) FROM pg_catalog.pg_locks WHERE locktype = 'advisory' "
+                "AND pid = pg_catalog.pg_backend_pid()"
+            )
+        )
+    except Exception as exc:
+        raise MigrationError(
+            f"lost contact with the session holding the run lock ({type(exc).__name__}); "
+            "refusing to continue while another run may have taken it"
+        ) from exc
+    if not held:
+        raise MigrationError(
+            "the run lock is no longer held — its session was closed (an idle timeout or a "
+            "proxy), so another run may already have started. Nothing further is applied"
+        )
+
+
 async def _restore_session(conn: AsyncConnection) -> None:
-    """Undo session state a migration left, before the connection is pooled.
+    """Drop the connection a migration ran on, rather than pooling it.
 
     A migration's ``SET search_path`` is committed with it and rides back into
     the pool, so a library caller's next query — which never reaches
     :func:`_ensure_bookkeeping` and its reset — resolves unqualified names in
-    the migration's schema. Measured: ``SHOW search_path`` returned ``app`` on
-    the next application query.
+    the migration's schema. Measured: ``SHOW search_path`` returned ``app``, and
+    ``statement_timeout`` ``1234ms``, on the next application query.
+
+    ``RESET search_path`` fixed only the case that was found: a migration can
+    also leave ``statement_timeout``, ``SET ROLE``, ``LISTEN`` registrations and
+    temporary objects behind. ``DISCARD ALL`` covers all of those and is the
+    obvious answer — but it runs ``DEALLOCATE ALL``, and asyncpg keeps a
+    per-connection cache of prepared statements that the server has now
+    forgotten, so the next caller to reuse that pooled connection gets
+    ``prepared statement "__asyncpg_stmt_1d__" does not exist``. Measured: 17 of
+    this module's own tests failed that way.
+
+    So the session ends instead. Ending it discards every kind of state at once
+    — including states nobody has thought of yet — and costs one reconnect on a
+    connection that is used once per run. The pool simply opens a fresh one.
     """
-    with suppress(Exception):
-        await conn.rollback()
-        await conn.execute(sa.text("RESET search_path"))
-        await conn.commit()
+    await _discard(conn)
 
 
 async def _unlock(conn: AsyncConnection, *, emit: Emit) -> None:
@@ -846,7 +973,8 @@ async def apply_pending(
     # pg_advisory_unlock_all()` released the runner's own lock without ending
     # its transaction, and a second runner could then enter mid-migration —
     # measured. A separate session is not reachable from migration text at all.
-    async with engine.connect() as lock_conn, engine.connect() as conn:
+    async with AsyncExitStack() as stack:
+        lock_conn, conn = await _two_connections(engine, stack)
         # _lock is INSIDE the guarded region: PostgreSQL may grant the lock and
         # the caller be cancelled before the result is seen, which would return
         # a locked session to the pool with nothing arranged to release it.
@@ -869,6 +997,7 @@ async def apply_pending(
                     continue
                 async with _atomic(conn):
                     await _run_sql(conn, migration.content, filename=migration.filename)
+                    await _confirm_lock(lock_conn)
                     await _ledger(
                         conn,
                         sa.text(
@@ -918,7 +1047,8 @@ async def downgrade_to(
 
     # As in apply_pending, on its own connection: migration SQL cannot reach a
     # session it does not run on.
-    async with engine.connect() as lock_conn, engine.connect() as conn:
+    async with AsyncExitStack() as stack:
+        lock_conn, conn = await _two_connections(engine, stack)
         # The lock is taken inside the region that releases it, so a
         # cancellation landing on the grant cannot strand it.
         try:
@@ -980,6 +1110,7 @@ async def downgrade_to(
                 async with _atomic(conn):
                     assert migration.down_content is not None  # checked above
                     await _run_sql(conn, migration.down_content, filename=migration.down_filename)
+                    await _confirm_lock(lock_conn)
                     await _ledger(
                         conn,
                         sa.text(f"DELETE FROM {ledger} WHERE filename = :f"),

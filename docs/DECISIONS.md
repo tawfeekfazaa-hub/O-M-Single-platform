@@ -126,8 +126,31 @@ that decides the next schema's shape.
    bookkeeping statement now runs under `SET LOCAL search_path = pg_catalog`,
    and the advisory-lock functions are `pg_catalog`-qualified. And a migration's
    `SET search_path` rode back into the pool, so a library caller's next query
-   resolved unqualified names in the migration's schema — the session is
-   restored before the connection is returned.
+   resolved unqualified names in the migration's schema — the connection a
+   migration ran on is now dropped rather than returned to it. `RESET
+   search_path` closed only the case that was found: `statement_timeout`,
+   `SET ROLE`, `LISTEN` registrations and temporary objects ride back the same
+   way. `DISCARD ALL` covers all of them and was tried, but it runs `DEALLOCATE
+   ALL`, leaving asyncpg's per-connection statement cache naming prepared
+   statements the server has forgotten — measured, 17 tests in the runner's own
+   module failed with `prepared statement "__asyncpg_stmt_1d__" does not exist`
+   on the next caller to reuse that pooled connection. Ending the session
+   discards every kind of state at once, including kinds nobody has thought of
+   yet, for the price of one reconnect on a connection used once per run.
+4m. **The lock must still be held when the history row is written.** The run
+   lock lives on a connection of its own (4l), and that connection is idle for
+   as long as a migration takes — `idle_session_timeout` or a proxy can close
+   it, and a session-scoped advisory lock dies with its session. Measured: with
+   the lock session terminated mid-migration, a second runner took the key while
+   the first carried on and committed its history under a lock it no longer
+   held. The lock session is re-checked immediately before each history row,
+   which is the last moment the work can still be abandoned; the check doubles
+   as a keep-alive, since between migrations that session is no longer idle.
+4n. **Migrations need an engine that can supply two connections.** A consequence
+   of 4l worth stating rather than leaving to be discovered: with `pool_size=1,
+   max_overflow=0` the second checkout blocked until `pool_timeout` and surfaced
+   as a pool error saying nothing about why. The runner now refuses up front and
+   says what it needs.
 4j. **The ledger cannot be redirected by the migrations it records.** Migration
    SQL runs on the runner's connection and may legitimately `SET search_path`,
    which would resolve a later unqualified `schema_migrations` elsewhere.
@@ -137,7 +160,25 @@ that decides the next schema's shape.
    any migration runs, and every later statement is qualified with it; the
    search path is reset at the start of each run, because a `SET` from a
    previous run rides back on the pooled connection and would otherwise poison
-   that resolution.
+   that resolution. `RESET` restores the *configured* default, though, and that
+   is also within a migration's reach: `ALTER DATABASE … SET search_path = evil`
+   outlives the session, the pool and the process. Measured on a fresh engine
+   afterwards — RESET yielded `evil`, `CREATE TABLE IF NOT EXISTS
+   schema_migrations` created a SECOND, empty ledger there, and the run silently
+   re-applied an already-applied migration, putting a data migration's row in
+   twice. (`CREATE TABLE IF NOT EXISTS` checks only the schema it would create
+   in, not visibility, so it duplicated the ledger even with the real one on the
+   path and plainly visible.) The runner now looks for `schema_migrations`
+   across the whole database before creating one: not on the path but present
+   elsewhere is refused, naming where it is, because a second ledger reads as
+   "nothing has ever been applied". Refusing only in that exact transition
+   leaves a database that legitimately hosts several applications, each with its
+   own ledger in its own schema, working — each path finds its own. What stays
+   outside the runner's reach: a migration that creates a complete, pre-filled
+   ledger earlier on a redirected path is indistinguishable from an operator
+   relocating one. That is review's job, not the runner's. An operator does not
+   need `ALTER DATABASE` to arrive here either — retargeting `ALTER ROLE … SET
+   search_path` gets there by accident.
 4k. **Two migrations may not share a sequence number.** Filename order hides a
    reused number from the prefix rule — `002_beta` sorts after `002_alpha`, so
    the applied set stays a prefix and a second `002` is applied. "We are at 002"

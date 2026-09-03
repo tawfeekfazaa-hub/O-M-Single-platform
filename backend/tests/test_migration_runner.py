@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -139,7 +141,7 @@ async def test_editing_an_applied_migration_refuses_the_whole_run(
         migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", "DROP TABLE sprocket;"
     )
 
-    with pytest.raises(MigrationChecksumError, match="001_first.sql"):
+    with pytest.raises(MigrationChecksumError, match="edited after being applied: 001_first.sql"):
         await apply_pending(db_engine, migrations_dir)
 
     # ... and the pending migration was NOT applied: the run is refused whole.
@@ -152,7 +154,7 @@ async def test_deleting_an_applied_migration_refuses_the_whole_run(
 ):
     await apply_pending(db_engine, migrations_dir)
     (migrations_dir / "002_second.sql").unlink()
-    with pytest.raises(MigrationChecksumError, match="002_second.sql"):
+    with pytest.raises(MigrationChecksumError, match="no longer present: 002_second.sql"):
         await apply_pending(db_engine, migrations_dir)
 
 
@@ -180,7 +182,7 @@ async def test_a_line_ending_change_to_an_applied_migration_is_drift(
     assert rewritten != path.read_bytes()  # the mutation must actually mutate
     path.write_bytes(rewritten)
 
-    with pytest.raises(MigrationChecksumError, match="001_first.sql"):
+    with pytest.raises(MigrationChecksumError, match="edited after being applied: 001_first.sql"):
         await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
 
 
@@ -259,7 +261,7 @@ async def test_a_missing_down_file_unwinds_nothing_at_all(
     write_pair(migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", None)
     await apply_pending(db_engine, migrations_dir)
 
-    with pytest.raises(MigrationError, match="003_third.sql"):
+    with pytest.raises(MigrationError, match="have no .down.sql: 003_third.sql"):
         await downgrade_to(db_engine, migrations_dir, "base")
 
     assert await table_exists(db_engine, "widget")  # nothing was unwound
@@ -396,7 +398,7 @@ async def test_an_edited_rollback_file_is_refused(db_engine: AsyncEngine, migrat
         "DROP TABLE IF EXISTS gadget; DROP TABLE IF EXISTS widget;"
     )
 
-    with pytest.raises(MigrationChecksumError, match="002_second.sql"):
+    with pytest.raises(MigrationChecksumError, match="rollback files were edited.* 002_second.sql"):
         await downgrade_to(db_engine, migrations_dir, "001_first.sql")
 
     # Nothing ran: 001's table is untouched and 002 is still applied.
@@ -483,9 +485,9 @@ async def test_a_migration_numbered_behind_applied_ones_is_refused(
     (migrations_dir / "002_second.sql").write_text(held_up)
     (migrations_dir / "002_second.down.sql").write_text(held_down)
 
-    with pytest.raises(MigrationOrderError, match="002_second.sql"):
+    with pytest.raises(MigrationOrderError, match="not a prefix.*002_second.sql"):
         await apply_pending(db_engine, migrations_dir)
-    with pytest.raises(MigrationOrderError, match="002_second.sql"):
+    with pytest.raises(MigrationOrderError, match="not a prefix.*002_second.sql"):
         await downgrade_to(db_engine, migrations_dir, "base")
     assert not await table_exists(db_engine, "gadget")
 
@@ -613,7 +615,7 @@ async def test_an_edited_rollback_file_blocks_applying_anything_new(
         "DROP TABLE IF EXISTS sprocket;",
     )
 
-    with pytest.raises(MigrationChecksumError, match="001_first.sql"):
+    with pytest.raises(MigrationChecksumError, match="rollback files were edited.* 001_first.sql"):
         await apply_pending(db_engine, migrations_dir)
     assert not await table_exists(db_engine, "sprocket")
 
@@ -624,7 +626,7 @@ async def test_a_removed_rollback_file_is_treated_like_an_edited_one(
     await apply_pending(db_engine, migrations_dir)
     (migrations_dir / "002_second.down.sql").unlink()
 
-    with pytest.raises(MigrationChecksumError, match="002_second.sql"):
+    with pytest.raises(MigrationChecksumError, match="rollback files were edited.* 002_second.sql"):
         await apply_pending(db_engine, migrations_dir)
 
 
@@ -751,6 +753,10 @@ async def test_a_lost_connection_reports_the_migration_failure_not_the_cleanup_f
     )
     with pytest.raises(MigrationError, match="003_third.sql failed to execute"):
         await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+    # Note: this kills the WORK connection. Since the lock moved to a session of
+    # its own, _unlock now takes its ordinary path here, so this no longer
+    # exercises the discard fallback — that is
+    # test_the_lock_is_freed_when_its_own_session_dies below.
 
 
 async def test_a_failure_releasing_the_lock_neither_masks_nor_hides_itself(
@@ -863,7 +869,7 @@ async def test_adoption_does_not_touch_a_rollback_that_was_recorded_all_along(
     await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
     (migrations_dir / "001_first.down.sql").write_text("DROP TABLE IF EXISTS widget CASCADE;")
 
-    with pytest.raises(MigrationChecksumError, match="001_first.sql"):
+    with pytest.raises(MigrationChecksumError, match="rollback files were edited.* 001_first.sql"):
         await apply_pending(db_engine, migrations_dir, emit=lambda _: None, adopt_legacy=True)
 
 
@@ -1090,16 +1096,61 @@ async def test_the_cli_reports_a_malformed_database_url_as_a_refusal(
     assert capsys.readouterr().err.startswith("migration refused: the run failed (")
 
 
-def test_the_maintenance_connection_uses_the_database_it_was_given():
-    # Substituting `postgres` was a silent extra requirement: a role that can
-    # reach the database it was given but not the cluster's `postgres` failed
-    # every live test before the first one ran.
-    from sqlalchemy.engine import make_url
+async def test_the_maintenance_connection_uses_the_database_it_was_given(
+    test_database_url: URL, monkeypatch: pytest.MonkeyPatch
+):
+    """Drives the fixture from a database that is deliberately not ``postgres``.
 
-    from tests.conftest import _admin_url
+    Two earlier versions of this test could not fail. The first asserted
+    ``_admin_url(url).database == "their_db"`` — a call site that substituted
+    ``postgres`` without going through the helper would have kept it green. The
+    second spied on the fixture's own call but compared against
+    TEST_DATABASE_URL's database, which on the machine it was written on WAS
+    ``postgres``, so the substitution was invisible there (CI names its database
+    aq_om_test, so CI would have caught it — a test that only works on some
+    machines is not a test). Hence the scratch database: whatever the URL says,
+    the fixture is handed a database that is definitely not the cluster's.
 
-    url = make_url("postgresql+asyncpg://someone@example.invalid:5432/their_db")
-    assert _admin_url(url).database == "their_db"
+    The requirement is that a role able to reach the database it was given, but
+    not the cluster's ``postgres``, can run the live suite — it used to fail
+    every live test before the first one ran.
+    """
+    from tests import conftest
+
+    scratch = f"aq_admin_{uuid.uuid4().hex[:12]}"
+    admin = create_async_engine(test_database_url, isolation_level="AUTOCOMMIT")
+    try:
+        async with admin.connect() as conn:
+            await conn.execute(sa.text(f'CREATE DATABASE "{scratch}"'))
+
+        seen: list[str | None] = []
+        real_create = conftest.create_async_engine
+
+        def spy(url, *args, **kwargs):
+            seen.append(getattr(url, "database", None))
+            return real_create(url, *args, **kwargs)
+
+        monkeypatch.setattr(conftest, "create_async_engine", spy)
+        generator = conftest.db_url.__wrapped__(test_database_url.set(database=scratch))
+        created = await generator.__anext__()
+        try:
+            # The maintenance engine is the first one the fixture builds.
+            assert seen[0] == scratch
+            assert created.database != scratch  # and it really did make a new one
+        finally:
+            with contextlib.suppress(StopAsyncIteration):
+                await generator.__anext__()
+    finally:
+        async with admin.connect() as conn:
+            await conn.execute(
+                sa.text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = :n AND pid <> pg_backend_pid()"
+                ),
+                {"n": scratch},
+            )
+            await conn.execute(sa.text(f'DROP DATABASE IF EXISTS "{scratch}"'))
+        await admin.dispose()
 
 
 async def test_the_cli_reports_an_invalid_unrelated_setting_as_a_refusal(
@@ -1529,5 +1580,234 @@ async def test_the_cli_survives_a_closed_stdout_on_a_successful_run(db_url: URL,
     engine = create_async_engine(db_url)
     try:
         assert await table_exists(engine, "widget")  # and it really did the work
+    finally:
+        await engine.dispose()
+
+
+async def _run_killing_the_idle_lock_session(engine: AsyncEngine, migrations_dir: Path, emit):
+    """Apply migrations, terminating the lock session in the middle of one.
+
+    The kill happens AFTER the migration's own SQL, at which point the work
+    connection is `idle in transaction` and the lock connection is the only
+    `idle` one in this (per-test) database — so the terminate hits the lock
+    session and nothing else.
+    """
+    killer = create_async_engine(engine.url, isolation_level="AUTOCOMMIT")
+    real_run = migrations_module._run_sql
+
+    async def run_then_kill(conn, sql, *, filename):
+        await real_run(conn, sql, filename=filename)
+        async with killer.connect() as k:
+            killed = await k.scalar(
+                sa.text(
+                    "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+                    "WHERE datname = :n AND state = 'idle' AND pid <> pg_backend_pid()"
+                ),
+                {"n": engine.url.database},
+            )
+        # Without this the test could pass having killed nothing at all.
+        assert killed == 1, f"expected to terminate the lock session only, killed {killed}"
+
+    migrations_module._run_sql = run_then_kill
+    try:
+        with pytest.raises(MigrationError) as raised:
+            await apply_pending(engine, migrations_dir, emit=emit)
+    finally:
+        migrations_module._run_sql = real_run
+        await killer.dispose()
+    return raised.value
+
+
+async def test_a_lock_session_that_dies_mid_run_stops_the_run(db_url: URL, migrations_dir: Path):
+    # The lock connection is idle for as long as the migration takes, so an
+    # idle_session_timeout or a proxy can close it — and a session-scoped
+    # advisory lock dies with its session. Measured before the check: a second
+    # runner took the key while the first carried on and recorded its history.
+    engine = create_async_engine(db_url)
+    try:
+        error = await _run_killing_the_idle_lock_session(engine, migrations_dir, lambda _: None)
+    finally:
+        await engine.dispose()
+    assert "run lock" in str(error)
+
+    verify = create_async_engine(db_url)
+    try:
+        # Nothing recorded: the work is abandoned rather than committed under a
+        # lock somebody else may now hold.
+        assert await applied_names(verify) == []
+        assert not await table_exists(verify, "widget")
+    finally:
+        await verify.dispose()
+
+
+async def test_a_dead_lock_session_is_reported_rather_than_masking_the_failure(
+    db_url: URL, migrations_dir: Path
+):
+    # Regression cover that moved: the work-connection kill above used to be
+    # what reached _unlock's discard path, and since the lock got a session of
+    # its own it no longer does. Killing the LOCK session is now the case where
+    # releasing the lock cannot succeed, and the cleanup must be reported
+    # alongside the real failure rather than replacing it.
+    lines: list[str] = []
+    engine = create_async_engine(db_url)
+    try:
+        error = await _run_killing_the_idle_lock_session(engine, migrations_dir, lines.append)
+    finally:
+        await engine.dispose()
+
+    assert "run lock" in str(error)  # the real reason survived the cleanup
+    assert [line for line in lines if line.startswith("note: the advisory lock could not be")], (
+        f"expected a note about the failed release, got {lines}"
+    )
+
+
+async def test_a_migration_leaves_no_session_state_behind_at_all(db_url: URL, migrations_dir: Path):
+    # search_path was the case review found; statement_timeout, SET ROLE, LISTEN
+    # and temporary objects ride back into the pool the same way.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "SET statement_timeout = '1234ms';\nCREATE TEMP TABLE leftover (id INT);"
+        "\nCREATE TABLE sprocket (id INT);",
+        "DROP TABLE IF EXISTS sprocket;",
+    )
+    engine = create_async_engine(db_url)
+    try:
+        await apply_pending(engine, migrations_dir, emit=lambda _: None)
+        # BOTH connections, held at once: the run checks out two and the order
+        # the pool hands them back is its own business, so asking for one could
+        # ask the lock connection — which never ran a migration and would look
+        # clean however dirty the other is. (With the fix in place the work
+        # connection is gone rather than clean, so both of these are fresh
+        # backends. Reverting the fix to `RESET search_path` puts the dirty one
+        # back in the pool and this fails, which is what it is here to catch.)
+        async with engine.connect() as first, engine.connect() as second:
+            for conn in (first, second):
+                assert await conn.scalar(sa.text("SHOW statement_timeout")) == "0"
+                assert not await conn.scalar(sa.text("SELECT to_regclass('leftover') IS NOT NULL"))
+    finally:
+        await engine.dispose()
+
+
+async def test_the_engine_is_still_usable_after_a_run(db_url: URL, migrations_dir: Path):
+    # Scrubbing the session instead of ending it looks like the tidier answer
+    # and quietly breaks the caller's engine: DISCARD ALL runs DEALLOCATE ALL,
+    # and asyncpg's per-connection statement cache then names prepared
+    # statements the server has forgotten. Measured: 17 tests in this module
+    # failed with `prepared statement "__asyncpg_stmt_1d__" does not exist`.
+    engine = create_async_engine(db_url)
+    try:
+        assert await apply_pending(engine, migrations_dir, emit=lambda _: None) == 2
+        # Both pooled connections at once, replaying a statement the runner
+        # itself issued on its work connection (_ensure_bookkeeping's), because
+        # that is the only thing a poisoned cache breaks on: a statement the
+        # server has forgotten but asyncpg still has a name for. A second
+        # apply_pending() does NOT do it — the pool hands the connections back
+        # in the other order, so the poisoned one becomes the next run's LOCK
+        # connection and never re-runs anything it had prepared. That version of
+        # this test passed against the broken code.
+        async with engine.connect() as first, engine.connect() as second:
+            for conn in (first, second):
+                await conn.execute(sa.text("RESET search_path"))
+                assert await conn.scalar(sa.text("SELECT 1")) == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_a_second_ledger_is_never_created_beside_an_existing_one(
+    db_url: URL, migrations_dir: Path
+):
+    """A migration can move the search_path the NEXT run resets to.
+
+    `RESET search_path` restores the configured default, and `ALTER DATABASE
+    ... SET search_path` outlives the session, the pool and the process.
+    Measured on a fresh engine afterwards: RESET yielded `evil`, `CREATE TABLE
+    IF NOT EXISTS schema_migrations` made a second, empty ledger there, and the
+    run silently re-applied an already-applied migration — a data migration's
+    row went in twice. An operator retargeting `ALTER ROLE ... SET search_path`
+    arrives at the same place by accident.
+    """
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE SCHEMA elsewhere;\n"
+        f'ALTER DATABASE "{db_url.database}" SET search_path = elsewhere;\n'
+        "CREATE TABLE IF NOT EXISTS reading (v INT);\nINSERT INTO public.reading VALUES (1);",
+        "DROP TABLE IF EXISTS reading;",
+    )
+    engine = create_async_engine(db_url)
+    try:
+        assert await apply_pending(engine, migrations_dir, emit=lambda _: None) == 3
+    finally:
+        await engine.dispose()
+
+    # A brand-new engine: nothing is left over on a pooled session, so the only
+    # thing carrying the redirection is the database's own default.
+    engine = create_async_engine(db_url)
+    try:
+        with pytest.raises(MigrationError, match="not on this connection's search_path"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+        async with engine.connect() as conn:
+            # Nothing applied twice, and no second ledger to make it look unapplied.
+            assert await conn.scalar(sa.text("SELECT count(*) FROM public.reading")) == 1
+            assert (
+                await conn.scalar(
+                    sa.text(
+                        "SELECT count(*) FROM pg_catalog.pg_class c "
+                        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE c.relname = 'schema_migrations' AND c.relkind = 'r'"
+                    )
+                )
+                == 1
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_a_ledger_reachable_only_later_on_the_path_is_used_not_duplicated(
+    db_url: URL, migrations_dir: Path
+):
+    # The same redirection, but with the ledger's schema still on the path
+    # behind the new one. `CREATE TABLE IF NOT EXISTS` checks only the schema it
+    # would create in — the FIRST on the path — not visibility, so it made a
+    # duplicate in `elsewhere` while `public.schema_migrations` sat right there
+    # and was perfectly visible. Nothing is refused here: the ledger resolves,
+    # so the run simply carries on.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE SCHEMA elsewhere;\n"
+        f'ALTER DATABASE "{db_url.database}" SET search_path = elsewhere, public;\n'
+        "CREATE TABLE IF NOT EXISTS reading (v INT);\nINSERT INTO public.reading VALUES (1);",
+        "DROP TABLE IF EXISTS reading;",
+    )
+    engine = create_async_engine(db_url)
+    try:
+        assert await apply_pending(engine, migrations_dir, emit=lambda _: None) == 3
+    finally:
+        await engine.dispose()
+
+    engine = create_async_engine(db_url)
+    try:
+        assert await apply_pending(engine, migrations_dir, emit=lambda _: None) == 0
+        async with engine.connect() as conn:
+            assert await conn.scalar(sa.text("SELECT count(*) FROM public.reading")) == 1
+            assert not await conn.scalar(
+                sa.text("SELECT to_regclass('elsewhere.schema_migrations') IS NOT NULL")
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_an_engine_that_cannot_supply_two_connections_says_so(
+    db_url: URL, migrations_dir: Path
+):
+    # The lock needs a session of its own, which is a pool requirement the
+    # caller never agreed to. It used to surface as a pool timeout after
+    # pool_timeout seconds, with no indication of why.
+    engine = create_async_engine(db_url, pool_size=1, max_overflow=0, pool_timeout=2)
+    try:
+        with pytest.raises(MigrationError, match="fewer than two"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
     finally:
         await engine.dispose()

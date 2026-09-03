@@ -47,7 +47,13 @@ message — a connection error's text carries the host and port.
 4. **One writer at a time.** A session-level advisory lock is taken before
    anything else and released explicitly, so it is not left held on a pooled
    connection where the next call from the same process succeeds while every
-   other process blocks.
+   other process blocks. It is held on a connection of its own, which the
+   migrations cannot reach — so the runner needs an engine able to supply **two**
+   connections, and refuses up front on one that cannot. That connection sits
+   idle while a migration runs, so the lock is re-checked immediately before
+   every history row: if its session was closed underneath us (an idle timeout,
+   a proxy), the run stops there rather than committing under a lock somebody
+   else may now hold.
 5. **Safe to re-run.** Re-applying is a no-op, so a retried deploy is harmless.
 6. **Every migration has a tested way back.** Each `NNN_name.sql` has a paired
    `NNN_name.down.sql`, and rollback refuses to start unless *every* down file it
@@ -64,6 +70,18 @@ message — a connection error's text carries the host and port.
    reported as a refusal naming the file and the error type, never the SQL.
 9. **Every refusal has a documented way forward** that does not involve editing
    `schema_migrations` by hand.
+10. **There is one ledger, and the runner will not quietly make a second.** A
+   second, empty `schema_migrations` reads as "nothing has ever been applied",
+   so the next run re-applies everything. Before creating one, the runner looks
+   for an existing `schema_migrations` across the whole database; if one exists
+   but is not on this connection's `search_path`, the run is refused and names
+   where it is. See "schema_migrations is not on this connection's search_path"
+   below.
+11. **The connection a migration ran on is dropped, not pooled.** A migration
+   can leave `search_path`, `statement_timeout`, `SET ROLE`, `LISTEN`
+   registrations and temporary objects behind, and a caller sharing the engine
+   would inherit all of it. Ending the session is the only reset that covers
+   every kind at once. Cost: one reconnect per run.
 
 ## Writing a migration
 
@@ -90,7 +108,15 @@ message — a connection error's text carries the host and port.
   runner: the ledger's schema is resolved before any migration runs, every
   bookkeeping statement runs with the path pinned to `pg_catalog` (which pins
   the `=` operator too, not just the table), each run starts by resetting the
-  path, and the connection is restored before it goes back to the pool.
+  path, and the connection is dropped rather than returned to the pool.
+- **Do not change the database's or the role's default `search_path` from a
+  migration.** `ALTER DATABASE … SET search_path` / `ALTER ROLE … SET
+  search_path` outlive the session, the pool and the process, and the next run
+  resets to the value you left. If that value no longer reaches
+  `schema_migrations`, the run is refused (guarantee 10) — and before that
+  refusal existed, it silently created a second ledger and re-applied every
+  migration. Setting a default search_path is an operator step, like role
+  provisioning.
 - The run lock is held on a **separate connection**. A migration cannot release
   it — `pg_advisory_unlock_all()` in a migration affects only its own session.
 - If a value needs a carriage return in it, write the escape — `E'a\r\nb'` —
@@ -195,6 +221,39 @@ connection was discarded instead, which ends its session and releases the
 session-scoped lock with it, so the next run is not blocked. It appears when the
 database became unreachable during the run; the refusal printed alongside it is
 the one to act on.
+
+**"the run lock is no longer held"** / **"lost contact with the session holding
+the run lock"**
+The connection carrying the advisory lock was closed while a migration ran — an
+`idle_session_timeout`, a connection proxy, or an administrator terminating the
+backend. A session-scoped lock dies with its session, so another run could have
+started. The migration in flight is rolled back and nothing further is applied;
+earlier migrations in the same run stay applied and recorded, as they always do.
+Check that no second run is in progress, then run again. If it recurs, raise
+`idle_session_timeout` for the migration role, or run migrations somewhere
+without a proxy in the path.
+
+**"could not open a second connection ... fewer than two"**
+The run lock needs a connection of its own. Give the runner an engine whose pool
+can supply two (the CLI's own engine always can); an engine created with
+`pool_size=1, max_overflow=0` cannot.
+
+**"schema_migrations is not on this connection's search_path, but one already
+exists at X"**
+The ledger exists at `X`, but this connection's `search_path` does not reach it,
+so applying anything would mean creating a second, empty ledger — which reads as
+"nothing has ever been applied" and re-applies every migration. Nothing was
+applied. Usually the database's or the role's default `search_path` changed
+(`ALTER DATABASE … SET search_path`, `ALTER ROLE … SET search_path`), possibly
+from inside a migration, which is why migrations must not set it (see "Writing a
+migration"). Fix by putting `X`'s schema back on the default path, or move the
+ledger deliberately:
+
+```sql
+ALTER TABLE X SET SCHEMA the_schema_you_want;   -- with no run in progress
+```
+
+Do not create the second table to get past it.
 
 **"cannot roll back to NNN_name.sql: it is not applied"**
 The target exists in the checkout but the database never reached it. Nothing was
