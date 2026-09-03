@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -338,7 +339,7 @@ async def test_the_lock_is_released_even_when_a_migration_fails(
     db_engine: AsyncEngine, db_url: URL, migrations_dir: Path
 ):
     write_pair(migrations_dir, "003_broken", "THIS IS NOT SQL;", "SELECT 1;")
-    with pytest.raises(MigrationError):
+    with pytest.raises(MigrationError, match="003_broken.sql failed to execute"):
         await apply_pending(db_engine, migrations_dir)
 
     other = create_async_engine(db_url)
@@ -563,9 +564,13 @@ async def test_a_failing_migration_stays_inside_the_error_taxonomy(
     with pytest.raises(MigrationError) as excinfo:
         await apply_pending(db_engine, migrations_dir)
 
-    message = str(excinfo.value)
-    assert "003_broken.sql failed to execute" in message
-    assert "THIS IS NOT SQL" not in message  # names and types only, never content
+    # Matched WHOLE, not searched for a phrase that must be absent: a blacklist
+    # only catches the leak you thought of, and this one is a security property.
+    # The pattern admits a filename and a bare exception type and nothing else,
+    # so any SQL, value, host or port reaching the message fails it.
+    assert re.fullmatch(r"003_broken\.sql failed to execute: [A-Za-z_]\w*", str(excinfo.value)), (
+        f"unexpected shape: {str(excinfo.value)!r}"
+    )
 
     # The two good migrations stand; the broken one recorded nothing.
     assert await applied_names(db_engine) == ["001_first.sql", "002_second.sql"]
@@ -797,7 +802,7 @@ async def test_the_lock_is_free_after_the_connection_was_discarded(
     )
     first = create_async_engine(db_url)
     try:
-        with pytest.raises(MigrationError):
+        with pytest.raises(MigrationError, match="003_third.sql failed to execute"):
             await apply_pending(first, migrations_dir, emit=lambda _: None)
     finally:
         await first.dispose()
@@ -991,7 +996,15 @@ async def test_migrations_are_lexed_as_standard_strings_whatever_the_database_de
             "CREATE TABLE smuggled (id INT);",
             "DROP TABLE IF EXISTS note;",
         )
-        with pytest.raises(MigrationError):
+        # Named, because the two assertions below are absences: they pass just as
+        # well if the run failed for some unrelated reason. And the NAME is the
+        # discriminator, not just a label — with the fix the server reads 'it\'
+        # and `s'...` as the guard does, so no COMMIT exists and the file dies of
+        # a syntax error while being EXECUTED. Without it the server honours the
+        # backslash, the COMMIT is real, the file executes clean, and the failure
+        # becomes the transaction-ended refusal instead. So reverting the fix
+        # fails this line before it reaches the absences below.
+        with pytest.raises(MigrationError, match=r"003_third\.sql failed to execute"):
             await apply_pending(engine, migrations_dir, emit=lambda _: None)
 
         # Nothing was smuggled past the guard, because the server lexed the file
@@ -1029,8 +1042,18 @@ async def test_the_cli_reports_an_unreachable_database_as_a_refusal(
 
     assert await cli.main() == 2
     err = capsys.readouterr().err
-    assert err.startswith("migration refused: the run failed (")
-    assert "127.0.0.1" not in err and "1" not in err.split("(")[0]
+    # `"1" not in err.split("(")[0]` used to stand for "the port did not leak".
+    # It inspects the text BEFORE the parenthesis, which is the constant
+    # "migration refused: the run failed " — so it could not fail, whatever the
+    # message carried. Measured: with `(ConnectionRefusedError: 127.0.0.2:1)`
+    # substituted in, the old assertion still passed.
+    #
+    # A whitelist over the whole line instead. The parenthesis may hold a bare
+    # exception type and nothing else, so a host, a port, a DSN or a driver
+    # message all fail it — including ones nobody listed.
+    assert re.fullmatch(r"migration refused: the run failed \([A-Za-z_]\w*\)\n", err), (
+        f"unexpected shape: {err!r}"
+    )
 
 
 async def test_cancelling_while_the_lock_is_granted_still_frees_it(
@@ -1529,6 +1552,9 @@ async def test_the_connection_is_returned_without_the_migrations_search_path(
     try:
         await apply_pending(engine, migrations_dir, emit=lambda _: None)
         async with engine.connect() as conn:
+            # The setup has to have happened for the absence below to mean
+            # anything: a migration that never ran leaves a clean session too.
+            assert await conn.scalar(sa.text("SELECT to_regnamespace('app') IS NOT NULL"))
             assert "app" not in str(await conn.scalar(sa.text("SHOW search_path")))
     finally:
         await engine.dispose()

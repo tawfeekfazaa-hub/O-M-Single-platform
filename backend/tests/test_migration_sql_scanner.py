@@ -212,9 +212,12 @@ def test_the_real_migrations_pass_the_guard():
     # The rule has to hold for what the repository actually ships, not only for
     # fixtures written to satisfy it.
     directory = Path(__file__).resolve().parents[1] / "migrations"
-    for path in sorted(directory.glob("*.sql")):
-        if not path.name.endswith(".down.sql"):
-            read_migration(path)
+    forward = [p for p in sorted(directory.glob("*.sql")) if not p.name.endswith(".down.sql")]
+    # Same reason as the carriage-return sweep below: a loop over an empty glob
+    # is a test that passes having read nothing.
+    assert forward, f"no forward migrations found under {directory}"
+    for path in forward:
+        read_migration(path)
 
 
 def test_a_real_commit_is_still_refused_beside_a_sql_standard_function_body(tmp_path: Path):
@@ -386,7 +389,13 @@ def test_no_migration_in_this_repository_carries_a_carriage_return():
     git and are not a reliable way to carry data.
     """
     directory = Path(__file__).resolve().parents[1] / "migrations"
-    offenders = [p.name for p in sorted(directory.glob("*.sql")) if b"\r" in p.read_bytes()]
+    files = sorted(directory.glob("*.sql"))
+    # Assert the sweep found something before concluding it found nothing wrong.
+    # A renamed or moved directory makes the glob empty and every CR in the
+    # repository invisible, with this test still green — the shape review has
+    # found in my tests three rounds running.
+    assert files, f"no migration files found under {directory}"
+    offenders = [p.name for p in files if b"\r" in p.read_bytes()]
     assert offenders == []
 
 
