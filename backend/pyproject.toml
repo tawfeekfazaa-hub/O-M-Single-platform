@@ -8,6 +8,14 @@ requires-python = ">=3.11"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# Unknown markers are an error: a typo in a marker would otherwise silently
+# deselect nothing and let the DB job "pass" without running a single test.
+# Live-database tests are DESELECTED by default so a bare `pytest` stays
+# offline and skip-free; `pytest -m dbtest` on the command line overrides this.
+addopts = "--strict-markers -m 'not dbtest'"
+markers = [
+    "dbtest: needs a live PostgreSQL/TimescaleDB named by TEST_DATABASE_URL",
+]
 
 [tool.ruff]
 line-length = 100
