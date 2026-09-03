@@ -64,9 +64,20 @@ that decides the next schema's shape.
    migration the runner asks the driver whether the transaction is still open,
    which holds however the transaction was ended.
 
-   Reading SQL without parsing it is exactly the kind of code that is
-   confidently wrong, so three measured false negatives are recorded here
-   rather than only fixed: `$` is legal inside an unquoted identifier, so
+   The guard is a **tokenizer**, not a search, and that distinction was
+   learned the expensive way. Its first form blanked comments and quotes and
+   then looked for keywords, with single-character look-back to decide what a
+   `$` or an `E` meant. Review broke it four times over two rounds, and every
+   break had the same shape: a delimiter, a string prefix or a keyword read out
+   of the MIDDLE of an identifier — `foo$$`, `foo$E'...'`, `foo$BEGIN ATOMIC`,
+   an identifier with a non-ASCII character before `$$`. PostgreSQL lexes an
+   identifier greedily and `$` is an identifier character after the first, so
+   consuming whole identifiers makes that entire class of misreading
+   impossible instead of excluding its members one at a time. Patching the
+   fourth corner would have invited a fifth.
+
+   Recorded from the same rounds, as measured false negatives rather than
+   only fixed: `$` is legal inside an unquoted identifier, so
    reading the `$$` of `foo$$` as a dollar quote blanked the file through to
    the next `$$` and hid a real `COMMIT`; one `BEGIN ATOMIC` body used to
    exempt *every* `END` in the file rather than its own; and with
@@ -108,6 +119,13 @@ that decides the next schema's shape.
    the only remedy on offer was to roll the migration back, destroying data to
    close a bookkeeping gap. `--adopt-legacy-checksums` now records it in place,
    under the same explicit-operator-action posture as 2.
+4g. **The lock is taken inside the region that releases it.** PostgreSQL can
+   grant the advisory lock and the caller be cancelled before the runner sees
+   the result, so acquiring it before entering the `try/finally` left a window
+   where a locked session went back to the pool with nothing arranged to
+   release it. `pg_advisory_unlock` only ever releases a lock held by the
+   calling session, so running it when the lock may not have been granted
+   cannot disturb the run that does hold it.
 5. **Role provisioning is not a migration.** The runner is not assumed to be a
    superuser or able to create roles; roles and grants are an operator step, so
    no migration ever carries a role name bound to a password. The concrete

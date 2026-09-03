@@ -52,6 +52,19 @@ def write(tmp_path: Path, sql: str, *, down: str | None = None) -> Path:
         "CREATE TABLE foo$$ (id int); COMMIT; CREATE TABLE bar$$ (id int);",
         # A genuine END after a BEGIN ATOMIC body: PostgreSQL commits on it.
         "CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1; END; END;",
+        # `foo$E` is one identifier, so the quote after it opens a PLAIN string
+        # in which a backslash escapes nothing. Reading that E as a string
+        # prefix ran the literal on to the next quote and swallowed the COMMIT.
+        "SELECT foo$E'abc\\'; COMMIT; SELECT 'done';",
+        # `foo$BEGIN` is one identifier and `ATOMIC` its alias — not a function
+        # body opener, so the END that follows is a real commit.
+        "SELECT 1 FROM foo$BEGIN ATOMIC; END;",
+        # `begin` is an unreserved word, so this is a table named `begin`
+        # aliased `atomic` — not a function body, so the END is a real commit.
+        "SELECT * FROM begin atomic; END;",
+        # A non-ASCII character is an identifier character to PostgreSQL, so
+        # these dollars belong to the table names, not to a quote.
+        "CREATE TABLE aq\u0301$$ (id int); COMMIT; CREATE TABLE bq\u0301$$ (id int);",
     ],
 )
 def test_a_migration_that_manages_its_own_transaction_is_refused(tmp_path: Path, sql: str):
@@ -134,6 +147,23 @@ def test_the_refusal_names_what_it_found(tmp_path: Path):
             "CREATE TABLE tbl$x (id INT);\n"
             "CREATE FUNCTION f() RETURNS INT AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql;",
         ),
+        (
+            # A dollar-quote tag follows identifier rules, which include
+            # non-ASCII letters. Refusing this would refuse valid SQL.
+            "unicode dollar-quote tag",
+            "CREATE FUNCTION uni() RETURNS INT AS $\u00e9$ BEGIN RETURN 1; END; $\u00e9$ "
+            "LANGUAGE plpgsql;",
+        ),
+        (
+            "tagged body whose tag contains digits and underscores",
+            "CREATE FUNCTION f() RETURNS INT AS $body_2$ BEGIN RETURN 1; END; $body_2$ "
+            "LANGUAGE plpgsql;",
+        ),
+        (
+            # $1 is a positional parameter, not a quote delimiter.
+            "positional parameters",
+            "CREATE FUNCTION f(int) RETURNS INT AS 'SELECT $1' LANGUAGE sql;",
+        ),
     ],
 )
 def test_transaction_keywords_that_are_not_transaction_control_are_allowed(
@@ -185,3 +215,27 @@ def test_the_end_exemption_is_spent_by_the_body_that_earned_it(tmp_path: Path):
             )
         )
     assert "END" in str(excinfo.value)
+
+
+def test_an_identifier_is_read_as_one_token(tmp_path: Path):
+    """The property the whole guard rests on, stated directly.
+
+    PostgreSQL lexes an identifier greedily and `$` is an identifier character
+    after the first, so `foo$$`, `foo$E` and `foo$BEGIN` are single tokens.
+    Every bypass found in review came from reading a delimiter, a string prefix
+    or a keyword out of the middle of one.
+    """
+    from app.db.migrations import _statements
+
+    assert _statements("SELECT foo$$ FROM bar$BEGIN") == [["SELECT", "FOO$$", "FROM", "BAR$BEGIN"]]
+    assert _statements("SELECT foo$E'x'") == [["SELECT", "FOO$E"]]
+    assert _statements("SELECT E'x'") == [["SELECT"]]  # a real escape-string prefix
+
+
+def test_words_inside_quotes_and_comments_are_not_tokens(tmp_path: Path):
+    from app.db.migrations import _statements
+
+    assert _statements("SELECT 'COMMIT'; -- COMMIT\n/* COMMIT */ SELECT $$COMMIT$$") == [
+        ["SELECT"],
+        ["SELECT"],
+    ]

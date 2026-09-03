@@ -102,137 +102,148 @@ def _digest(content: str) -> str:
 _TX_CONTROL = frozenset({"BEGIN", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE"})
 #: Only transaction control when followed by TRANSACTION; ``PREPARE stmt AS`` is not.
 _TX_CONTROL_PAIRS = frozenset({("START", "TRANSACTION"), ("PREPARE", "TRANSACTION")})
-_DOLLAR_TAG = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
-#: A PostgreSQL 14+ ``LANGUAGE SQL`` body: ``BEGIN ATOMIC ... END``, not a
-#: transaction. Unlike a ``$$ ... $$`` body it is not quoted, so it cannot be
-#: blanked out wholesale.
-_BEGIN_ATOMIC = re.compile(r"\bBEGIN\s+ATOMIC\b", re.IGNORECASE)
-_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
-def _ident_char(ch: str) -> bool:
-    """Whether ``ch`` can continue an unquoted PostgreSQL identifier.
-
-    Deliberately liberal: treating a character as part of an identifier can
-    only make the scanner blank LESS, which risks a false alarm. Treating one
-    as a delimiter blanks more, which risks missing a real COMMIT.
-    """
-    return ch.isalnum() or ch in "_$"
+def _is_ident_start(ch: str) -> bool:
+    """PostgreSQL: a letter, an underscore, or any non-ASCII character."""
+    return ch.isalpha() or ch == "_" or ord(ch) >= 128
 
 
-def _blank_quoted_and_commented(sql: str) -> str:
-    """Replace comments and quoted text with spaces, keeping every other offset.
+def _is_ident_cont(ch: str) -> bool:
+    """As above, plus digits and dollar signs after the first character."""
+    return ch.isalnum() or ch in "_$" or ord(ch) >= 128
 
-    Keyword scanning is only honest once the parts of the file that merely
-    *contain* words are neutralised: a ``COMMIT`` in a comment, in a string
-    literal, or inside a PL/pgSQL ``$$ BEGIN ... END $$`` body is not
-    transaction control, and refusing a migration over one would be a false
-    alarm an author could not work around.
-    """
-    out = list(sql)
+
+def _string_end(sql: str, start: int, quote: str, *, backslash_escapes: bool) -> int:
+    """Index just past the string or quoted identifier opening at ``start``."""
     n = len(sql)
-    i = 0
-
-    def blank(start: int, stop: int) -> None:
-        for k in range(start, stop):
-            if out[k] != "\n":  # keep line numbers intact for any future reporting
-                out[k] = " "
-
-    def scan_quote(start: int, quote: str, backslash_escapes: bool) -> int:
-        j = start + 1
-        while j < n:
-            if backslash_escapes and sql[j] == "\\" and j + 1 < n:
-                j += 2
+    i = start + 1
+    while i < n:
+        if backslash_escapes and sql[i] == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if sql[i] == quote:
+            if i + 1 < n and sql[i + 1] == quote:  # '' and "" are escaped quotes
+                i += 2
                 continue
-            if sql[j] == quote:
-                if j + 1 < n and sql[j + 1] == quote:  # '' or "" is an escaped quote
-                    j += 2
-                    continue
-                return j + 1
-            j += 1
-        return n  # unterminated: the database will reject it, we just stop here
+            return i + 1
+        i += 1
+    return n  # unterminated: the server will reject it, we just stop here
 
+
+def _dollar_delimiter(sql: str, start: int) -> int:
+    """Length of the dollar-quote delimiter at ``start``, or 0 if it is not one.
+
+    The tag follows identifier rules but cannot itself contain a dollar sign,
+    so ``$$``, ``$body$`` and ``$é$`` are delimiters while ``$1`` is not.
+    """
+    n = len(sql)
+    i = start + 1
+    if i < n and _is_ident_start(sql[i]):
+        i += 1
+        while i < n and sql[i] != "$" and _is_ident_cont(sql[i]):
+            i += 1
+    return i - start + 1 if i < n and sql[i] == "$" else 0
+
+
+def _statements(sql: str) -> list[list[str]]:
+    """``sql`` split on ``;``, each statement as its upper-cased word tokens.
+
+    A tokenizer rather than a search, because every bypass found in review came
+    from reading a keyword, a quote delimiter or a string prefix out of the
+    MIDDLE of an identifier: ``foo$$``, ``foo$BEGIN ATOMIC``, ``foo$E'...'``.
+    PostgreSQL lexes an identifier greedily and ``$`` is an identifier character
+    after the first, so consuming whole identifiers is what makes those
+    misreadings impossible, rather than excluding them one at a time.
+
+    Comments, string literals and quoted identifiers yield no tokens: they can
+    contain any words at all without meaning them.
+    """
+    statements: list[list[str]] = []
+    words: list[str] = []
+    i, n = 0, len(sql)
     while i < n:
         ch = sql[i]
         if sql.startswith("--", i):
             end = sql.find("\n", i)
-            end = n if end == -1 else end
-            blank(i, end)
-            i = end
+            i = n if end == -1 else end
         elif sql.startswith("/*", i):
-            depth, j = 1, i + 2
-            while j < n and depth:
-                if sql.startswith("/*", j):  # PostgreSQL block comments nest
-                    depth += 1
-                    j += 2
-                elif sql.startswith("*/", j):
-                    depth -= 1
-                    j += 2
+            depth, i = 1, i + 2
+            while i < n and depth:  # PostgreSQL block comments nest
+                if sql.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
                 else:
-                    j += 1
-            blank(i, j)
-            i = j
-        elif ch in "'\"":
-            # E'...' honours backslash escapes; a plain '...' does not.
-            escaped = (
-                ch == "'"
-                and i > 0
-                and sql[i - 1] in "Ee"
-                and (i == 1 or not _WORD.match(sql[i - 2]))
-            )
-            end = scan_quote(i, ch, escaped)
-            blank(i, end)
-            i = end
-        elif (
-            ch == "$"
-            and not _ident_char(sql[i - 1] if i else "")
-            and (tag := _DOLLAR_TAG.match(sql, i))
-        ):
-            # A `$` that CONTINUES an identifier does not open a dollar quote:
-            # PostgreSQL accepts `foo$$` as a table name, and reading its `$$`
-            # as an opener blanks everything up to the next `$$` in the file —
-            # hiding any real COMMIT in between. Closing is deliberately not
-            # boundary-checked: PostgreSQL ends a dollar-quoted string at the
-            # first literal occurrence of the tag, wherever it falls.
-            close = sql.find(tag.group(0), tag.end())
-            end = n if close == -1 else close + len(tag.group(0))
-            blank(i, end)
-            i = end
-        else:
+                    i += 1
+        elif ch == ";":
+            statements.append(words)
+            words = []
             i += 1
-    return "".join(out)
+        elif ch in "'\"":
+            # Plain literals never honour backslash escapes, because the runner
+            # executes migrations with standard_conforming_strings = on.
+            i = _string_end(sql, i, ch, backslash_escapes=False)
+        elif ch == "$" and (length := _dollar_delimiter(sql, i)):
+            tag = sql[i : i + length]
+            # PostgreSQL closes at the first literal occurrence of the tag,
+            # wherever it falls, so the close is deliberately not boundary-checked.
+            close = sql.find(tag, i + length)
+            i = n if close == -1 else close + length
+        elif _is_ident_start(ch):
+            end = i + 1
+            while end < n and _is_ident_cont(sql[end]):
+                end += 1
+            word = sql[i:end]
+            if word in ("E", "e") and end < n and sql[end] == "'":
+                # E'...' is one lexical unit and the only string form where a
+                # backslash escapes. `foo$E'...'` is NOT one — that E belongs to
+                # the identifier — which is why this asks about the whole token
+                # rather than the character before the quote.
+                i = _string_end(sql, end, "'", backslash_escapes=True)
+            else:
+                words.append(word.upper())
+                i = end
+        else:
+            i += 1  # numbers, operators, punctuation, $1 parameters
+    statements.append(words)
+    return statements
 
 
 def _transaction_control(sql: str) -> list[str]:
     """Transaction-control statements found in ``sql``, in order of appearance.
 
-    Best effort by design: it is the *guard*, not the guarantee. The guarantee
-    is the post-execution check in :func:`_run_sql`, which measures whether the
-    transaction is still open rather than inferring it from the text.
+    A guard, not the guarantee. The guarantee is the post-execution check in
+    :func:`_run_sql`, which measures whether the transaction is still open
+    rather than inferring it from the text.
     """
     found: list[str] = []
     open_bodies = 0
-    for statement in _blank_quoted_and_commented(sql).split(";"):
-        words = _WORD.findall(statement)
+    for words in _statements(sql):
         if not words:
             continue
-        first = words[0].upper()
-        second = words[1].upper() if len(words) > 1 else ""
+        first = words[0]
+        second = words[1] if len(words) > 1 else ""
 
         if first == "END" and open_bodies:
-            # This END closes a BEGIN ATOMIC body rather than a transaction.
-            # Statements INSIDE such a body never begin with END — a
-            # `CASE ... END` sits mid-statement — so the first statement-initial
-            # END after the body opened is precisely its terminator. Counting
-            # them keeps the exemption to the body: a second END, with no body
-            # left open, is a COMMIT synonym and is still refused.
+            # Closes a BEGIN ATOMIC body rather than a transaction. Statements
+            # inside such a body never begin with END — a `CASE ... END` sits
+            # mid-statement — so the first statement-initial END after a body
+            # opens is precisely its terminator.
             open_bodies -= 1
             continue
         if first in _TX_CONTROL:
             found.append(first)
         elif (first, second) in _TX_CONTROL_PAIRS:
             found.append(f"{first} {second}")
-        open_bodies += len(_BEGIN_ATOMIC.findall(statement))
+
+        if first == "CREATE":
+            # A BEGIN ATOMIC body can only belong to CREATE [OR REPLACE]
+            # FUNCTION or PROCEDURE. Requiring that context stops the words
+            # being read as an opener where they are a table and its alias.
+            open_bodies += sum(
+                a == "BEGIN" and b == "ATOMIC" for a, b in zip(words, words[1:], strict=False)
+            )
     return found
 
 
@@ -587,6 +598,12 @@ async def _unlock(conn: AsyncConnection, *, emit: Emit) -> None:
     or process blocks on it, while a second call through the same pooled session
     succeeds anyway because advisory locks are reentrant, hiding the leak.
 
+    Runs even when the lock was never granted — a concurrent run holds it, or a
+    cancellation landed on the grant so nobody knows. ``pg_advisory_unlock``
+    only ever releases a lock held by THIS session, so releasing one we may not
+    hold cannot disturb the run that does; it returns false and says so in the
+    server log.
+
     This runs in a ``finally``, so anything it raises would REPLACE the failure
     that brought us here — a database that went away mid-migration would reach
     the operator as a closed-connection traceback instead of the refusal the CLI
@@ -626,8 +643,11 @@ async def apply_pending(
     known = {m.filename: m for m in migrations}
     applied_count = 0
     async with engine.connect() as conn:
-        await _lock(conn)
+        # _lock is INSIDE the guarded region: PostgreSQL may grant the lock and
+        # the caller be cancelled before the result is seen, which would return
+        # a locked session to the pool with nothing arranged to release it.
         try:
+            await _lock(conn)
             await _ensure_bookkeeping(conn)
             await conn.commit()
             applied = await _applied_rows(conn)
@@ -682,8 +702,10 @@ async def downgrade_to(
         raise MigrationError(f"unknown --down-to target: {target}")
 
     async with engine.connect() as conn:
-        await _lock(conn)
+        # As in apply_pending: the lock is taken inside the region that releases
+        # it, so a cancellation landing on the grant cannot strand it.
         try:
+            await _lock(conn)
             await _ensure_bookkeeping(conn)
             await conn.commit()
             applied = await _applied_rows(conn)

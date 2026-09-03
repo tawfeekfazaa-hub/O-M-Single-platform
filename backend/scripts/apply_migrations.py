@@ -62,8 +62,12 @@ async def main() -> int:
         print("DATABASE_URL is not set — nothing to migrate.", file=sys.stderr)
         return 1
 
-    engine = create_async_engine(settings.database_url)
+    engine = None
     try:
+        # Inside the handler: a malformed URL or an unavailable dialect makes
+        # create_async_engine() raise synchronously, and a configuration mistake
+        # is exactly the failure an operator should see as a refusal.
+        engine = create_async_engine(settings.database_url)
         if args.status:
             drifted = 0
             for state in await status(engine, MIGRATIONS_DIR):
@@ -103,7 +107,8 @@ async def main() -> int:
         print(f"migration refused: the run failed ({type(exc).__name__})", file=sys.stderr)
         return 2
     finally:
-        await engine.dispose()
+        if engine is not None:
+            await engine.dispose()
     return 0
 
 

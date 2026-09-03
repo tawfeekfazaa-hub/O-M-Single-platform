@@ -220,7 +220,9 @@ TEST_DATABASE_URL=postgresql+asyncpg://user@127.0.0.1:5432/postgres \
 ```
 
 Each test creates and drops its own database, so the one named in
-`TEST_DATABASE_URL` is only used to connect — it is never modified. In CI these
+`TEST_DATABASE_URL` is only used to connect — it is never modified, and it is
+the database actually used for that connection, so the role needs no access to
+the cluster's `postgres` database. In CI these
 run in the `backend-db` job against the same pinned TimescaleDB image as
 `docker-compose.yml`. A bare `pytest` deselects them, so the default suite stays
 offline and skip-free.

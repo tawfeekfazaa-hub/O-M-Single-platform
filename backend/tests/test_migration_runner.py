@@ -995,3 +995,78 @@ async def test_the_cli_reports_an_unreachable_database_as_a_refusal(
     err = capsys.readouterr().err
     assert err.startswith("migration refused: the run failed (")
     assert "127.0.0.1" not in err and "1" not in err.split("(")[0]
+
+
+async def test_cancelling_while_the_lock_is_granted_still_frees_it(
+    db_url: URL, migrations_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A narrower window than the cleanup one: PostgreSQL can grant the lock and
+    # the caller be cancelled before the runner has arranged to release it. The
+    # acquisition therefore has to happen INSIDE the region that releases it,
+    # not before entering it.
+    engine = create_async_engine(db_url)
+    real_commit = migrations_module.AsyncConnection.commit
+
+    async def cancel_right_after_the_grant(self, *args, **kwargs):
+        # _lock's commit, immediately after pg_try_advisory_lock returned true.
+        monkeypatch.undo()
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+        return await real_commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(migrations_module.AsyncConnection, "commit", cancel_right_after_the_grant)
+
+    task = asyncio.create_task(apply_pending(engine, migrations_dir, emit=lambda _: None))
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    other = create_async_engine(db_url)
+    try:
+        async with other.connect() as conn:
+            assert await conn.scalar(
+                sa.text("SELECT pg_try_advisory_lock(:k)"),
+                {"k": migrations_module.ADVISORY_LOCK_KEY},
+            )
+    finally:
+        await other.dispose()
+        await engine.dispose()
+
+
+async def test_the_cli_reports_a_malformed_database_url_as_a_refusal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    # create_async_engine() raises synchronously for a malformed URL or an
+    # unavailable dialect, so building the engine has to happen inside the
+    # handler — a configuration mistake is exactly the failure an operator
+    # should see as a refusal rather than a traceback.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "apply_migrations_cli",
+        Path(__file__).resolve().parents[1] / "scripts" / "apply_migrations.py",
+    )
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    monkeypatch.setattr(
+        cli,
+        "_parse_args",
+        lambda: argparse.Namespace(status=False, down_to=None, adopt_legacy_checksums=False),
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: SimpleNamespace(database_url="not-a-url"))
+
+    assert await cli.main() == 2
+    assert capsys.readouterr().err.startswith("migration refused: the run failed (")
+
+
+def test_the_maintenance_connection_uses_the_database_it_was_given():
+    # Substituting `postgres` was a silent extra requirement: a role that can
+    # reach the database it was given but not the cluster's `postgres` failed
+    # every live test before the first one ran.
+    from sqlalchemy.engine import make_url
+
+    from tests.conftest import _admin_url
+
+    url = make_url("postgresql+asyncpg://someone@example.invalid:5432/their_db")
+    assert _admin_url(url).database == "their_db"

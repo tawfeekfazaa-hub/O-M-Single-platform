@@ -47,9 +47,17 @@ def repository() -> InMemoryRepository:
 
 
 def _admin_url(url: URL) -> URL:
-    """Same server, maintenance database — CREATE DATABASE needs a connection
-    that is not the database being created."""
-    return url.set(database="postgres")
+    """The supplied URL, used as-is for CREATE/DROP DATABASE.
+
+    CREATE DATABASE only needs a connection to some database other than the one
+    being created, and the generated names are unique, so the supplied one
+    always qualifies. Substituting ``postgres`` here used to be a silent extra
+    requirement: a role that can reach the database it was given but not the
+    cluster's ``postgres`` failed every live test before the first one ran —
+    and it contradicted the documented promise that the named database is only
+    a connection point.
+    """
+    return url
 
 
 @pytest.fixture(scope="session")
