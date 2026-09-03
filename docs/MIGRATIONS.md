@@ -32,10 +32,11 @@ message — a connection error's text carries the host and port.
 1. **An applied migration is immutable — and so is its rollback.** A SHA-256 of
    the forward file *and* of its `.down.sql` is stored on first apply and
    re-verified on every later run. Editing either refuses the whole run,
-   including any pending migrations behind it. The checksum is taken over
-   newline-normalized content, so a CRLF checkout does not trip it — but only
-   the checksum is normalized. Migrations run exactly as written, so a CRLF
-   inside a string literal is stored as a CRLF.
+   including any pending migrations behind it. The checksum is over the file's
+   exact bytes — nothing is normalized — so two files that would execute
+   differently can never share one. Line endings are pinned instead by
+   `.gitattributes` (`*.sql text eol=lf`), and a test asserts no migration in
+   this repository carries a CR.
 2. **What is executed is what was checksummed.** Each file is read once, at
    discovery; that exact text is both hashed and executed. A file replaced
    mid-run cannot record one hash and run different SQL.
@@ -84,6 +85,10 @@ message — a connection error's text carries the host and port.
   `COMMIT` the guard reads as quoted text is one the server executes.
 - Anything that cannot run inside a transaction — `CREATE INDEX CONCURRENTLY`,
   `VACUUM` — cannot be a migration here. Do it as an operator step.
+- If a value needs a carriage return in it, write the escape — `E'a\r\nb'` —
+  rather than a physical CRLF in the file. Line endings are normalized by git on
+  the way in and out, so they are not a reliable way to carry data, and a CR in
+  a migration file will fail the check above.
 - Write the paired `NNN_lower_snake.down.sql` at the same time. A migration
   without one can be applied but blocks any rollback past it.
 - Prefer additive changes (new tables, nullable columns). They make the down

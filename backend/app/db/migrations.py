@@ -7,12 +7,12 @@ Guarantees this runner provides, in the order they matter:
    applied and re-verified before they are used again. A rollback file is as
    destructive as the forward file is constructive, so it gets the same
    protection.
-2. **What is executed is what was checksummed.** Each file is read exactly once;
-   that text is executed, and its newline-normalized form is hashed. A file
-   replaced mid-run (a deploy updating a shared checkout) cannot record one hash
-   and run another. The normalization exists so a CRLF checkout does not refuse
-   every run, and it stops at the hash: the file is executed exactly as written,
-   because a CRLF inside a string literal is part of the value.
+2. **What is executed is what was checksummed.** Each file is read exactly once,
+   and that exact text is both hashed and executed — no normalization anywhere,
+   so two files that would execute differently can never share a checksum. A
+   file replaced mid-run (a deploy updating a shared checkout) cannot record one
+   hash and run another. Line endings are pinned by ``.gitattributes`` instead,
+   which is checked by a test.
 3. **History is a prefix.** Applied migrations must be the first N of the
    discovered sequence. A migration numbered behind ones already applied is
    refused, because applying it would make the recorded order a lie and send
@@ -88,23 +88,24 @@ def _decode(raw: bytes) -> str:
 
 
 def _checksum(content: str) -> str:
-    """SHA-256 over newline-normalized content.
+    """SHA-256 over the exact text that will be executed. No normalization.
 
-    A Windows checkout can rewrite LF to CRLF (the README documents a Windows
-    workflow), which would change a byte-level hash without changing a single
-    SQL statement and refuse every subsequent run. Normalizing makes the
-    checksum a property of the SQL rather than of the checkout.
+    This was briefly a hash of newline-normalized content, so that a CRLF
+    checkout could not change every checksum and refuse every run. That folding
+    is gone, because it made two files that EXECUTE DIFFERENTLY hash the same:
+    a physical CRLF inside a string literal is part of the value, so an LF and a
+    CRLF checkout inserted different data under one recorded history, and
+    editing an applied literal from LF to CRLF passed the immutability check.
 
-    The normalization stops here, at the hash. It deliberately does NOT touch
-    what is executed: a CRLF inside a string literal or a dollar-quoted body is
-    part of the VALUE, and folding it would quietly store different data than
-    the migration says. Measured before this split: ``'first\r\nsecond'``
-    reached the column as ``first\nsecond``.
+    The checkout problem is handled where it belongs — ``.gitattributes`` pins
+    ``*.sql`` to LF in the working tree, and a test asserts no migration in this
+    repository contains a CR — rather than by making the checksum blind to a
+    difference that reaches the database.
 
-    "What was checksummed is what runs" still holds, because both come from the
-    same single read of the file — see :class:`Migration`.
+    So "what was checksummed is what runs" is an identity again, not an
+    argument: same text, same bytes, one read.
     """
-    return _digest(content.replace("\r\n", "\n"))
+    return _digest(content)
 
 
 def _digest(content: str) -> str:
@@ -167,6 +168,11 @@ class _Token(NamedTuple):
     #: at depth 1, its SQL-standard body at depth 0 — which is the difference
     #: between `CREATE FUNCTION f(begin atomic)` and a real body opener.
     depth: int
+    #: Whether only whitespace and comments separate this token from the one
+    #: before it. `begin.atomic` is a qualified NAME, not the two keywords:
+    #: the dot makes them two tokens that are adjacent in the word list but not
+    #: in the SQL.
+    adjacent: bool
 
 
 def _statements(sql: str) -> list[list[_Token]]:
@@ -185,6 +191,7 @@ def _statements(sql: str) -> list[list[_Token]]:
     statements: list[list[_Token]] = []
     words: list[_Token] = []
     depth = 0
+    separated = False  # punctuation seen since the last word token
     i, n = 0, len(sql)
     while i < n:
         ch = sql[i]
@@ -197,29 +204,36 @@ def _statements(sql: str) -> list[list[_Token]]:
             breaks = [p for p in (sql.find("\n", i), sql.find("\r", i)) if p != -1]
             i = min(breaks) if breaks else n
         elif sql.startswith("/*", i):
-            depth, i = 1, i + 2
-            while i < n and depth:  # PostgreSQL block comments nest
+            # `nesting`, NOT `depth`: this counter belongs to the comment, and
+            # reusing the parenthesis one left it at zero afterwards — so a
+            # block comment anywhere inside a routine signature made every
+            # token after it look top-level.
+            nesting, i = 1, i + 2
+            while i < n and nesting:  # PostgreSQL block comments nest
                 if sql.startswith("/*", i):
-                    depth, i = depth + 1, i + 2
+                    nesting, i = nesting + 1, i + 2
                 elif sql.startswith("*/", i):
-                    depth, i = depth - 1, i + 2
+                    nesting, i = nesting - 1, i + 2
                 else:
                     i += 1
         elif ch == ";":
             statements.append(words)
             words = []
             depth = 0  # a new statement starts outside any parentheses
+            separated = False
             i += 1
         elif ch in "'\"":
             # Plain literals never honour backslash escapes, because the runner
             # executes migrations with standard_conforming_strings = on.
             i = _string_end(sql, i, ch, backslash_escapes=False)
+            separated = True
         elif ch == "$" and (length := _dollar_delimiter(sql, i)):
             tag = sql[i : i + length]
             # PostgreSQL closes at the first literal occurrence of the tag,
             # wherever it falls, so the close is deliberately not boundary-checked.
             close = sql.find(tag, i + length)
             i = n if close == -1 else close + length
+            separated = True
         elif _is_ident_start(ch):
             end = i + 1
             while end < n and _is_ident_cont(sql[end]):
@@ -231,14 +245,19 @@ def _statements(sql: str) -> list[list[_Token]]:
                 # the identifier — which is why this asks about the whole token
                 # rather than the character before the quote.
                 i = _string_end(sql, end, "'", backslash_escapes=True)
+                separated = True
             else:
-                words.append(_Token(word.upper(), depth))
+                words.append(_Token(word.upper(), depth, not separated))
+                separated = False
                 i = end
+        elif ch.isspace():
+            i += 1  # whitespace does not separate two keywords
         else:
             if ch == "(":
                 depth += 1
             elif ch == ")":
                 depth = max(0, depth - 1)
+            separated = True
             i += 1  # numbers, operators, punctuation, $1 parameters
     statements.append(words)
     return statements
@@ -295,7 +314,7 @@ def _transaction_control(sql: str) -> list[str]:
             # names a parameter and a type — it does not open a body, and
             # counting it exempted the real END that followed.
             open_bodies += sum(
-                a.word == "BEGIN" and b.word == "ATOMIC" and a.depth == 0
+                a.word == "BEGIN" and b.word == "ATOMIC" and a.depth == 0 and b.adjacent
                 for a, b in zip(tokens, tokens[1:], strict=False)
             )
     return found

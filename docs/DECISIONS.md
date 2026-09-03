@@ -127,6 +127,15 @@ that decides the next schema's shape.
    the only remedy on offer was to roll the migration back, destroying data to
    close a bookkeeping gap. `--adopt-legacy-checksums` now records it in place,
    under the same explicit-operator-action posture as 2.
+4h. **The checksum is over the file's exact bytes.** It was briefly taken over
+   newline-normalized content, so that a CRLF checkout could not change every
+   hash and refuse every run. That folding was withdrawn: a physical CRLF inside
+   a string literal is part of the value, so two files that insert different
+   data hashed the same, and editing an applied literal from LF to CRLF passed
+   the immutability check. Immutability that cannot see a difference the
+   database will see is not immutability. The checkout problem moved to
+   `.gitattributes` (`*.sql text eol=lf`), with a test asserting the outcome —
+   no CR in any migration — rather than trusting the configuration.
 4g. **The lock is taken inside the region that releases it.** PostgreSQL can
    grant the advisory lock and the caller be cancelled before the runner sees
    the result, so acquiring it before entering the `try/finally` left a window

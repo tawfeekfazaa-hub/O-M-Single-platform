@@ -72,6 +72,13 @@ def write(tmp_path: Path, sql: str, *, down: str | None = None) -> Path:
         # a type named `atomic` — with a quoted body. No SQL-standard body is
         # opened, so the END that follows is a real commit.
         "CREATE FUNCTION f(begin atomic) RETURNS int LANGUAGE SQL AS 'SELECT 1'; END;",
+        # Same, with a block comment after the `(`. The comment must not cost
+        # the tokenizer its place inside the parentheses.
+        "CREATE FUNCTION f(/* note */ begin atomic) RETURNS int LANGUAGE SQL AS 'SELECT 1'; END;",
+        # `begin.atomic` is a schema-qualified NAME, not the two keywords: the
+        # dot separates them in the SQL even though they are adjacent words.
+        "CREATE SCHEMA begin; CREATE FUNCTION begin.atomic() RETURNS int "
+        "LANGUAGE SQL AS 'SELECT 1'; END;",
         # A non-ASCII character is an identifier character to PostgreSQL, so
         # these dollars belong to the table names, not to a quote.
         "CREATE TABLE aq\u0301$$ (id int); COMMIT; CREATE TABLE bq\u0301$$ (id int);",
@@ -149,6 +156,13 @@ def test_the_refusal_names_what_it_found(tmp_path: Path):
             # The CR rule must not swallow the rest of the file either.
             "line comment ended by a bare CR",
             "-- a note\rCREATE TABLE t (id int);",
+        ),
+        (
+            # Comments are whitespace, so they must NOT break the adjacency the
+            # opener rule relies on.
+            "sql-standard body with a comment between the keywords",
+            "CREATE FUNCTION f() RETURNS INT LANGUAGE SQL "
+            "BEGIN /* still a body */ ATOMIC SELECT 1; END;",
         ),
         (
             "sql-standard body containing CASE ... END",
@@ -280,6 +294,28 @@ def test_tokens_carry_their_parenthesis_depth(tmp_path: Path):
     (body, *_) = _statements("CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1")
     assert {t.word: t.depth for t in body}["BEGIN"] == 0
 
+    # A comment inside the signature must not cost the tokenizer its place: the
+    # comment's own nesting counter used to overwrite the parenthesis depth.
+    (commented,) = _statements("CREATE FUNCTION f(/* note */ begin atomic)")
+    assert {t.word: t.depth for t in commented}["BEGIN"] == 1
+
+
+def test_tokens_know_whether_punctuation_separated_them(tmp_path: Path):
+    # `begin.atomic` is one qualified name. Without this, the dot vanished and
+    # the two halves read as the keywords that open a routine body.
+    from app.db.migrations import _statements
+
+    (qualified,) = _statements("CREATE FUNCTION begin.atomic()")
+    assert [(t.word, t.adjacent) for t in qualified] == [
+        ("CREATE", True),
+        ("FUNCTION", True),
+        ("BEGIN", True),
+        ("ATOMIC", False),  # the dot separates it
+    ]
+
+    (keywords,) = _statements("BEGIN /* c */ ATOMIC")
+    assert [t.adjacent for t in keywords] == [True, True]  # comments are whitespace
+
 
 def test_only_a_routine_definition_opens_a_body(tmp_path: Path):
     """The exemption belongs to CREATE FUNCTION/PROCEDURE, not to CREATE.
@@ -316,13 +352,39 @@ def test_the_file_is_executed_exactly_as_written(tmp_path: Path):
     assert read_migration(path).content == payload
 
 
-def test_the_checksum_does_not_change_with_the_checkout(tmp_path: Path):
-    # The reason normalization exists at all: a Windows checkout must not
-    # refuse every run afterwards.
-    lf = tmp_path / "001_probe.sql"
-    lf.write_bytes(b"CREATE TABLE t (id INT);\nCREATE TABLE u (id INT);\n")
-    unix = read_migration(lf).checksum
+def test_files_that_execute_differently_never_share_a_checksum(tmp_path: Path):
+    """The checksum is over the exact executed text — no normalization.
 
+    This reverses an earlier design in which CRLF was folded before hashing, so
+    that a Windows checkout could not refuse every run. That folding made two
+    files that insert DIFFERENT DATA hash identically: a physical CRLF inside a
+    literal is part of the value. Immutability that cannot see a difference the
+    database will see is not immutability.
+
+    The checkout problem moved to `.gitattributes`, which the next test checks.
+    """
+    lf = tmp_path / "001_probe.sql"
+    lf.write_bytes(b"INSERT INTO t VALUES ('first\nsecond');")
     crlf = tmp_path / "002_probe.sql"
-    crlf.write_bytes(b"CREATE TABLE t (id INT);\r\nCREATE TABLE u (id INT);\r\n")
-    assert read_migration(crlf).checksum == unix
+    crlf.write_bytes(b"INSERT INTO t VALUES ('first\r\nsecond');")
+
+    assert read_migration(lf).content != read_migration(crlf).content
+    assert read_migration(lf).checksum != read_migration(crlf).checksum
+
+
+def test_no_migration_in_this_repository_carries_a_carriage_return():
+    """What `.gitattributes` is supposed to guarantee, actually checked.
+
+    Hashing exact bytes means a CRLF checkout would refuse every run, so
+    `*.sql text eol=lf` pins the working tree. A rule nothing verifies is a
+    rule that quietly stops holding, so this asserts the outcome rather than
+    the configuration: if a CR ever reaches a migration file, this fails before
+    an operator meets it as a checksum mismatch.
+
+    A migration that genuinely needs a CR in a value should write it as an
+    escape — `E'first\\r\\nsecond'` — since file line endings are normalized by
+    git and are not a reliable way to carry data.
+    """
+    directory = Path(__file__).resolve().parents[1] / "migrations"
+    offenders = [p.name for p in sorted(directory.glob("*.sql")) if b"\r" in p.read_bytes()]
+    assert offenders == []
