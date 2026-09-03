@@ -17,9 +17,15 @@ Guarantees this runner provides, in the order they matter:
 4. **One writer at a time**, via a session-level advisory lock that is released
    explicitly rather than left on a pooled connection.
 5. **Safe to re-run.** Applying twice is a no-op.
-6. **Nothing is trusted silently.** A row from the pre-checksum runner is refused
+6. **A migration and its history row commit together.** Each migration runs in
+   one transaction with its ``schema_migrations`` write, so the schema can never
+   advance without its history. A file that manages its own transaction would
+   break that pair, so it is refused before it runs and the transaction is
+   measured again after it does.
+7. **Nothing is trusted silently.** A row from the pre-checksum runner is refused
    until an operator adopts it deliberately, and ``--status`` reports drift
-   instead of hiding it.
+   instead of hiding it. Every refusal has a documented way forward that does not
+   involve editing ``schema_migrations`` by hand.
 
 The SQL files remain the source of truth for DDL; ``app/db/tables.py`` mirrors
 them for query building only.
@@ -29,6 +35,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -88,6 +96,123 @@ def _digest(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+#: Statements that end or re-scope the transaction the runner opened. A file
+#: containing one commits itself, so its bookkeeping row can no longer fail with
+#: it — the atomicity guarantee below would silently stop holding.
+_TX_CONTROL = frozenset({"BEGIN", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE"})
+#: Only transaction control when followed by TRANSACTION; ``PREPARE stmt AS`` is not.
+_TX_CONTROL_PAIRS = frozenset({("START", "TRANSACTION"), ("PREPARE", "TRANSACTION")})
+_DOLLAR_TAG = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
+#: A PostgreSQL 14+ ``LANGUAGE SQL`` body: ``BEGIN ATOMIC ... END``, not a
+#: transaction. Unlike a ``$$ ... $$`` body it is not quoted, so it cannot be
+#: blanked out wholesale.
+_BEGIN_ATOMIC = re.compile(r"\bBEGIN\s+ATOMIC\b", re.IGNORECASE)
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _blank_quoted_and_commented(sql: str) -> str:
+    """Replace comments and quoted text with spaces, keeping every other offset.
+
+    Keyword scanning is only honest once the parts of the file that merely
+    *contain* words are neutralised: a ``COMMIT`` in a comment, in a string
+    literal, or inside a PL/pgSQL ``$$ BEGIN ... END $$`` body is not
+    transaction control, and refusing a migration over one would be a false
+    alarm an author could not work around.
+    """
+    out = list(sql)
+    n = len(sql)
+    i = 0
+
+    def blank(start: int, stop: int) -> None:
+        for k in range(start, stop):
+            if out[k] != "\n":  # keep line numbers intact for any future reporting
+                out[k] = " "
+
+    def scan_quote(start: int, quote: str, backslash_escapes: bool) -> int:
+        j = start + 1
+        while j < n:
+            if backslash_escapes and sql[j] == "\\" and j + 1 < n:
+                j += 2
+                continue
+            if sql[j] == quote:
+                if j + 1 < n and sql[j + 1] == quote:  # '' or "" is an escaped quote
+                    j += 2
+                    continue
+                return j + 1
+            j += 1
+        return n  # unterminated: the database will reject it, we just stop here
+
+    while i < n:
+        ch = sql[i]
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            end = n if end == -1 else end
+            blank(i, end)
+            i = end
+        elif sql.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if sql.startswith("/*", j):  # PostgreSQL block comments nest
+                    depth += 1
+                    j += 2
+                elif sql.startswith("*/", j):
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+        elif ch in "'\"":
+            # E'...' honours backslash escapes; a plain '...' does not.
+            escaped = (
+                ch == "'"
+                and i > 0
+                and sql[i - 1] in "Ee"
+                and (i == 1 or not _WORD.match(sql[i - 2]))
+            )
+            end = scan_quote(i, ch, escaped)
+            blank(i, end)
+            i = end
+        elif ch == "$" and (tag := _DOLLAR_TAG.match(sql, i)):
+            close = sql.find(tag.group(0), tag.end())
+            end = n if close == -1 else close + len(tag.group(0))
+            blank(i, end)
+            i = end
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _transaction_control(sql: str) -> list[str]:
+    """Transaction-control statements found in ``sql``, in order of appearance.
+
+    Best effort by design: it is the *guard*, not the guarantee. The guarantee
+    is the post-execution check in :func:`_run_sql`, which measures whether the
+    transaction is still open rather than inferring it from the text.
+    """
+    blanked = _blank_quoted_and_commented(sql)
+    # The ``END`` closing a ``BEGIN ATOMIC`` body is not transaction control,
+    # and finding where that body ends needs a real parser — the statements
+    # inside it can carry their own ``CASE ... END``. So in a file that has one,
+    # ``END`` is left to the post-execution check, which measures the
+    # transaction instead of reading the text. Every other keyword still
+    # applies, so a genuine ``COMMIT;`` in such a file is still refused here.
+    control = _TX_CONTROL - {"END"} if _BEGIN_ATOMIC.search(blanked) else _TX_CONTROL
+
+    found: list[str] = []
+    for statement in blanked.split(";"):
+        words = _WORD.findall(statement)
+        if not words:
+            continue
+        first = words[0].upper()
+        second = words[1].upper() if len(words) > 1 else ""
+        if first in control:
+            found.append(first)
+        elif (first, second) in _TX_CONTROL_PAIRS:
+            found.append(f"{first} {second}")
+    return found
+
+
 @dataclass(frozen=True, slots=True)
 class Migration:
     filename: str
@@ -116,10 +241,27 @@ class MigrationState:
     drift: str | None = None
 
 
+def _reject_transaction_control(content: str, filename: str) -> None:
+    statements = _transaction_control(content)
+    if statements:
+        raise MigrationError(
+            f"{filename} manages its own transaction ("
+            + ", ".join(sorted(set(statements)))
+            + ") — the runner already wraps each migration in one, together with "
+            "its schema_migrations row, and a migration that commits itself "
+            "breaks that pair: the schema would advance with no history. Remove "
+            "the transaction-control statements; the file is a migration, not a "
+            "standalone script."
+        )
+
+
 def read_migration(path: Path) -> Migration:
     content = _normalize(path.read_bytes())
+    _reject_transaction_control(content, path.name)
     down_path = path.with_name(path.name[: -len(".sql")] + DOWN_SUFFIX)
     down_content = _normalize(down_path.read_bytes()) if down_path.is_file() else None
+    if down_content is not None:
+        _reject_transaction_control(down_content, down_path.name)
     return Migration(
         filename=path.name,
         path=path,
@@ -266,6 +408,42 @@ async def _verify(
         emit(f"adopt {name}  (unverified baseline recorded on operator request)")
 
 
+async def _adopt_new_rollbacks(
+    conn: AsyncConnection,
+    applied: dict[str, _AppliedRow],
+    known: dict[str, Migration],
+    *,
+    emit: Emit,
+) -> None:
+    """Record a rollback file that was written after its migration was applied.
+
+    Its recorded ``down_checksum`` is NULL, which is evidence the file did not
+    accompany the migration, so ``downgrade_to`` refuses to execute it and
+    ``status`` reports drift. Without this there was no way to vouch for such a
+    file while KEEPING the migration applied: the deployment gate stayed at exit
+    2 permanently, and the only remedy the runner offered was to roll the
+    migration back — destroying data to clear a bookkeeping gap.
+
+    Adoption is what it says: it authorises this exact text to run as that
+    migration's rollback later, on nothing but an operator's word. Hence the
+    same explicit flag as an unverifiable forward checksum, and the same
+    reporting.
+    """
+    for name in sorted(
+        name
+        for name, row in applied.items()
+        if row.checksum is not None
+        and row.down_checksum is None
+        and known[name].down_checksum is not None
+    ):
+        await conn.execute(
+            sa.text("UPDATE schema_migrations SET down_checksum = :d WHERE filename = :f"),
+            {"d": known[name].down_checksum, "f": name},
+        )
+        applied[name] = _AppliedRow(applied[name].checksum, known[name].down_checksum)
+        emit(f"adopt {name}  (rollback file recorded unverified on operator request)")
+
+
 async def _run_sql(conn: AsyncConnection, sql: str, *, filename: str) -> None:
     """Execute one migration's SQL inside the caller's transaction.
 
@@ -289,10 +467,53 @@ async def _run_sql(conn: AsyncConnection, sql: str, *, filename: str) -> None:
     await conn.execute(sa.text("SELECT 1"))
 
     raw = await conn.get_raw_connection()
+    driver = raw.driver_connection
     try:
-        await raw.driver_connection.execute(sql)
+        await driver.execute(sql)
     except Exception as exc:
         raise MigrationError(f"{filename} failed to execute: {type(exc).__name__}") from exc
+
+    # The guarantee behind the guard in read_migration(). A file that ends the
+    # transaction — a COMMIT the scanner did not recognise, a procedure that
+    # commits internally — would leave the statements above already durable
+    # while the bookkeeping row that follows could still fail, which is exactly
+    # the schema-without-history state this pairing exists to prevent. Measured
+    # from the driver rather than inferred from the text, so it holds however
+    # the transaction was ended.
+    if not driver.is_in_transaction():
+        raise MigrationError(
+            f"{filename} ended the runner's transaction before its "
+            "schema_migrations row could be written — whatever it did is now "
+            "committed with NO history, so the next run would apply it again. "
+            "Remove any transaction control from the file, then reconcile "
+            "schema_migrations with the schema by hand"
+        )
+
+
+@asynccontextmanager
+async def _atomic(conn: AsyncConnection) -> AsyncIterator[None]:
+    """One migration and its history row, committed or discarded together.
+
+    ``async with conn.begin()`` does that too, but it rolls back on the way out
+    of a failing body — and when the failure IS the database going away, that
+    rollback raises as well and REPLACES the migration error, which the CLI then
+    cannot recognise as a refusal. Measured: a migration that loses its backend
+    surfaced as ``InterfaceError: cannot call Transaction.rollback(): the
+    underlying connection is closed``, with the real reason buried.
+
+    The original failure is the one worth keeping. A connection that died has
+    already had its transaction discarded by the server, so there is nothing the
+    failed rollback would have achieved.
+    """
+    tx = await conn.begin()
+    try:
+        yield
+    except BaseException:
+        with suppress(Exception):
+            await tx.rollback()
+        raise
+    else:
+        await tx.commit()
 
 
 async def _lock(conn: AsyncConnection) -> None:
@@ -308,16 +529,34 @@ async def _lock(conn: AsyncConnection) -> None:
     await conn.commit()
 
 
-async def _unlock(conn: AsyncConnection) -> None:
+async def _unlock(conn: AsyncConnection, *, emit: Emit) -> None:
     """Release explicitly — closing the connection only returns it to the pool.
 
     A session-level lock left on a pooled connection stays held: another engine
     or process blocks on it, while a second call through the same pooled session
     succeeds anyway because advisory locks are reentrant, hiding the leak.
+
+    This runs in a ``finally``, so anything it raises would REPLACE the failure
+    that brought us here — a database that went away mid-migration would reach
+    the operator as a closed-connection traceback instead of the refusal the CLI
+    knows how to report. So a cleanup failure never propagates: the connection is
+    discarded instead, which ends its session and takes the session-scoped lock
+    with it, and the reason is reported alongside rather than in place of the
+    real one.
     """
-    await conn.rollback()
-    await conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY})
-    await conn.commit()
+    try:
+        await conn.rollback()
+        await conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY})
+        await conn.commit()
+    except Exception as exc:
+        try:
+            await conn.invalidate()
+        except Exception:  # pragma: no cover - the connection was already gone
+            pass
+        emit(
+            f"note: the advisory lock could not be released cleanly ({type(exc).__name__}); "
+            "the connection was discarded, which ends its session and the lock with it"
+        )
 
 
 async def apply_pending(
@@ -339,13 +578,15 @@ async def apply_pending(
             applied = await _applied_rows(conn)
             await _verify(conn, applied, known, adopt_legacy=adopt_legacy, emit=emit)
             _require_prefix(migrations, applied)
+            if adopt_legacy:
+                await _adopt_new_rollbacks(conn, applied, known, emit=emit)
             await conn.commit()
 
             for migration in migrations:
                 if migration.filename in applied:
                     emit(f"skip  {migration.filename}")
                     continue
-                async with conn.begin():
+                async with _atomic(conn):
                     await _run_sql(conn, migration.content, filename=migration.filename)
                     await conn.execute(
                         sa.text(
@@ -361,7 +602,7 @@ async def apply_pending(
                 emit(f"apply {migration.filename}")
                 applied_count += 1
         finally:
-            await _unlock(conn)
+            await _unlock(conn, emit=emit)
     return applied_count
 
 
@@ -431,7 +672,7 @@ async def downgrade_to(
                 emit(f"adopt {name}  (unverified rollback executed on operator request)")
 
             for migration in doomed:
-                async with conn.begin():
+                async with _atomic(conn):
                     assert migration.down_content is not None  # checked above
                     await _run_sql(conn, migration.down_content, filename=migration.down_filename)
                     await conn.execute(
@@ -440,7 +681,7 @@ async def downgrade_to(
                     )
                 emit(f"down  {migration.filename}")
         finally:
-            await _unlock(conn)
+            await _unlock(conn, emit=emit)
     return len(doomed)
 
 

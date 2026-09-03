@@ -52,6 +52,33 @@ that decides the next schema's shape.
    prepared statements), the transaction is forced open first. Measured before
    the fix: DDL run through the driver survived a rollback that should have
    discarded it, which would leave a schema advanced with no history.
+4c. **A migration may not manage its own transaction.** That pairing is only
+   worth as much as the transaction it depends on, and a file wrapped in
+   `BEGIN`/`COMMIT` — the shape an author gets by pasting in a script that ran
+   standalone — commits itself before the bookkeeping row is written. Measured:
+   with a `COMMIT` in the file, a failing bookkeeping INSERT left the table
+   created and `schema_migrations` empty, exactly the state 4b closes. So files
+   are scanned at discovery and refused, with comments, string literals and
+   `$$ … $$` bodies excluded so a `COMMIT` that is merely *mentioned* is not a
+   false alarm. Text analysis is the guard, not the guarantee: after every
+   migration the runner asks the driver whether the transaction is still open,
+   which holds however the transaction was ended.
+4d. **Cleanup never replaces the failure it is cleaning up after.** Rolling back
+   and releasing the lock both run in `finally`, and both raise when the failure
+   was the database going away — replacing the `MigrationError` the CLI knows
+   how to report with a closed-connection traceback. Measured: a migration whose
+   backend was terminated surfaced as `InterfaceError: cannot call
+   Transaction.rollback()`. Cleanup failures are now suppressed in favour of the
+   original error, and the connection is discarded rather than returned to the
+   pool, which ends its session and the session-scoped lock with it.
+4e. **Every refusal has a way forward that is not hand-editing
+   `schema_migrations`.** A rollback file written *after* its migration was
+   applied has a NULL recorded `down_checksum`, which rollback refuses and
+   `--status` reports — but there was no way to vouch for it while keeping the
+   migration applied, so the deployment gate stayed at exit 2 permanently and
+   the only remedy on offer was to roll the migration back, destroying data to
+   close a bookkeeping gap. `--adopt-legacy-checksums` now records it in place,
+   under the same explicit-operator-action posture as 2.
 5. **Role provisioning is not a migration.** The runner is not assumed to be a
    superuser or able to create roles; roles and grants are an operator step, so
    no migration ever carries a role name bound to a password. The concrete

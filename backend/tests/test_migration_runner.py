@@ -643,3 +643,217 @@ async def test_status_reports_a_rollback_file_that_appeared_or_vanished(
     states = {s.filename: s for s in await status(db_engine, migrations_dir)}
     assert states["002_second.sql"].drift == "rollback file removed after it was applied"
     assert states["003_third.sql"].drift == "rollback file added after it was applied (unverified)"
+
+
+# --------------------------------------------------------------------- #
+# a migration must not be able to commit itself                         #
+# --------------------------------------------------------------------- #
+
+
+async def test_a_migration_that_ends_the_transaction_past_the_guard_is_refused(
+    db_engine: AsyncEngine, migrations_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The text guard in read_migration() refuses the ordinary case, but it reads
+    # SQL without parsing it. This is the guarantee underneath: whatever the
+    # file did, the transaction the bookkeeping row depends on must still be
+    # open. Planting the migration bypasses the guard, so the check under test
+    # is the only thing that can catch it.
+    captured = read_migration(migrations_dir / "001_first.sql")
+    planted = Migration(
+        filename=captured.filename,
+        path=captured.path,
+        content="CREATE TABLE widget (id INT); COMMIT;",
+        checksum=captured.checksum,
+        down_content=captured.down_content,
+        down_checksum=captured.down_checksum,
+    )
+    monkeypatch.setattr(migrations_module, "discover", lambda _directory: [planted])
+
+    with pytest.raises(MigrationError, match="ended the runner's transaction"):
+        await apply_pending(db_engine, migrations_dir)
+
+    # The DDL is committed and unrecoverable — that is why the refusal tells the
+    # operator to reconcile by hand. What must NOT happen is a history row
+    # implying the pairing held.
+    assert await applied_names(db_engine) == []
+
+
+async def test_a_self_committing_migration_never_reaches_the_database(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "BEGIN;\nCREATE TABLE sprocket (id INT);\nCOMMIT;",
+        "DROP TABLE IF EXISTS sprocket;",
+    )
+    with pytest.raises(MigrationError, match="manages its own transaction"):
+        await apply_pending(db_engine, migrations_dir)
+
+    # Discovery refuses the whole run, so the migrations ahead of it are not
+    # applied either — the same all-or-nothing posture as a checksum mismatch.
+    assert not await table_exists(db_engine, "sprocket")
+    assert not await table_exists(db_engine, "widget")
+
+
+# --------------------------------------------------------------------- #
+# cleanup must not bury the failure it is cleaning up after             #
+# --------------------------------------------------------------------- #
+
+
+async def test_a_lost_connection_reports_the_migration_failure_not_the_cleanup_failure(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # A database that goes away mid-migration — a restart, an idle-timeout
+    # proxy, an OOM-killed backend — leaves every cleanup path with a dead
+    # connection. Rolling back the migration's transaction then raises on the
+    # way out and REPLACES the MigrationError, and the CLI catches only
+    # MigrationError: the operator gets a traceback about a closed connection
+    # instead of the refusal, with the real reason buried.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE TABLE sprocket (id INT);\nSELECT pg_terminate_backend(pg_backend_pid());",
+        "DROP TABLE IF EXISTS sprocket;",
+    )
+    with pytest.raises(MigrationError, match="003_third.sql failed to execute"):
+        await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+
+
+async def test_a_failure_releasing_the_lock_neither_masks_nor_hides_itself(
+    db_engine: AsyncEngine, migrations_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # _unlock runs in a `finally`, so anything it raises replaces the failure
+    # that brought us here. Suppressing that must not mean swallowing it
+    # silently either: the operator gets the real refusal, plus a note that the
+    # lock was dealt with by discarding the connection.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE TABLE sprocket (id INT NOT AN INT);",  # deliberate syntax error
+        "DROP TABLE IF EXISTS sprocket;",
+    )
+
+    async def refuse_to_roll_back(self, *args, **kwargs):
+        raise RuntimeError("simulated cleanup failure")
+
+    monkeypatch.setattr(migrations_module.AsyncConnection, "rollback", refuse_to_roll_back)
+
+    lines: list[str] = []
+    with pytest.raises(MigrationError, match="003_third.sql failed to execute"):
+        await apply_pending(db_engine, migrations_dir, emit=lines.append)
+    assert any("advisory lock could not be released cleanly" in line for line in lines)
+
+
+async def test_the_lock_is_free_after_the_connection_was_discarded(
+    db_url: URL, migrations_dir: Path
+):
+    # The point of discarding rather than re-raising: the next run must not find
+    # the lock still held by a session nobody is using.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "SELECT pg_terminate_backend(pg_backend_pid());",
+        "SELECT 1;",
+    )
+    first = create_async_engine(db_url)
+    try:
+        with pytest.raises(MigrationError):
+            await apply_pending(first, migrations_dir, emit=lambda _: None)
+    finally:
+        await first.dispose()
+
+    second = create_async_engine(db_url)
+    try:
+        async with second.connect() as conn:
+            assert await conn.scalar(
+                sa.text("SELECT pg_try_advisory_lock(:k)"),
+                {"k": migrations_module.ADVISORY_LOCK_KEY},
+            )
+    finally:
+        await second.dispose()
+
+
+# --------------------------------------------------------------------- #
+# a rollback file written later, without rolling the migration back     #
+# --------------------------------------------------------------------- #
+
+
+async def test_a_rollback_file_added_later_can_be_adopted_while_staying_applied(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # Without this the operator is stranded: --status reports drift and exits 2
+    # forever, apply changes nothing, and the only way to clear it is to roll
+    # the migration back — destroying data to close a bookkeeping gap.
+    write_pair(migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", None)
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+    (migrations_dir / "003_third.down.sql").write_text("DROP TABLE IF EXISTS sprocket;")
+
+    assert [s.drift for s in await status(db_engine, migrations_dir) if s.drift] == [
+        "rollback file added after it was applied (unverified)"
+    ]
+
+    lines: list[str] = []
+    await apply_pending(db_engine, migrations_dir, emit=lines.append, adopt_legacy=True)
+    assert "adopt 003_third.sql  (rollback file recorded unverified on operator request)" in lines
+
+    assert await table_exists(db_engine, "sprocket")  # still applied
+    assert [s.drift for s in await status(db_engine, migrations_dir) if s.drift] == []
+
+    # And having been vouched for, it is now usable as a rollback without the
+    # flag — which is exactly what adopting it authorised.
+    assert await downgrade_to(db_engine, migrations_dir, "002_second.sql", emit=lambda _: None) == 1
+    assert not await table_exists(db_engine, "sprocket")
+
+
+async def test_adopting_a_late_rollback_file_takes_the_operator_saying_so(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    write_pair(migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", None)
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+    (migrations_dir / "003_third.down.sql").write_text("DROP TABLE IF EXISTS sprocket;")
+
+    lines: list[str] = []
+    await apply_pending(db_engine, migrations_dir, emit=lines.append)
+    assert not any("adopt" in line for line in lines)
+    assert [s.drift for s in await status(db_engine, migrations_dir) if s.drift] == [
+        "rollback file added after it was applied (unverified)"
+    ]
+
+
+async def test_adoption_does_not_touch_a_rollback_that_was_recorded_all_along(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # The flag is for unverifiable history. It must not become a way to quietly
+    # re-baseline a rollback file that WAS recorded and has since been edited —
+    # that is the tampering case, and it stays refused.
+    await apply_pending(db_engine, migrations_dir, emit=lambda _: None)
+    (migrations_dir / "001_first.down.sql").write_text("DROP TABLE IF EXISTS widget CASCADE;")
+
+    with pytest.raises(MigrationChecksumError, match="001_first.sql"):
+        await apply_pending(db_engine, migrations_dir, emit=lambda _: None, adopt_legacy=True)
+
+
+async def test_a_sql_standard_function_body_applies_end_to_end(
+    db_engine: AsyncEngine, migrations_dir: Path
+):
+    # The guard stands END down for a file containing BEGIN ATOMIC, which is
+    # only defensible if such a migration really does run — otherwise the
+    # carve-out is protecting SQL nobody could use anyway.
+    write_pair(
+        migrations_dir,
+        "003_third",
+        "CREATE FUNCTION doubled(n INT) RETURNS INT LANGUAGE SQL\n"
+        "BEGIN ATOMIC\n"
+        "  SELECT CASE WHEN n > 0 THEN n * 2 ELSE 0 END;\n"
+        "END;",
+        "DROP FUNCTION IF EXISTS doubled;",
+    )
+    assert await apply_pending(db_engine, migrations_dir, emit=lambda _: None) == 3
+
+    async with db_engine.connect() as conn:
+        assert await conn.scalar(sa.text("SELECT doubled(21)")) == 42
+
+    # And the transaction survived it, which is what the carve-out relies on:
+    # the history row is there, so the pairing held.
+    assert "003_third.sql" in await applied_names(db_engine)

@@ -49,17 +49,31 @@ message says why). A refusal never leaves the schema half-changed.
    would need is present and matches what was recorded.
 7. **A migration and its history row commit together.** The migration SQL and
    the `schema_migrations` write share one transaction, so the schema can never
-   advance without its history — or the reverse.
+   advance without its history — or the reverse. A file that manages its own
+   transaction would break that pair, so it is refused before it runs, and the
+   transaction is checked again after it has run.
 8. **Nothing is trusted silently.** Rows from the pre-checksum runner, and
    rollback files that appeared after their migration was applied, are refused
    until an operator adopts them deliberately. Every failure — including a
-   syntax error inside a migration — is reported as a refusal naming the file
-   and the error type, never the SQL.
+   syntax error inside a migration, or a database that disappears mid-run — is
+   reported as a refusal naming the file and the error type, never the SQL.
+9. **Every refusal has a documented way forward** that does not involve editing
+   `schema_migrations` by hand.
 
 ## Writing a migration
 
 - Name it `NNN_lower_snake.sql` — the number is the apply order. Anything that
   cannot be ordered is refused.
+- **Do not wrap it in `BEGIN`/`COMMIT`.** The runner already runs each migration
+  in one transaction together with its history row; a file that commits itself
+  breaks that pair and is refused. This is the one difference from a script you
+  would run by hand in `psql`, and it is the usual reason a working script is
+  rejected on the way in. (A `COMMIT` inside a `$$ … $$` function body, a string
+  or a comment is fine — only real transaction control counts, and a
+  `BEGIN ATOMIC … END` function body is recognised as a body, not a
+  transaction.)
+- Anything that cannot run inside a transaction — `CREATE INDEX CONCURRENTLY`,
+  `VACUUM` — cannot be a migration here. Do it as an operator step.
 - Write the paired `NNN_lower_snake.down.sql` at the same time. A migration
   without one can be applied but blocks any rollback past it.
 - Prefer additive changes (new tables, nullable columns). They make the down
@@ -96,8 +110,34 @@ history.
 **"these migrations were applied with no rollback file, and one has since appeared"**
 The recorded `down_checksum` is NULL, which is evidence that this file did not
 accompany the applied migration — it could contain anything. Review it, then
-re-run with `--adopt-legacy-checksums` to execute it anyway. The execution is
-announced as unverified.
+choose:
+
+- to keep the migration applied and simply record the file, run
+  `apply_migrations.py --adopt-legacy-checksums`. It stores the checksum in
+  place, clears the `--status` drift, and authorises that exact text to run as
+  the rollback later.
+- to roll back right now, pass the same flag to `--down-to`. The execution is
+  announced as unverified.
+
+Either way the adoption rests on nothing but your review of the file, which is
+why neither happens without the flag.
+
+**"NNN_name.sql manages its own transaction (BEGIN, COMMIT)"**
+The file is written as a standalone script. The runner supplies the transaction
+— together with the `schema_migrations` row, so the two commit or fail as one —
+and a file that commits itself silently breaks that. Delete the
+transaction-control statements; nothing else needs to change. Nothing was
+applied, including the migrations ahead of it in the same run.
+
+**"NNN_name.sql ended the runner's transaction before its schema_migrations row
+could be written"**
+The safety net behind the check above, for a way of ending the transaction the
+file scan did not recognise (a procedure that commits internally, for example).
+Unlike every other refusal here, this one reports damage rather than preventing
+it: what the migration did is already committed, with no history row, so the
+next run would apply it a second time. Remove the transaction control, then
+reconcile by hand — either undo what it did, or insert its `schema_migrations`
+row once you have confirmed the schema matches the file.
 
 **"applied migrations are not a prefix of the migration sequence"**
 A migration is numbered behind ones already applied — typically a branch merge
@@ -120,6 +160,13 @@ A concurrent deploy is running, or a previous run died with its connection still
 open. Wait; if nothing is running, the lock is released as soon as the orphaned
 session ends. `SELECT * FROM pg_locks WHERE locktype = 'advisory'` shows the
 holder.
+
+**"note: the advisory lock could not be released cleanly"**
+Not a failure of the run — it accompanies whatever the real result was. The
+connection was discarded instead, which ends its session and releases the
+session-scoped lock with it, so the next run is not blocked. It appears when the
+database became unreachable during the run; the refusal printed alongside it is
+the one to act on.
 
 **"cannot roll back — these migrations have no .down.sql"**
 Nothing was unwound. Write the missing down file first, then re-run. This check
