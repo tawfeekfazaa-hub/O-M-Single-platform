@@ -49,8 +49,45 @@ adapter — no credentials, no database needed.
 
 ```bash
 docker compose up -d timescaledb
-cd backend && python scripts/apply_migrations.py   # uses DATABASE_URL
+cd backend && python scripts/apply_migrations.py       # uses DATABASE_URL
+python scripts/apply_migrations.py --status            # what is applied
+python scripts/apply_migrations.py --down-to base      # roll everything back
 ```
+
+An applied migration is immutable: its checksum is verified on every run and an
+edit refuses the whole run. Rollback, recovery and the rules for writing a
+migration are in `docs/MIGRATIONS.md`.
+
+### Live-database tests
+
+The default `pytest` run is offline and needs no database. The migration and
+repository tests need a real PostgreSQL/TimescaleDB and are deselected unless
+asked for:
+
+```bash
+TEST_DATABASE_URL=postgresql+asyncpg://aq_om@127.0.0.1:5432/postgres \
+  pytest -m dbtest
+```
+
+Each test creates and drops its own database, so the one in the URL is only used
+to connect. That is a connection point, **not** the extent of what the role
+needs: these tests are not runnable by an ordinary application role.
+
+- **`CREATEDB`** — every test creates and drops a database of its own, because
+  migrations are DDL and a shared schema would make one test's rollback another
+  test's missing table. Without it the fixtures fail before any test body runs.
+- **Permission to install TimescaleDB** — `001` runs `CREATE EXTENSION
+  timescaledb`, which needs a superuser or equivalent on most installations, and
+  the extension available on the server.
+
+So point `TEST_DATABASE_URL` at a **throwaway server** you have that much
+control over — the `docker-compose.yml` one does, and is the intended target —
+not at a shared or production cluster. The application's own runtime role needs
+none of this; see "Role provisioning is not a migration" in `docs/MIGRATIONS.md`
+for the split.
+
+CI runs these in the `backend-db` job against the same pinned TimescaleDB image
+as `docker-compose.yml`.
 
 ## Frontend quickstart
 
@@ -93,7 +130,8 @@ All configuration via environment variables — see `.env.example`
   disabled scheduler — and prints counts only, never station identities,
   values, tokens, or credentials. A green mock run (or green tests) is no
   evidence that a real Huawei connection works.
-- CI enforces: ruff + pytest, `pip-audit` on the fully resolved production
+- CI enforces: ruff + pytest (offline), the migration/repository suite against
+  a real TimescaleDB, `pip-audit` on the fully resolved production
   tree and on the complete installed environment (blocking on any finding),
   `npm audit` blocking on high/critical for production and for all
   dependencies, ESLint, `tsc --noEmit`, production build, a `/plants`
