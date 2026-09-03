@@ -25,7 +25,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from app.db import migrations as migrations_module
 from app.db.migrations import (
@@ -1995,8 +1995,8 @@ async def test_the_lock_session_is_not_parked_in_a_transaction(db_url: URL, migr
     states: list[list[str]] = []
     real_confirm = migrations_module._confirm_lock
 
-    async def sample(lock_conn):
-        await real_confirm(lock_conn)
+    async def sample(lock_conn, **kwargs):
+        await real_confirm(lock_conn, **kwargs)
         # The lock connection is never touched by this probe: an earlier version
         # rolled it back to read its pid and so created what it was measuring.
         async with watcher.connect() as w:
@@ -2123,3 +2123,169 @@ async def test_a_migrations_directory_with_no_forward_files_is_refused(
 
     # And it refused before creating the ledger it would have read as empty.
     assert not await table_exists(db_engine, "schema_migrations")
+
+
+async def test_two_overlapping_runs_cannot_both_commit(db_url: URL, migrations_dir: Path):
+    """Opposite directions touch DIFFERENT ledger rows, so per-row checks miss it.
+
+    Measured before the fence, with a rollback of 002 and an apply of 003
+    overlapping: both runs succeeded, the history was left reading `001, 003`,
+    and 003's effects stood on a schema 002 had been unwound from — a state no
+    sequence of files describes.
+
+    The fence is two things and this exercises both, by releasing the two runs
+    from a barrier so neither is serialised by the test itself:
+
+    * the transaction-scoped writer lock — without it both re-read the same
+      history at the same moment, both find it unchanged, and both commit;
+    * the re-read — without it the loser merely waits its turn and then applies
+      a plan built on a history that no longer exists.
+
+    Which run wins is the pool's business, so this asserts the shape: exactly
+    one succeeds, the other is refused naming the change, and what is left is a
+    history the sequence can describe.
+    """
+    write_pair(migrations_dir, "003_third", "CREATE TABLE sprocket (id INT);", None)
+    only_two = migrations_dir.parent / "only_two"
+    only_two.mkdir()
+    for name in ("001_first", "002_second"):
+        for suffix in (".sql", ".down.sql"):
+            (only_two / f"{name}{suffix}").write_text(
+                (migrations_dir / f"{name}{suffix}").read_text()
+            )
+
+    setup = create_async_engine(db_url)
+    try:
+        await apply_pending(setup, only_two, emit=lambda _: None)  # 001, 002 applied
+    finally:
+        await setup.dispose()
+
+    applier = create_async_engine(db_url)
+    unwinder = create_async_engine(db_url)
+    real_fence = migrations_module._fence
+    real_lock, real_confirm = migrations_module._lock, migrations_module._confirm_lock
+    both_ready = asyncio.Barrier(2)
+
+    async def wait_for_the_other(conn, ledger, expected):
+        # Both runs arrive having read the SAME history and are released
+        # together, so nothing but the runner's own fence orders them.
+        assert sorted(expected) == ["001_first.sql", "002_second.sql"], expected
+        await both_ready.wait()
+        return await real_fence(conn, ledger, expected)
+
+    # The run lock is NEUTRALISED here, because a lock that has stopped
+    # excluding is the finding's premise: its session can be closed after
+    # _confirm_lock passed and a second run take the key while the first
+    # transaction is still live. Leaving the real lock in place would let it
+    # refuse one of these runs and the fence would never be reached — which is
+    # exactly what the first draft of this test measured instead of the fence.
+    async def no_exclusion(conn):
+        return 0
+
+    async def no_confirmation(lock_conn, *, backend=None):
+        return None
+
+    migrations_module._fence = wait_for_the_other
+    migrations_module._lock = no_exclusion
+    migrations_module._confirm_lock = no_confirmation
+    try:
+        outcomes = await asyncio.gather(
+            apply_pending(applier, migrations_dir, emit=lambda _: None),
+            downgrade_to(unwinder, only_two, "001_first.sql", emit=lambda _: None),
+            return_exceptions=True,
+        )
+    finally:
+        migrations_module._fence = real_fence
+        migrations_module._lock = real_lock
+        migrations_module._confirm_lock = real_confirm
+        for engine in (applier, unwinder):
+            await engine.dispose()
+
+    refused = [o for o in outcomes if isinstance(o, MigrationError)]
+    assert len(refused) == 1, f"expected exactly one refusal, got {outcomes}"
+    assert "history changed while this run was working" in str(refused[0]), refused[0]
+    assert len([o for o in outcomes if isinstance(o, int)]) == 1, outcomes
+
+    verify = create_async_engine(db_url)
+    try:
+        history = await applied_names(verify)
+        # Whichever won, what is left is describable: either 002 was unwound and
+        # 003 never ran, or 003 was applied on top of an intact 001-002.
+        assert history in (
+            ["001_first.sql"],
+            ["001_first.sql", "002_second.sql", "003_third.sql"],
+        ), history
+        assert await table_exists(verify, "sprocket") == ("003_third.sql" in history)
+    finally:
+        await verify.dispose()
+
+
+async def test_a_lock_session_that_moves_to_another_backend_is_refused(
+    db_url: URL, migrations_dir: Path
+):
+    # A session-scoped advisory lock belongs to one backend. Through a
+    # transaction-pooling proxy (PgBouncer in transaction mode) the commit in
+    # _lock hands the backend back, and a later statement can land on a
+    # different one — so the confirmation would interrogate a session that never
+    # took the key, and invalidating the client connection could not end the one
+    # that did. I have no PgBouncer here, so this simulates the observable
+    # property rather than the proxy: the backend under the lock connection is
+    # not the one the key was taken on.
+    engine = create_async_engine(db_url)
+    real_lock = migrations_module._lock
+
+    async def lock_then_move(conn):
+        return await real_lock(conn) + 1  # as if the next statement landed elsewhere
+
+    migrations_module._lock = lock_then_move
+    try:
+        with pytest.raises(MigrationError, match="the session is not stable"):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    finally:
+        migrations_module._lock = real_lock
+        await engine.dispose()
+
+    verify = create_async_engine(db_url)
+    try:
+        assert await applied_names(verify) == []  # refused before anything was recorded
+    finally:
+        await verify.dispose()
+
+
+async def test_status_leaves_the_callers_search_path_alone(db_url: URL, migrations_dir: Path):
+    # _ensure_bookkeeping runs RESET search_path and status committed it, on a
+    # connection that then went back to the pool. RESTORED rather than
+    # discarded: discarding ends the session, which loses the caller's setting
+    # just as thoroughly — measured, both land on the database default.
+    engine = create_async_engine(db_url, pool_size=1, max_overflow=0)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(sa.text("CREATE SCHEMA tenant"))
+            await conn.execute(sa.text("SET search_path = tenant, public"))
+            await conn.commit()
+
+        assert await status(engine, migrations_dir)  # and it still did its job
+
+        async with engine.connect() as conn:
+            assert await conn.scalar(sa.text("SHOW search_path")) == "tenant, public"
+    finally:
+        await engine.dispose()
+
+
+async def test_a_cancellation_during_cleanup_is_not_swallowed(db_url: URL, migrations_dir: Path):
+    # _discard suppressed BaseException around invalidate(), so a cancellation
+    # landing there was consumed: the caller had cancelled the task and got a
+    # completed migration count back instead. Measured: apply_pending returned 2.
+    engine = create_async_engine(db_url)
+    real_invalidate = AsyncConnection.invalidate
+
+    async def cancel_in_cleanup(self, *args, **kwargs):
+        raise asyncio.CancelledError()
+
+    AsyncConnection.invalidate = cancel_in_cleanup  # type: ignore[method-assign]
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await apply_pending(engine, migrations_dir, emit=lambda _: None)
+    finally:
+        AsyncConnection.invalidate = real_invalidate  # type: ignore[method-assign]
+        await engine.dispose()

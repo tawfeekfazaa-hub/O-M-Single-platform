@@ -90,8 +90,20 @@ message — a connection error's text carries the host and port.
 13. **Two overlapping runs cannot both succeed.** If a run's lock session is
    closed after the lock was confirmed and another run takes the key, whichever
    reaches the history second is refused and its copy of the work is rolled back
-   with it — forward and in rollback alike. See "was recorded by another run"
-   and "was already removed from the history by another run" below.
+   with it — forward and in rollback alike, and whether or not the two touch the
+   same migration. Every writer transaction takes a transaction-scoped lock and
+   re-reads the whole history before running any SQL, so the loser is refused
+   before it changes anything. See "was recorded by another run", "was already
+   removed from the history by another run" and "the migration history changed
+   while this run was working" below.
+14. **Migrations need a real PostgreSQL session.** A transaction-pooling proxy
+   (PgBouncer in `transaction` mode) breaks the exclusion, because a session
+   advisory lock belongs to a backend the proxy will hand to somebody else. The
+   runner detects the backend changing under it and refuses. Use a direct
+   connection or a session-pooled port.
+15. **Reading the history does not change the session it read on.** `--status`
+   restores the caller's `search_path` rather than leaving the runner's reset
+   behind or ending the session.
 
 ## Writing a migration
 

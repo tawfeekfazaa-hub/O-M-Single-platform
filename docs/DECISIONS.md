@@ -174,6 +174,47 @@ that decides the next schema's shape.
    — `times the rollback SQL executed: 2`. Both mutations are now checked, and
    because the duplicate work shares the transaction being refused, rolling back
    discards it rather than merely reporting it.
+4t. **Every writer transaction is fenced, and re-checks what it assumed.** 4p
+   closed the case where two overlapping runs mutate the SAME ledger row. Runs
+   going in opposite directions do not: a rollback of 002 deletes one row while
+   an apply of 003 inserts another, so both per-row checks pass. Measured with
+   exactly that overlap: both runs reported success and the history was left
+   reading `001, 003`, with 003's effects on a schema 002 had been unwound from
+   — a state no sequence of files describes. Each writer transaction now takes a
+   TRANSACTION-scoped advisory lock on a second key and re-reads the whole
+   history, refusing if it is not what this run last saw. Both halves are
+   needed: without the lock two runs read the same history at the same moment
+   and both commit; without the re-read the loser merely waits its turn and then
+   applies a stale plan. The fence runs BEFORE the migration SQL, so refusing
+   costs nothing to undo. A transaction-scoped lock is also the one kind
+   `pg_advisory_unlock_all()` cannot release, which is why it is safe on the
+   connection migration SQL shares.
+4u. **The lock connection must be a real PostgreSQL session.** A session
+   advisory lock belongs to one backend. Through a transaction-pooling proxy
+   (PgBouncer in transaction mode) the commit in `_lock` returns the backend to
+   the proxy and later statements may land on a different one — so the
+   confirmation would interrogate a session that never took the key, and
+   invalidating the client connection could not end the one that did; the key
+   could be stranded against every future deploy. Nothing in the runner can make
+   a transaction-pooled proxy safe. What it does instead is refuse to pretend:
+   the backend pid is recorded when the lock is taken and checked on every
+   confirmation. No PgBouncer was available to test against, so the test
+   simulates the observable property — the backend under the connection
+   changed — rather than the proxy.
+4v. **`status()` restores the session it read on; it does not end it.** It was
+   the one path that returned its connection to the pool after
+   `_ensure_bookkeeping`'s `RESET search_path` had been committed, so a caller
+   with a session `search_path` got the database default back. Measured:
+   `tenant, public` became `"$user", public`. Restored rather than discarded,
+   which is where this differs from the writers: what they drop is state a
+   MIGRATION left, and dropping it is the point; here the state is the caller's
+   own, and ending the session loses it just as thoroughly — measured, the
+   discard lands on the same default. Only putting it back is a fix.
+4w. **A cancellation arriving during cleanup is still the caller's.** `_discard`
+   suppressed `BaseException` around `invalidate()`, so a cancellation landing
+   there was consumed: the caller had cancelled the task and got a completed
+   migration count back. Measured: `apply_pending` returned 2. The fallback
+   still runs — the lock has to go — and then it is re-raised.
 4r. **The run lock is never taken on a session that already holds it.** Session
    advisory locks are reentrant: taking one this session already holds succeeds
    and raises the hold count, while the single release lowers it by one — so the

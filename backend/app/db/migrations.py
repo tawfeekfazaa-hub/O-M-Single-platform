@@ -65,6 +65,17 @@ ADVISORY_LOCK_KEY = int.from_bytes(
     hashlib.sha256(b"aq_om.schema_migrations").digest()[:8], "big", signed=True
 )
 
+# A SECOND key, held for the length of each writer transaction rather than the
+# run. The run lock lives on a session that can be closed under it (see
+# _confirm_lock); this one is transaction-scoped, so it cannot outlive or
+# predecease the work it fences, and `pg_advisory_unlock_all()` cannot release
+# it — transaction locks are released only by ending the transaction. Derived
+# from its own string so it can never collide with the run lock, which the work
+# connection must not contend with.
+WRITER_LOCK_KEY = int.from_bytes(
+    hashlib.sha256(b"aq_om.schema_migrations.writer").digest()[:8], "big", signed=True
+)
+
 
 class MigrationError(RuntimeError):
     """A migration cannot be applied or rolled back safely."""
@@ -623,6 +634,59 @@ async def _applied_rows(conn: AsyncConnection, ledger: str) -> dict[str, _Applie
     return {r.filename: _AppliedRow(r.checksum, r.down_checksum) for r in result}
 
 
+async def _fence(conn: AsyncConnection, ledger: str, expected: set[str]) -> None:
+    """Serialise this writer against every other, and re-check what it assumed.
+
+    Two runs can both believe they hold the run lock: the lock session can be
+    closed after :func:`_confirm_lock` passed but before this transaction
+    commits. Checking the row this transaction is about to write is not enough,
+    because two runs going in OPPOSITE directions touch DIFFERENT rows and so
+    never collide. Measured, with a rollback of 002 and an apply of 003
+    overlapping: both runs succeeded, and the history was left reading
+    ``001, 003`` with 003's effects applied on a schema 002 had been unwound
+    from — a state no sequence of files describes.
+
+    Two halves, both needed:
+
+    * The transaction-scoped lock makes writers take turns. Without it both can
+      read the same history, act on it, and commit changes that do not conflict
+      at the row level.
+    * Re-reading the history inside the fence is what makes taking turns worth
+      anything: the loser then sees that the history is no longer what its plan
+      was built on. Without this the loser simply waits and then applies a stale
+      plan.
+
+    ``expected`` is what this run last saw. Anything else means somebody else
+    committed to the ledger, so this run's remaining plan is not trustworthy —
+    whichever direction either run was going.
+    """
+    # _ledger pins search_path to pg_catalog for the rest of the TRANSACTION, and
+    # the migration runs later in this same one — under the pin its `CREATE
+    # TABLE` tried to create in pg_catalog and was refused for lack of
+    # privilege. So restore what was in force on the way in, exactly as ledger
+    # discovery does.
+    entry_path = str(await conn.scalar(sa.text("SHOW search_path")))
+    await _ledger(
+        conn, sa.text("SELECT pg_catalog.pg_advisory_xact_lock(:k)"), {"k": WRITER_LOCK_KEY}
+    )
+    rows = await _ledger(conn, sa.text(f"SELECT filename FROM {ledger}"))
+    current = {r.filename for r in rows}
+    await conn.execute(
+        sa.text("SELECT pg_catalog.set_config('search_path', :p, true)"), {"p": entry_path}
+    )
+    if current != expected:
+        appeared = sorted(current - expected)
+        vanished = sorted(expected - current)
+        raise MigrationError(
+            "the migration history changed while this run was working"
+            + (f" (now recorded: {', '.join(appeared)})" if appeared else "")
+            + (f" (no longer recorded: {', '.join(vanished)})" if vanished else "")
+            + " — another run committed to it, so two runs overlapped. This run's work has "
+            "been rolled back and nothing further is applied. Check that only one migration "
+            "run is started per deploy, then re-run"
+        )
+
+
 def _require_prefix(migrations: list[Migration], applied: dict[str, _AppliedRow]) -> None:
     """Applied migrations must be the FIRST N of the discovered sequence.
 
@@ -852,7 +916,7 @@ _LOCK_CLASSID = (ADVISORY_LOCK_KEY & 0xFFFFFFFFFFFFFFFF) >> 32
 _LOCK_OBJID = ADVISORY_LOCK_KEY & 0xFFFFFFFF
 
 
-async def _lock(conn: AsyncConnection) -> None:
+async def _lock(conn: AsyncConnection) -> int:
     # Session advisory locks are REENTRANT: taking one this session already
     # holds succeeds and raises the hold count, while the single release below
     # lowers it by one — leaving the lock held on a connection that goes back to
@@ -885,8 +949,11 @@ async def _lock(conn: AsyncConnection) -> None:
             "another migration run holds the advisory lock; refusing to run concurrently"
         )
     # Session-scoped, so it survives this commit and every later per-migration
-    # transaction on the same connection.
+    # transaction on the same connection — provided the connection keeps the
+    # same session across it, which _confirm_lock is given this pid to check.
+    backend = await conn.scalar(sa.text("SELECT pg_catalog.pg_backend_pid()"))
     await conn.commit()
+    return int(backend)
 
 
 async def _discard(conn: AsyncConnection) -> None:
@@ -896,12 +963,25 @@ async def _discard(conn: AsyncConnection) -> None:
     lock, so this must not depend on the connection still working — and under
     cancellation even the async path can be interrupted again, which is why the
     synchronous fallback exists.
+
+    A cancellation arriving DURING the cleanup is still the caller's, though.
+    Swallowing it here let a cancelled ``apply_pending`` run to completion and
+    return a successful count — measured, with ``invalidate()`` raising
+    ``CancelledError``: the call returned 2. The fallback still runs (the lock
+    has to go), and then it is re-raised.
     """
-    with suppress(BaseException):
+    cancellation: BaseException | None = None
+    try:
         await conn.invalidate()
         return
+    except Exception:
+        pass  # a broken connection is the expected case; fall through
+    except BaseException as exc:  # cancellation, or anything else not an Exception
+        cancellation = exc
     with suppress(BaseException):  # pragma: no cover - only reachable mid-cancel
         conn.sync_connection.invalidate()  # type: ignore[union-attr]
+    if cancellation is not None:
+        raise cancellation
 
 
 async def _two_connections(
@@ -927,7 +1007,7 @@ async def _two_connections(
     return lock_conn, conn
 
 
-async def _confirm_lock(lock_conn: AsyncConnection) -> None:
+async def _confirm_lock(lock_conn: AsyncConnection, *, backend: int | None = None) -> None:
     """Fail the run if the lock session no longer holds the lock.
 
     The lock lives on its own connection, which is idle for as long as the
@@ -941,12 +1021,35 @@ async def _confirm_lock(lock_conn: AsyncConnection) -> None:
     migrations the lock session is no longer idle.
     """
     try:
-        held = await lock_conn.scalar(
-            sa.text(
-                "SELECT count(*) FROM pg_catalog.pg_locks WHERE locktype = 'advisory' "
-                "AND pid = pg_catalog.pg_backend_pid()"
+        row = (
+            await lock_conn.execute(
+                sa.text(
+                    "SELECT count(*) AS held, pg_catalog.pg_backend_pid() AS backend "
+                    "FROM pg_catalog.pg_locks WHERE locktype = 'advisory' "
+                    "AND pid = pg_catalog.pg_backend_pid()"
+                )
             )
-        )
+        ).one()
+        held = row.held
+        if backend is not None and row.backend != backend:
+            # The lock is SESSION-scoped, so it belongs to a particular backend.
+            # Through a transaction-pooling proxy (PgBouncer in transaction
+            # mode) the commit in _lock returns the backend to the proxy and a
+            # later statement may land on a different one — so this check would
+            # be interrogating a session that never took the key, invalidating
+            # the connection could not end the session that did, and the key
+            # could be stranded against every future deploy. Nothing here can
+            # make a pooled proxy safe; what it can do is refuse to pretend the
+            # client connection is a PostgreSQL session.
+            raise MigrationError(
+                f"the run lock was taken on backend {backend} but this connection is now "
+                f"backend {row.backend}: the session is not stable, which is what a "
+                "transaction-pooling proxy (PgBouncer in transaction mode) does. A session "
+                "advisory lock cannot fence a run across it. Point DATABASE_URL at the "
+                "server directly, or at a session-pooled port. Nothing further is applied"
+            )
+    except MigrationError:
+        raise
     except Exception as exc:
         raise MigrationError(
             f"lost contact with the session holding the run lock ({type(exc).__name__}); "
@@ -1065,10 +1168,11 @@ async def apply_pending(
         # the caller be cancelled before the result is seen, which would return
         # a locked session to the pool with nothing arranged to release it.
         try:
-            await _lock(lock_conn)
+            lock_pid = await _lock(lock_conn)
             ledger = await _ensure_bookkeeping(conn)
             await conn.commit()
             applied = await _applied_rows(conn, ledger)
+            expected = set(applied)  # what every writer transaction re-checks
             announcements = await _verify(conn, applied, known, ledger, adopt_legacy=adopt_legacy)
             _require_prefix(migrations, applied)
             if adopt_legacy:
@@ -1082,8 +1186,13 @@ async def apply_pending(
                     emit(f"skip  {migration.filename}")
                     continue
                 async with _atomic(conn):
+                    # Before the SQL, not after: the loser of an overlap must not
+                    # execute the migration at all, and holding the fence for the
+                    # duration is what makes "one writer" true rather than
+                    # "one recorder".
+                    await _fence(conn, ledger, expected)
                     await _run_sql(conn, migration.content, filename=migration.filename)
-                    await _confirm_lock(lock_conn)
+                    await _confirm_lock(lock_conn, backend=lock_pid)
                     try:
                         await _ledger(
                             conn,
@@ -1115,6 +1224,7 @@ async def apply_pending(
                             "other run's stands. Check that only one migration run is started "
                             "per deploy, then re-run"
                         ) from exc
+                expected.add(migration.filename)
                 emit(f"apply {migration.filename}")
                 applied_count += 1
         finally:
@@ -1157,10 +1267,11 @@ async def downgrade_to(
         # The lock is taken inside the region that releases it, so a
         # cancellation landing on the grant cannot strand it.
         try:
-            await _lock(lock_conn)
+            lock_pid = await _lock(lock_conn)
             ledger = await _ensure_bookkeeping(conn)
             await conn.commit()
             applied = await _applied_rows(conn, ledger)
+            expected = set(applied)  # what every writer transaction re-checks
             announcements = await _verify(conn, applied, known, ledger, adopt_legacy=adopt_legacy)
             _require_prefix(migrations, applied)
             await conn.commit()
@@ -1214,8 +1325,9 @@ async def downgrade_to(
             for migration in doomed:
                 async with _atomic(conn):
                     assert migration.down_content is not None  # checked above
+                    await _fence(conn, ledger, expected)
                     await _run_sql(conn, migration.down_content, filename=migration.down_filename)
-                    await _confirm_lock(lock_conn)
+                    await _confirm_lock(lock_conn, backend=lock_pid)
                     removed = await _ledger(
                         conn,
                         sa.text(f"DELETE FROM {ledger} WHERE filename = :f"),
@@ -1251,6 +1363,7 @@ async def downgrade_to(
                         f"adopt {migration.filename}  "
                         "(unverified rollback executed on operator request)"
                     )
+                expected.discard(migration.filename)
                 emit(f"down  {migration.filename}")
         finally:
             # Nested, not sequential: _restore_session suppresses Exceptions but
@@ -1275,9 +1388,31 @@ async def status(engine: AsyncEngine, directory: Path) -> list[MigrationState]:
     migrations = discover(directory)
     known = {m.filename: m for m in migrations}
     async with engine.connect() as conn:
-        ledger = await _ensure_bookkeeping(conn)
-        await conn.commit()
-        applied = await _applied_rows(conn, ledger)
+        # _ensure_bookkeeping runs `RESET search_path`, and the commit below makes
+        # that persistent on a connection that then goes back to the pool: a
+        # caller who had set a session search_path got the database default back
+        # on their next query. Measured: `tenant, public` became `"$user",
+        # public`. Reading the history is not a reason to change the session it
+        # was read on.
+        #
+        # RESTORED rather than discarded, which is where this differs from the
+        # writers. What they drop is state a MIGRATION left, and dropping it is
+        # the point. Here the state is the caller's own, so ending the session
+        # loses it just as thoroughly as leaking the reset does — measured, the
+        # discard lands on the same `"$user", public`. Only putting it back is
+        # actually a fix.
+        entry_path = str(await conn.scalar(sa.text("SHOW search_path")))
+        try:
+            ledger = await _ensure_bookkeeping(conn)
+            await conn.commit()
+            applied = await _applied_rows(conn, ledger)
+        finally:
+            with suppress(Exception):
+                await conn.execute(
+                    sa.text("SELECT pg_catalog.set_config('search_path', :p, false)"),
+                    {"p": entry_path},
+                )
+                await conn.commit()
 
     # Ordering is a property of the SEQUENCE, not of one file, so it is computed
     # once and attributed to the files that break it. Without this, the
